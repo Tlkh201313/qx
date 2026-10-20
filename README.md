@@ -38,13 +38,18 @@ the command itself.
    - `Git\cmd\*.exe` → `Git\mingw64\bin\*.exe` (the child's PATH gets
      `Git\usr\bin` and `Git\mingw64\bin` first, so hooks that need `sh` still run)
    - `npm.cmd` / `npx.cmd` / `pnpm.cmd` / `yarn.cmd` → `node.exe` + JS entrypoint
-   - `pip.exe` / `pytest.exe` / `black.exe` / `uvicorn.exe` / `flake8.exe`
-     → `python.exe -m <module>` when the module is installed beside that
-     interpreter and the interpreter is Python 3.11+. This removes the
-     console-script launcher process; qx sets `PYTHONSAFEPATH=1` so the working
-     directory stays off `sys.path`, as with the launcher (a repo's own
-     `platform.py` or `types.py` cannot shadow the stdlib). Older Pythons keep
-     the launcher.
+   - **any** pip/distlib or uv console-script launcher (`pytest.exe`, `black.exe`,
+     `hermes.exe`, …) → `python.exe <launcher.exe>`. Those launchers are a stub
+     with a stored zip appended; running the interpreter on the launcher is
+     exactly what the launcher itself does after one more process creation, so
+     `sys.argv[0]` and `sys.path[0]` still are the launcher. The interpreter
+     comes from the launcher's shebang line, so it works for stubs in any
+     `Scripts` directory, venvs included. No allow-list, no module guess.
+   - a venv's `Scripts\python.exe` → the base interpreter with
+     `__PYVENV_LAUNCHER__` set, which is the same session (`sys.prefix`,
+     `sys.executable` and `sys.path` are unchanged) with one process fewer.
+     Skipped when `PYTHONHOME` or `__PYVENV_LAUNCHER__` is already set, when the
+     venv is older than 3.11, or with `QX_PYTHON_VENV=off`.
    - **npm run/test/start fast path** - reads the nearest `package.json` and runs
      the script directly, skipping npm's ~100 ms JS CLI startup. Local
      `node_modules\.bin` dirs are on PATH, lifecycle env is set, and stdout is

@@ -12,6 +12,7 @@ mod fuzz;
 mod guard;
 mod mcp;
 mod npm;
+mod python;
 mod redact;
 mod resolve;
 
@@ -597,10 +598,13 @@ fn which(names: &[String]) -> i32 {
         }
         match resolve::resolve(name, None) {
             resolve::Target::Direct { exe, prefix } => {
+                let venv = python::venv_redirect(&exe)
+                    .map(|v| format!(" [venv → {}]", v.base.display()))
+                    .unwrap_or_default();
                 if prefix.is_empty() {
-                    println!("{name} -> {}", exe.display());
+                    println!("{name} -> {}{venv}", exe.display());
                 } else {
-                    println!("{name} -> {} {}", exe.display(), prefix.join(" "));
+                    println!("{name} -> {} {}{venv}", exe.display(), prefix.join(" "));
                 }
             }
             resolve::Target::Shim(p) => {

@@ -68,6 +68,8 @@ impl Native {
 }
 
 impl Client {
+    // Used by `qx setup` to walk every client it can register.
+    #[allow(dead_code)]
     pub const ALL: [Client; 6] = [
         Client::Dsh,
         Client::ClaudeCode,

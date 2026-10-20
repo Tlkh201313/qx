@@ -7,7 +7,7 @@
 //! the reply carries a stable code and tells the caller to use the client's own
 //! tool instead.
 
-use crate::client::{self, current, Native};
+use crate::client::{current, Native};
 use serde_json::{json, Value};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -1860,15 +1860,17 @@ mod tests {
         let dir = tmp("not-observed");
         fs::write(dir.join("a.txt"), "old\n").unwrap();
         let refused = |c| {
-            client::scoped(c, || invoke(&dir, "write", json!({"path":"a.txt","content":"new\n"})))
+            crate::client::scoped(c, || {
+                invoke(&dir, "write", json!({"path":"a.txt","content":"new\n"}))
+            })
         };
-        let r = refused(client::Client::Dsh);
+        let r = refused(crate::client::Client::Dsh);
         assert!(r.is_error);
         assert_eq!(r.structured["code"], "FS_NOT_OBSERVED");
         assert!(r.text.contains("native `write`"), "{}", r.text);
-        let codex = refused(client::Client::Codex);
+        let codex = refused(crate::client::Client::Codex);
         assert!(codex.text.contains("native `apply_patch`"), "{}", codex.text);
-        let generic = refused(client::Client::Generic);
+        let generic = refused(crate::client::Client::Generic);
         assert!(generic.text.contains("native write tool"), "{}", generic.text);
         assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "old\n");
         let _ = fs::remove_dir_all(&dir);

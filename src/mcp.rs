@@ -290,6 +290,7 @@ impl Drop for Active {
 
 /// One input line to its reply. Malformed input and handler panics still get an
 /// answer: a client waiting on an id would otherwise hang forever.
+#[cfg(test)]
 fn respond(line: &str) -> Option<Value> {
     match serde_json::from_str::<Value>(line) {
         Ok(req) => respond_value(&req),

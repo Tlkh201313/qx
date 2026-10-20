@@ -443,8 +443,15 @@ pub fn build_command_at(
                 .is_some_and(|s| s.eq_ignore_ascii_case("powershell"))
                 && std::env::var("QX_PS_PROFILE").ok().as_deref() != Some("1")
                 && !args.iter().any(|a| a.to_ascii_lowercase().starts_with("-nop"));
-            let prefix_m = prefix.first().is_some_and(|a| a == "-m");
-            let mut c = Command::new(exe);
+            // A venv's `python.exe` is a redirector: it re-execs the base interpreter. Running
+            // the base directly with `__PYVENV_LAUNCHER__` set is the same session, one process
+            // fewer.
+            let venv = crate::python::venv_redirect(&exe);
+            let program = match &venv {
+                Some(v) => v.base.as_path(),
+                None => exe.as_path(),
+            };
+            let mut c = Command::new(program);
             c.args(prefix);
             if skip_profile {
                 // A profile adds 300+ ms and can print into the output.
@@ -452,15 +459,16 @@ pub fn build_command_at(
             }
             c.args(args);
             prepare(&mut c);
+            if let Some(v) = &venv {
+                // After `prepare`, which clears the inherited environment: this is what makes
+                // the base interpreter report the venv's `sys.prefix` and `sys.executable`.
+                c.env("__PYVENV_LAUNCHER__", &v.launcher);
+            }
             if node {
                 apply_node_cache(&mut c);
             }
             if python {
                 apply_python_fast(&mut c);
-            }
-            if prefix_m {
-                // The bypassed console script never had the cwd on sys.path; `-m` does.
-                c.env("PYTHONSAFEPATH", "1");
             }
             if let Some(git) = git_root(&c) {
                 // The mingw64 binary was reached past Git\cmd, which would have set this PATH.

@@ -541,8 +541,13 @@ fn classify(p: PathBuf) -> Target {
     if let Some(t) = de_trampoline(&p) {
         return t;
     }
-    if let Some(t) = python_console_script(&p) {
-        return t;
+    // A console-script launcher is `python.exe <launcher>`: exact launcher semantics
+    // (sys.argv[0] and sys.path[0] both stay the launcher) in one process fewer.
+    if let Some(interpreter) = crate::python::launcher_interpreter(&p) {
+        return Target::Direct {
+            exe: interpreter,
+            prefix: vec![p.to_string_lossy().into_owned()],
+        };
     }
 
     Target::Direct {
@@ -571,51 +576,6 @@ fn de_trampoline(p: &Path) -> Option<Target> {
         }
     }
     None
-}
-
-/// Python console scripts (pip.exe, pytest.exe) are launchers that spawn
-/// python.exe. Calling `python -m <module>` is one process instead of two.
-fn python_console_script(p: &Path) -> Option<Target> {
-    let stem = p.file_stem()?.to_str()?.to_ascii_lowercase();
-    let module = match stem.as_str() {
-        "pip" | "pip3" => "pip",
-        s if s.starts_with("pip3.") => "pip",
-        "pytest" | "py.test" => "pytest",
-        "black" => "black",
-        "uvicorn" => "uvicorn",
-        "flake8" => "flake8",
-        "django-admin" => "django",
-        "mkdocs" => "mkdocs",
-        "virtualenv" => "virtualenv",
-        "poetry" => "poetry",
-        "ipython" => "IPython",
-        "jupyter" => "jupyter",
-        "mypy" => "mypy",
-        "pylint" => "pylint",
-        _ => return None,
-    };
-    let python = p.parent()?.parent()?.join("python.exe");
-    if !python.is_file() || python_minor(python.parent()?)? < 11 {
-        return None; // PYTHONSAFEPATH (cwd off sys.path) exists from 3.11 only
-    }
-    // Only bypass the launcher when the module is actually installed beside
-    // this interpreter; otherwise keep the launcher's own error behavior.
-    let site = python.parent()?.join("Lib").join("site-packages");
-    if !site.join(module).is_dir() && !site.join(format!("{module}.py")).is_file() {
-        return None;
-    }
-    Some(Target::Direct {
-        exe: python,
-        prefix: vec!["-m".to_string(), module.to_string()],
-    })
-}
-
-/// Minor version of the CPython install in `dir`, read from its `python3NN.dll`.
-fn python_minor(dir: &Path) -> Option<u32> {
-    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
-        let name = e.file_name().to_string_lossy().to_ascii_lowercase();
-        name.strip_prefix("python3")?.strip_suffix(".dll")?.parse().ok()
-    })
 }
 
 /// npm/npx/pnpm/yarn are .cmd trampolines that spawn cmd.exe then node.exe.
@@ -1052,22 +1012,6 @@ default_toolchain = "stable-x86_64-pc-windows-msvc"
             set(logic);
             assert!(generic_shim(&shim).is_none(), "{logic}");
         }
-    }
-
-    #[test]
-    fn python_launchers_are_bypassed_only_where_pythonsafepath_exists() {
-        let mk = |tag: &str, dll: &str| {
-            let d = tmp(tag);
-            fs::create_dir_all(d.join("Scripts")).unwrap();
-            fs::create_dir_all(d.join("Lib").join("site-packages").join("pytest")).unwrap();
-            fs::write(d.join("python.exe"), "").unwrap();
-            fs::write(d.join(dll), "").unwrap();
-            fs::write(d.join("Scripts").join("pytest.exe"), "").unwrap();
-            d.join("Scripts").join("pytest.exe")
-        };
-        let new = mk("py311", "python311.dll");
-        assert!(matches!(python_console_script(&new), Some(Target::Direct { prefix, .. }) if prefix == ["-m", "pytest"]));
-        assert!(python_console_script(&mk("py310", "python310.dll")).is_none());
     }
 
     #[test]
