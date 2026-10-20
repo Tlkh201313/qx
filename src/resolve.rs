@@ -54,7 +54,11 @@ pub fn resolve(program: &str, cwd: Option<&Path>) -> Target {
             }
         }
     }
-    let found = find_on_path(program).map_or(Target::Missing, classify);
+    let found = match find_on_path(program) {
+        Some(p) => classify(p),
+        // Git for Windows ships the coreutils the built-ins only partly cover.
+        None => git_coreutil(program).map_or(Target::Missing, classify),
+    };
     if !matches!(found, Target::Missing) {
         if let Ok(mut guard) = cache().lock() {
             if guard.len() < 512 {
@@ -97,6 +101,44 @@ fn resolve_path(program: &str, cwd: Option<&Path>) -> Target {
 pub fn find_on_path(name: &str) -> Option<PathBuf> {
     let exts = pathext();
     path_dirs().iter().find_map(|dir| find_in_dir(dir, name, &exts))
+}
+
+/// The coreutils Git for Windows ships in `usr\bin`. A built-in that declines its
+/// arguments (e.g. `wc` with two files) then still has somewhere to go.
+const COREUTILS: &[&str] = &[
+    "basename", "cat", "cp", "dirname", "echo", "false", "head", "ls", "mkdir", "mv", "pwd",
+    "realpath", "rm", "seq", "sleep", "tail", "touch", "true", "wc", "which",
+];
+
+/// `<Git>\usr\bin\<name>.exe`, for a name in `COREUTILS` only.
+pub fn git_coreutil(name: &str) -> Option<PathBuf> {
+    let lower = name.to_ascii_lowercase();
+    if !COREUTILS.contains(&lower.as_str()) {
+        return None;
+    }
+    let root = git_root_dir()?;
+    let exe = root.join("usr").join("bin").join(format!("{lower}.exe"));
+    exe.is_file().then_some(exe)
+}
+
+/// The Git for Windows root: the nearest ancestor (up to three levels) of the `git`
+/// on PATH that holds `usr\bin`, else the root implied by `git_bash()`.
+fn git_root_dir() -> Option<PathBuf> {
+    static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        if let Some(git) = find_on_path("git") {
+            let mut dir = git.parent()?.to_path_buf();
+            for _ in 0..3 {
+                if dir.join("usr").join("bin").is_dir() {
+                    return Some(dir);
+                }
+                dir = dir.parent()?.to_path_buf();
+            }
+        }
+        let bash = git_bash()?;
+        bash.parent()?.parent().map(Path::to_path_buf)
+    })
+    .clone()
 }
 
 /// One PATH directory. On Windows a single listing answers every PATHEXT candidate at once (a miss would
@@ -1026,5 +1068,31 @@ default_toolchain = "stable-x86_64-pc-windows-msvc"
         let new = mk("py311", "python311.dll");
         assert!(matches!(python_console_script(&new), Some(Target::Direct { prefix, .. }) if prefix == ["-m", "pytest"]));
         assert!(python_console_script(&mk("py310", "python310.dll")).is_none());
+    }
+
+    #[test]
+    fn coreutil_fallback_is_limited_to_coreutils() {
+        // Only names Git for Windows actually ships in usr\bin, so a typo never resolves.
+        assert!(git_coreutil("git").is_none());
+        assert!(git_coreutil("notepad").is_none());
+        assert!(git_coreutil("node").is_none());
+        if let Some(wc) = git_coreutil("WC") {
+            assert!(wc.is_file());
+            assert!(wc.to_string_lossy().to_ascii_lowercase().ends_with(r"usr\bin\wc.exe"));
+        }
+    }
+
+    #[test]
+    fn a_coreutil_resolves_when_the_path_has_none() {
+        // A name qx declines as a built-in and that is absent from PATH still resolves when Git
+        // ships it; the resolve() fallback is what a declined built-in relies on.
+        if git_coreutil("wc").is_none() {
+            println!("skip: Git for Windows coreutils are not installed here");
+            return;
+        }
+        let direct = find_on_path("wc");
+        if direct.is_none() {
+            assert!(matches!(resolve("wc", None), Target::Direct { .. }));
+        }
     }
 }

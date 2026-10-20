@@ -20,6 +20,11 @@ the command itself.
    name exists, or when a `/switch` is given. `where` is always the real
    `where.exe`; `which` prints the first PATH hit.
    `rm` refuses drive roots, your home directory, and the current directory.
+   When a built-in declines and no `name.exe` is on PATH, qx resolves the name
+   from Git for Windows' `usr\bin` (`wc`, `head`, `cp`, `mkdir`, …), so
+   `wc -l a.txt b.txt` still answers instead of failing with "command not
+   found"; only the coreutils Git actually ships are eligible, and the error
+   message says when a declined built-in had nowhere to go.
 2. **Direct exec** — `qx git status` calls `git.exe` directly. No `bash`, no login
    profile, no `cmd.exe` in between. Node targets also get a persistent
    `NODE_COMPILE_CACHE` (Node 22+), which cuts repeat CLI startup by ~20%.

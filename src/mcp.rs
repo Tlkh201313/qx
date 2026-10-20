@@ -1026,19 +1026,32 @@ mod tests {
         }
     }
 
-    /// A line source that answers everything at once and only then pauses before EOF, so the
-    /// server's reader loop has admitted the calls it was given.
-    struct SlowEof(std::io::Cursor<Vec<u8>>, bool, Duration);
+    /// A line source that answers everything at once and only reports EOF once the call it
+    /// carries has really started, so "running" and "queued" are not a race of thread startup.
+    struct SlowEof(std::io::Cursor<Vec<u8>>, bool);
 
     impl SlowEof {
-        fn new(text: &str, pause: Duration) -> Self {
-            SlowEof(std::io::Cursor::new(text.as_bytes().to_vec()), false, pause)
+        fn new(text: &str) -> Self {
+            SlowEof(std::io::Cursor::new(text.as_bytes().to_vec()), false)
         }
-        fn pause_once(&mut self) {
-            if !self.1 {
-                self.1 = true;
-                std::thread::sleep(self.2);
+        fn wait_for_the_running_call(&mut self) {
+            if self.1 {
+                return;
             }
+            self.1 = true;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                let started = INFLIGHT
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|(k, _)| k == "11");
+                if started {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            panic!("the running call never registered itself for cancellation");
         }
     }
 
@@ -1046,7 +1059,7 @@ mod tests {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             let n = self.0.read(buf)?;
             if n == 0 {
-                self.pause_once();
+                self.wait_for_the_running_call();
             }
             Ok(n)
         }
@@ -1055,7 +1068,7 @@ mod tests {
     impl BufRead for SlowEof {
         fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
             if self.0.fill_buf()?.is_empty() {
-                self.pause_once();
+                self.wait_for_the_running_call();
             }
             self.0.fill_buf()
         }
@@ -1077,6 +1090,39 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn a_declined_builtin_reaches_git_coreutils() {
+        // Runs a real child, so it must not overlap a server test that sets `SHUTDOWN`.
+        let _server = server_lock();
+        // `wc` with two files is what the built-in declines: the model must still get an answer.
+        if crate::resolve::git_coreutil("wc").is_none() {
+            println!("skip: Git for Windows coreutils are not installed here");
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("qx-mcp-coreutil-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("a.txt"), "1\n").unwrap();
+        std::fs::write(d.join("b.txt"), "1\n2\n").unwrap();
+        let cwd = d.to_string_lossy().to_string();
+        let r = client::scoped(Client::Dsh, || {
+            call(json!({"program":"wc","args":["-l","a.txt","b.txt"],"cwd":cwd,"mode":"full"}))
+        });
+        let text = r
+            .pointer("/result/structuredContent/stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(
+            r.pointer("/result/structuredContent/exit_code"),
+            Some(&json!(0)),
+            "reply: {r}"
+        );
+        assert!(text.contains("total"), "{text}");
+        assert!(text.contains('3'), "{text}");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn eof_cancels_running_and_queued_calls_promptly() {
         let _server = server_lock();
         // The pause before EOF is what makes "running" and "queued" deterministic: the first call
@@ -1092,7 +1138,7 @@ mod tests {
         );
         let sink = Sink::default();
         let t = std::time::Instant::now();
-        let code = serve_io(SlowEof::new(input, Duration::from_millis(700)), sink.clone(), limits);
+        let code = serve_io(SlowEof::new(input), sink.clone(), limits);
         assert!(t.elapsed() < Duration::from_secs(6), "shutdown took {:?}", t.elapsed());
         assert_eq!(code, 0);
         let running = sink.reply(11).expect("the running call answers");

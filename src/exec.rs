@@ -498,7 +498,19 @@ pub fn build_command_at(
             apply_child_defaults(&mut c, npmish);
             Ok(c)
         }
-        Target::Missing => Err(format!("command not found: {program}")),
+        Target::Missing => Err(not_found(program)),
+    }
+}
+
+/// The message for a program that could not be resolved. A built-in that declined its
+/// arguments is not a typo, so the message says so and names where qx looked.
+pub fn not_found(program: &str) -> String {
+    if crate::builtin::is_builtin(program) {
+        format!(
+            "command not found: {program} (the qx built-in does not support these arguments, and no {program}.exe is on PATH or in Git for Windows usr\\bin)"
+        )
+    } else {
+        format!("command not found: {program}")
     }
 }
 
@@ -506,11 +518,17 @@ fn cmd_internal(program: &str) -> bool {
     ["dir", "type", "del", "erase", "copy", "move"].iter().any(|n| program.eq_ignore_ascii_case(n))
 }
 
-/// The Git for Windows root when `cmd` runs a binary from its `mingw64\bin`.
+/// The Git for Windows root when `cmd` runs a binary from its `mingw64\bin` or `usr\bin`.
 fn git_root(cmd: &Command) -> Option<PathBuf> {
     let bin = Path::new(cmd.get_program()).parent()?;
-    let mingw = bin.parent()?;
     let named = |p: &Path, n: &str| p.file_name().is_some_and(|f| f.eq_ignore_ascii_case(n));
+    if named(bin, "bin") {
+        // The coreutils fallback runs <root>\usr\bin\x.exe, which needs the same PATH.
+        if let Some(usr) = bin.parent().filter(|p| named(p, "usr")) {
+            return usr.parent().map(Path::to_path_buf);
+        }
+    }
+    let mingw = bin.parent()?;
     (named(bin, "bin") && named(mingw, "mingw64")).then(|| mingw.parent().map(Path::to_path_buf))?
 }
 
@@ -1258,6 +1276,18 @@ mod tests {
         let c = Command::new(r"C:\Program Files\Git\mingw64\bin\git.exe");
         assert_eq!(git_root(&c).as_deref(), Some(Path::new(r"C:\Program Files\Git")));
         assert!(git_root(&Command::new(r"C:\tools\bin\git.exe")).is_none());
+        // The coreutils fallback runs from usr\bin and needs the same PATH prepend.
+        let wc = Command::new(r"C:\Program Files\Git\usr\bin\wc.exe");
+        assert_eq!(git_root(&wc).as_deref(), Some(Path::new(r"C:\Program Files\Git")));
+    }
+
+    #[test]
+    fn not_found_names_the_builtin_limit() {
+        // A declined built-in is not a typo: say which built-in declined and where qx looked.
+        let wc = not_found("wc");
+        assert!(wc.contains("qx built-in"), "{wc}");
+        assert!(wc.contains("usr\\bin"), "{wc}");
+        assert_eq!(not_found("zzz-nope"), "command not found: zzz-nope");
     }
 
     #[test]
