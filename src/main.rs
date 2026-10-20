@@ -3,6 +3,7 @@
 mod builtin;
 mod client;
 mod compact;
+mod deploy;
 mod digest;
 mod doctor;
 mod exec;
@@ -71,6 +72,7 @@ fn dispatch(args: &[String]) -> i32 {
             0
         }
         "doctor" | "bench" => doctor::run(),
+        "deploy" => deploy::run(&args[1..]),
         "gain" => gain(),
         "mcp" | "serve" => mcp::serve(),
         "which" => which(&args[1..]),
@@ -628,6 +630,7 @@ USAGE
   qx [flags] -c "<command line>"     shell string (auto: cmd or Git Bash)
   qx mcp                             MCP stdio server (tools: run, fs)
   qx doctor                          diagnose why commands are slow
+  qx deploy [--to PATH] [--dry-run]  install this build as the canonical qx.exe
   qx which <command>...              show the real binary that will run
   qx gain                            output savings (needs QX_STATS=1)
   qx check <program|command>         dry-run the safety gate

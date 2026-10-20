@@ -240,8 +240,17 @@ directories where deletion is routine.
 ```powershell
 cd C:\Users\USER\Projects\qx
 cargo build --release
-Copy-Item target\release\qx.exe C:\Users\USER\.cargo\bin\qx.exe -Force
+target\release\qx.exe deploy
 ```
+
+`deploy` copies the running build to the canonical `%CARGO_HOME%\bin\qx.exe`
+(else `%USERPROFILE%\.cargo\bin\qx.exe`), and is safe to run while MCP servers
+are using it: Windows lets a running image be renamed, so the old copy is moved
+aside to `qx.exe.old-<ms>` and the new one takes its place. Running clients keep
+the old file until they exit; `qx deploy` reports the aside path, and the next
+deploy sweeps it. `--to <path>` installs somewhere else, `--dry-run` says what
+it would do without writing. One canonical binary and one path in every client
+config is what keeps clients from drifting onto stale builds.
 
 ## Usage
 
