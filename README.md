@@ -336,6 +336,27 @@ commands are cancelled (their reply carries `timed_out: true`), calls still
 waiting for a slot are refused with `qx is shutting down; the call was not run`,
 and the server returns within about 3 s. Child processes die with qx's job object.
 
+### Clients
+
+qx writes its messages for the client it is talking to. Detection order is
+`QX_CLIENT`, then `clientInfo.name`, then `CLAUDECODE=1`, then generic:
+
+| client | detected by | tools qx names as the fallback | output shape |
+|---|---|---|---|
+| dsh | `dsh-mcp-client` | `pwsh`, `read`, `write` | text + `structuredContent` |
+| Claude Code | `claude-code`, `CLAUDECODE=1` | `Bash`, `Read`, `Write` | text only (no `outputSchema`, no `structuredContent`) |
+| Codex | `codex-mcp-client` | `exec_command`, `apply_patch` | text only |
+| OpenCode | `opencode` | `shell`, `read`, `write` | text + `structuredContent` |
+| Hermes | `QX_CLIENT=hermes` (it reports the SDK default `mcp`) | `terminal`, `read_file`, `write_file`, `patch` | text + metadata, without a second copy of `stdout` |
+| pi | `pi` | `bash`, `read`, `write` | text + `structuredContent` |
+| generic | anything else | `shell`, `read`, `write` | text + `structuredContent` |
+
+The server instructions name the tools with that client's ids (`mcp__qx__run`, or
+`qx_run` on OpenCode) and stay under 1 KiB, because Codex reads only the first
+512 bytes of them. Set `QX_CLIENT` in the server environment when a client's
+self-report is ambiguous; that is the only reliable way to reach the Hermes
+profile.
+
 ## Measured on this machine (AV active)
 
 | command | time |

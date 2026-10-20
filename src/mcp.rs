@@ -1,16 +1,15 @@
 //! MCP (stdio) server exposing `run` (commands) and `fs` (filesystem).
+//!
+//! Tool names, fallback pointers and output shape come from `client`, so the same
+//! server speaks correctly to dsh, Claude Code, Codex, OpenCode, Hermes and pi.
 
+use crate::client::{self, Client, Native, Structured};
 use crate::{builtin, compact, digest, exec, guard, npm, redact};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-/// MCP server instructions are injected into the harness system prompt by
-/// clients such as dsh. Keep this short: it is paid on every request, so it
-/// only states the routing rule and the output contract.
-const MCP_INSTRUCTIONS: &str = r#"qx is the preferred tool layer for this session. Call `mcp__qx__run` for commands: prefer `program` + `args`, pass the session `cwd`; for env vars use `command: "NAME=v prog args"` (runs prog directly, ~0.15 s) instead of a powershell wrapper (~0.4 s start, ~1.5 s with Start-Process), and keep `mode: "compact"`. Call `mcp__qx__fs` for filesystem work: `op=read|write|edit|glob|grep|list|stat`, always with `cwd`. Use qx fs first for read, glob, and literal grep; qx grep is literal-only, so use native grep for regex. qx fs is workspace-confined, and write/edit require a prior qx read. If a qx call errors, or the task needs dsh sandbox escalation, images, or regex, fall back to the native dsh tool of the same purpose. Native tools always remain available. If a qx `run` is truncated, read its `full_output` spool instead of re-running."#;
 
 /// Bounds the server: concurrent commands, how many more may queue, and how long
 /// shutdown waits for them.
@@ -46,6 +45,8 @@ fn serve_io<R: BufRead, W: Write + Send + 'static>(mut reader: R, out: W, limits
     // One process serves one session, so this starts fresh: a shutdown flag from a previous
     // session must never refuse the first call of this one.
     SHUTDOWN.store(false, Ordering::SeqCst);
+    // `QX_CLIENT` (or generic) until `initialize` names the client.
+    client::set_current(Client::detect(None, |k| std::env::var(k).ok()));
     let out = Arc::new(Mutex::new(out));
     let gate = Gate::new(limits.workers);
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -337,6 +338,11 @@ fn handle(req: &Value) -> Option<Value> {
                 .pointer("/params/protocolVersion")
                 .and_then(|v| v.as_str())
                 .unwrap_or("2024-11-05");
+            // The client names itself here; from now on every message is written for it.
+            client::set_current(Client::detect(
+                req.pointer("/params/clientInfo/name").and_then(Value::as_str),
+                |k| std::env::var(k).ok(),
+            ));
             Some(json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -344,7 +350,7 @@ fn handle(req: &Value) -> Option<Value> {
                     "protocolVersion": ver,
                     "capabilities": { "tools": {} },
                     "serverInfo": { "name": "qx", "version": env!("CARGO_PKG_VERSION") },
-                    "instructions": MCP_INSTRUCTIONS
+                    "instructions": client::current().instructions()
                 }
             }))
         }
@@ -366,10 +372,24 @@ fn rpc_error(id: Value, code: i32, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
+/// Codex and Claude Code never show the model `structuredContent`, so advertising an
+/// `outputSchema` for them would promise data that never arrives.
+fn strip_output_schema(schema: &mut Value, c: Client) {
+    if c.structured() == Structured::Off {
+        if let Value::Object(m) = schema {
+            m.remove("outputSchema");
+        }
+    }
+}
+
 fn run_schema() -> Value {
-    json!({
+    let c = client::current();
+    let mut schema = json!({
         "name": "run",
-        "description": "Run a local command fast. Prefer `program` + `args` (direct exec, no shell). Simple `command` strings are also split without a shell; use pipes/redirects only when needed. In-process built-ins: pwd, echo, ls, cat, head, tail, wc, mkdir, rm, cp, mv, touch, which, realpath, whoami, hostname, seq, sleep. Output is compacted, preserves errors from the middle, and redacts secrets. On failure, fall back to native bash/pwsh for sandbox escalation, background jobs, or PTY work.",
+        "description": format!(
+            "Run a local command fast. Prefer `program` + `args` (direct exec, no shell). Simple `command` strings are also split without a shell; use pipes/redirects only when needed. In-process built-ins: pwd, echo, ls, cat, head, tail, wc, mkdir, rm, cp, mv, touch, which, realpath, whoami, hostname, seq, sleep. Output is compacted, preserves errors from the middle, and redacts secrets. On failure, fall back to the native {} for sandbox escalation, background jobs, or PTY work.",
+            c.native(Native::Shell)
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -400,20 +420,30 @@ fn run_schema() -> Value {
                 "error": { "type": "string" }
             }
         }
-    })
+    });
+    strip_output_schema(&mut schema, c);
+    schema
 }
 
 fn fs_schema() -> Value {
-    json!({
+    let c = client::current();
+    let mut schema = json!({
         "name": "fs",
-        "description": "Fast in-process filesystem operations for the workspace. op=read: line-numbered UTF-8 read (path, offset?, limit?). op=write: create or replace (path, content); an existing file needs a prior qx read. op=edit: literal replace (path, old_string, new_string, replace_all?); needs a prior qx read. op=glob: path discovery (pattern; path?). op=grep: literal content search (pattern; path?, include?, ignore_case?); one output line is path:line: text. op=list/stat. Always pass cwd; paths outside cwd are refused. qx skips generated dirs (node_modules, target, dist, build, ...) during recursive walks for speed; pass one as `path` to search it directly, or use native dsh glob/grep when the whole ignored tree matters. qx grep is literal, not regex. On any error use the native dsh read/write/edit/glob/grep tool. Native tools remain authoritative for sandbox escalation, images, and regex. qx mutations are atomic and read-before-write guarded, but do not replace dsh's sandbox policy.",
+        "description": format!(
+            "Fast in-process filesystem operations for the workspace. op=read: line-numbered UTF-8 read (path, offset?, limit?). op=write: create or replace (path, content); an existing file needs a prior qx read. op=edit: literal replace (path, old_string, new_string, replace_all?); needs a prior qx read. op=glob: path discovery (pattern; path?). op=grep: literal content search (pattern; path?, include?, ignore_case?); one output line is path:line: text. op=list/stat. Always pass cwd; paths outside cwd are refused. qx skips generated dirs (node_modules, target, dist, build, ...) during recursive walks for speed; pass one as `path` to search it directly, or use the native {glob}/{grep} when the whole ignored tree matters. qx grep is literal, not regex. On any error use the native {read}/{write}/{edit}/{glob}/{grep} tool. Native tools remain authoritative for sandbox escalation, images, and regex. qx mutations are atomic and read-before-write guarded, but do not replace the client's sandbox policy.",
+            glob = c.native(Native::Glob),
+            grep = c.native(Native::Grep),
+            read = c.native(Native::Read),
+            write = c.native(Native::Write),
+            edit = c.native(Native::Edit),
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "op": { "type": "string", "enum": ["read", "write", "edit", "glob", "grep", "list", "stat"] },
                 "cwd": { "type": "string", "description": "Session working directory. qx confines every path to this root." },
                 "path": { "type": "string", "description": "File or directory, absolute or relative to cwd. Defaults to '.' for glob, grep, and list. Alias: file_path." },
-                "file_path": { "type": "string", "description": "Alias for path, matching the native dsh read/write/edit tools." },
+                "file_path": { "type": "string", "description": format!("Alias for path, matching the native {}/{}/{} tools.", c.native(Native::Read), c.native(Native::Write), c.native(Native::Edit)) },
                 "content": { "type": "string", "description": "write: complete new file content." },
                 "old_string": { "type": "string", "description": "edit: literal text to replace." },
                 "new_string": { "type": "string", "description": "edit: replacement text." },
@@ -453,7 +483,9 @@ fn fs_schema() -> Value {
                 "fallback": { "type": "string" }
             }
         }
-    })
+    });
+    strip_output_schema(&mut schema, c);
+    schema
 }
 
 fn call_tool(req: &Value, id: Option<Value>) -> Value {
@@ -725,14 +757,24 @@ fn tool_result(id: Option<Value>, text: &str, is_error: bool, extra: Value) -> V
             }
         }
     }
-    ok(
-        id,
-        json!({
-            "content": [{ "type": "text", "text": text }],
-            "structuredContent": structured,
-            "isError": is_error
-        }),
-    )
+    let mut result = json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": is_error
+    });
+    // The output policy decides whether the JSON copy exists at all: dsh, Claude Code and Hermes
+    // reject a result that has a schema but no `structuredContent`, and Hermes prints both copies.
+    match client::current().structured() {
+        Structured::Off => {}
+        Structured::Meta => {
+            if let Value::Object(m) = &mut structured {
+                m.remove("stdout");
+                m.remove("stderr");
+            }
+            result["structuredContent"] = structured;
+        }
+        Structured::Full => result["structuredContent"] = structured,
+    }
+    ok(id, result)
 }
 
 #[cfg(test)]
@@ -747,7 +789,7 @@ mod tests {
             "method": "initialize",
             "params": { "protocolVersion": "2024-11-05" }
         });
-        let res = handle(&req).expect("initialize must answer");
+        let res = client::scoped(Client::Dsh, || handle(&req)).expect("initialize must answer");
         assert_eq!(res.pointer("/result/serverInfo/name"), Some(&json!("qx")));
         let instructions = res
             .pointer("/result/instructions")
@@ -760,6 +802,53 @@ mod tests {
         assert!(instructions.contains("compact"));
         assert!(instructions.contains("fall back"));
         assert!(instructions.len() < 1024);
+    }
+
+    #[test]
+    fn initialize_learns_the_client_from_client_info() {
+        let _global = client::lock_global();
+        let init = |name: &str| {
+            handle(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": { "clientInfo": { "name": name } }
+            }))
+            .expect("initialize must answer")
+        };
+        let previous = client::current();
+        init("codex-mcp-client");
+        assert_eq!(client::current(), Client::Codex);
+        init("dsh-mcp-client");
+        assert_eq!(client::current(), Client::Dsh);
+        client::set_current(previous);
+    }
+
+    #[test]
+    fn output_policy_follows_the_matrix() {
+        let list = |c: Client| {
+            client::scoped(c, || {
+                handle(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}})).unwrap()
+            })
+        };
+        let has_schema = |v: &Value| v.pointer("/result/tools/0/outputSchema").is_some();
+        assert!(has_schema(&list(Client::Dsh)));
+        assert!(has_schema(&list(Client::Hermes)));
+        assert!(!has_schema(&list(Client::Codex)));
+        assert!(!has_schema(&list(Client::ClaudeCode)));
+
+        let run = |c: Client| client::scoped(c, || call(json!({"program":"echo","args":["x"],"mode":"full"})));
+        assert!(run(Client::Dsh).pointer("/result/structuredContent/stdout").is_some());
+        assert!(run(Client::Codex).pointer("/result/structuredContent").is_none());
+        let hermes = run(Client::Hermes);
+        assert!(hermes.pointer("/result/structuredContent/stdout").is_none());
+        assert!(hermes.pointer("/result/structuredContent/exit_code").is_some());
+        // The text keeps the output either way: that is what Codex and Hermes show.
+        assert!(run(Client::Codex)
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains('x'));
     }
 
     #[test]
@@ -816,8 +905,10 @@ mod tests {
             std::fs::write(d.join(format!("f{i:03}.txt")), "").unwrap();
         }
         let cwd = d.to_string_lossy().to_string();
-        let plain = call(json!({"command":"ls","cwd":cwd,"mode":"full"}));
-        let full = call(json!({"command":"QX_LS_FULL=1 ls","cwd":cwd,"mode":"full"}));
+        let plain = client::scoped(Client::Dsh, || call(json!({"command":"ls","cwd":cwd,"mode":"full"})));
+        let full = client::scoped(Client::Dsh, || {
+            call(json!({"command":"QX_LS_FULL=1 ls","cwd":cwd,"mode":"full"}))
+        });
         let text = |r: &Value| r.pointer("/result/structuredContent/stdout").and_then(Value::as_str).unwrap().to_string();
         assert!(text(&plain).contains("more entries") || text(&plain).lines().count() < 230);
         assert_eq!(text(&full).lines().count(), 230);
@@ -828,7 +919,9 @@ mod tests {
     #[test]
     fn cancel_stops_the_running_command() {
         let worker = std::thread::spawn(|| {
-            call_id(77, json!({"program":"ping","args":["-n","30","127.0.0.1"],"timeout_ms":60000}))
+            client::scoped(Client::Dsh, || {
+                call_id(77, json!({"program":"ping","args":["-n","30","127.0.0.1"],"timeout_ms":60000}))
+            })
         });
         std::thread::sleep(Duration::from_millis(600));
         assert!(respond(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":77}}"#).is_none());
@@ -844,7 +937,9 @@ mod tests {
         // The reader answers `notifications/cancelled` while the call still waits for a worker slot.
         assert!(respond(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":78}}"#).is_none());
         let t = std::time::Instant::now();
-        let r = call_id(78, json!({"program":"ping","args":["-n","30","127.0.0.1"],"timeout_ms":60000}));
+        let r = client::scoped(Client::Dsh, || {
+            call_id(78, json!({"program":"ping","args":["-n","30","127.0.0.1"],"timeout_ms":60000}))
+        });
         assert!(t.elapsed() < Duration::from_secs(10), "the early cancel was dropped");
         assert_eq!(r.pointer("/result/structuredContent/timed_out"), Some(&json!(true)));
     }
@@ -969,13 +1064,15 @@ mod tests {
         }
     }
 
-    /// `SHUTDOWN` is process-wide, so the tests that drive a whole server run one at a time.
+    /// `SHUTDOWN` and the current client are process-wide, so the tests that drive a whole
+    /// server run one at a time and never overlap a test that changes either.
     static SERVER: Mutex<()> = Mutex::new(());
 
-    fn server_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn server_lock() -> (std::sync::MutexGuard<'static, ()>, std::sync::MutexGuard<'static, ()>) {
+        let global = client::lock_global();
         let guard = SERVER.lock().unwrap_or_else(|e| e.into_inner());
         SHUTDOWN.store(false, Ordering::SeqCst);
-        guard
+        (guard, global)
     }
 
     #[cfg(windows)]

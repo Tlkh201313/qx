@@ -4,9 +4,10 @@
 //! against an explicit `cwd`, symlinks may not escape that root, and mutations
 //! require a prior read of the same version. Writes are atomic (temp + replace)
 //! and never touch VCS metadata. When an operation cannot be completed safely,
-//! the reply carries a stable code and tells the caller to use the native dsh
+//! the reply carries a stable code and tells the caller to use the client's own
 //! tool instead.
 
+use crate::client::{self, current, Native};
 use serde_json::{json, Value};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -18,6 +19,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_READ_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The current client's name for one of its own tools, for messages shaped `the native {} tool`.
+fn native(n: Native) -> &'static str {
+    current().native(n)
+}
 const MAX_WRITE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EDIT_BYTES: usize = 1024 * 1024;
 const MAX_GREP_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -71,10 +77,10 @@ impl FsError {
     }
 
     fn reply(&self, op: &str) -> Reply {
-        let fallback = if self.fallback == "tool" {
-            "the native dsh tool for this operation".to_string()
-        } else {
-            format!("the native dsh `{}` tool", self.fallback)
+        // The pointer must name a tool this client actually has.
+        let fallback = match Native::from_name(self.fallback) {
+            Some(n) => format!("the native {} tool", current().native(n)),
+            None => "the native tool for this operation".to_string(),
         };
         Reply {
             text: format!(
@@ -140,7 +146,7 @@ fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
 
-/// Native dsh read/write/edit call the target `file_path`; qx's unified tool
+/// Native read/write/edit call the target `file_path`; qx's unified tool
 /// calls it `path`. Accept both so a model switching tools does not need a
 /// different argument shape.
 fn path_arg(args: &Value) -> Option<&str> {
@@ -184,7 +190,7 @@ fn bool_arg(args: &Value, key: &str, default: bool) -> bool {
 
 // --------------------------------------------------------------------- root
 
-/// dsh sends the same session cwd on every call. Canonicalizing it each time
+/// The client sends the same session cwd on every call. Canonicalizing it each time
 /// costs a Win32 handle round-trip for no new information; cache the answer by
 /// the input path. A deleted or replaced workspace invalidates naturally at the
 /// next filesystem operation, and the cache is bounded.
@@ -258,8 +264,9 @@ impl Root {
             Err(FsError::new(
                 "FS_OUTSIDE_WORKSPACE",
                 format!(
-                    "path escapes the workspace: {} (use the native dsh tool for paths outside cwd)",
-                    path.display()
+                    "path escapes the workspace: {} (use the native {} for paths outside cwd)",
+                    path.display(),
+                    native(Native::Shell)
                 ),
             ))
         }
@@ -302,7 +309,10 @@ impl Root {
             if md.file_type().is_symlink() {
                 return Err(FsError::new(
                     "FS_SYMLINK",
-                    format!("refusing to replace symlink \"{raw}\"; use the native dsh write tool"),
+                    format!(
+                        "refusing to replace symlink \"{raw}\"; use the native {} tool",
+                        native(Native::Write)
+                    ),
                 ));
             }
             if !md.is_file() {
@@ -441,13 +451,15 @@ fn check_observed(cwd: &Path, path: &Path, current: Version, display: &str) -> R
         None => Err(FsError::new(
             "FS_NOT_OBSERVED",
             format!(
-                "cannot modify \"{display}\": file has not been read — read it with qx fs op=read first, or use the native dsh write/edit tool"
+                "cannot modify \"{display}\": file has not been read — read it with qx fs op=read first, or use the native {} tool",
+                native(Native::Write)
             ),
         )),
         Some(v) if *v != current => Err(FsError::new(
             "FS_STALE",
             format!(
-                "cannot modify \"{display}\": file changed since it was read — re-read it, or use the native dsh write/edit tool"
+                "cannot modify \"{display}\": file changed since it was read — re-read it, or use the native {} tool",
+                native(Native::Write)
             ),
         )),
         Some(_) => Ok(()),
@@ -475,10 +487,11 @@ fn read_file(path: &Path, fallback: &'static str) -> Result<(Vec<u8>, Version), 
         return Err(FsError::new(
             "FS_TOO_LARGE",
             format!(
-                "cannot read \"{}\": file is {} bytes (qx cap {}); use the native dsh read tool",
+                "cannot read \"{}\": file is {} bytes (qx cap {}); use the native {} tool",
                 path.display(),
                 md.len(),
-                MAX_READ_BYTES
+                MAX_READ_BYTES,
+                native(Native::Read)
             ),
         )
         .fb(fallback));
@@ -844,9 +857,10 @@ fn write(root: &Root, args: &Value) -> Result<Reply, FsError> {
         return Err(FsError::new(
             "FS_TOO_LARGE",
             format!(
-                "content is {} bytes (qx cap {}); use the native dsh write tool",
+                "content is {} bytes (qx cap {}); use the native {} tool",
                 content.len(),
-                MAX_WRITE_BYTES
+                MAX_WRITE_BYTES,
+                native(Native::Write)
             ),
         )
         .fb("write"));
@@ -982,7 +996,10 @@ fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
     if pattern.starts_with('!') {
         return Err(FsError::new(
             "FS_UNSUPPORTED",
-            "negated glob patterns are not supported by qx; use the native dsh glob tool",
+            format!(
+                "negated glob patterns are not supported by qx; use the native {} tool",
+                native(Native::Glob)
+            ),
         )
         .fb("glob"));
     }
@@ -1065,9 +1082,10 @@ fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
         out.push_str("No files found.\n");
     } else if count > shown {
         out.push_str(&format!(
-            "[qx] showing {shown} of {}{} paths; narrow the pattern or use the native dsh glob tool.\n",
+            "[qx] showing {shown} of {}{} paths; narrow the pattern or use the native {} tool.\n",
             if scan_capped { "at least " } else { "" },
-            count
+            count,
+            native(Native::Glob)
         ));
     }
     if scan_capped {
@@ -1104,15 +1122,19 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     let include = opt_str(args, "include");
     if let Some(inc) = include {
         if inc.contains(',') {
-            return Err(FsError::arg(
-                "include takes one glob; comma-separated lists are not supported (use the native dsh grep tool)",
-            )
+            return Err(FsError::arg(format!(
+                "include takes one glob; comma-separated lists are not supported (use the native {} tool)",
+                native(Native::Grep)
+            ))
             .fb("grep"));
         }
         if inc.starts_with('!') {
             return Err(FsError::new(
                 "FS_UNSUPPORTED",
-                "negated include globs are not supported by qx; use the native dsh grep tool",
+                format!(
+                    "negated include globs are not supported by qx; use the native {} tool",
+                    native(Native::Grep)
+                ),
             )
             .fb("grep"));
         }
@@ -1222,7 +1244,8 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
         out.push_str("No matches found.\n");
     } else if total > shown {
         out.push_str(&format!(
-            "\n[qx] showing {shown} of {total} matches; narrow the search or use the native dsh grep tool.\n"
+            "\n[qx] showing {shown} of {total} matches; narrow the search or use the native {} tool.\n",
+            native(Native::Grep)
         ));
     }
     if skipped_binary > 0 || skipped_large > 0 || read_errors > 0 {
@@ -1413,8 +1436,9 @@ fn list(root: &Root, args: &Value) -> Result<Reply, FsError> {
     }
     if rows.len() > shown {
         out.push_str(&format!(
-            "[qx] showing {shown} of {} entries; use the native dsh tools for the rest.\n",
-            rows.len()
+            "[qx] showing {shown} of {} entries; use the native {} tool for the rest.\n",
+            rows.len(),
+            native(Native::Glob)
         ));
     }
     Ok(Reply {
@@ -1835,10 +1859,17 @@ mod tests {
     fn write_existing_without_read_is_refused() {
         let dir = tmp("not-observed");
         fs::write(dir.join("a.txt"), "old\n").unwrap();
-        let r = invoke(&dir, "write", json!({"path":"a.txt","content":"new\n"}));
+        let refused = |c| {
+            client::scoped(c, || invoke(&dir, "write", json!({"path":"a.txt","content":"new\n"})))
+        };
+        let r = refused(client::Client::Dsh);
         assert!(r.is_error);
         assert_eq!(r.structured["code"], "FS_NOT_OBSERVED");
-        assert!(r.text.contains("native dsh `write`"));
+        assert!(r.text.contains("native `write`"), "{}", r.text);
+        let codex = refused(client::Client::Codex);
+        assert!(codex.text.contains("native `apply_patch`"), "{}", codex.text);
+        let generic = refused(client::Client::Generic);
+        assert!(generic.text.contains("native write tool"), "{}", generic.text);
         assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "old\n");
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1,6 +1,7 @@
 //! qx — fast local command executor for coding agents.
 
 mod builtin;
+mod client;
 mod compact;
 mod digest;
 mod doctor;
