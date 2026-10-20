@@ -6,6 +6,9 @@
 
 /// Remove ANSI escape sequences (colors, cursor moves, OSC titles).
 pub fn strip_ansi(s: &str) -> String {
+    if !s.contains('\x1b') {
+        return s.to_string();
+    }
     let b = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0usize;
@@ -33,8 +36,14 @@ pub fn strip_ansi(s: &str) -> String {
                     }
                     i += 1;
                 }
-            } else if i < b.len() {
+            } else if i < b.len() && b[i].is_ascii() {
+                // ESC 7 / ESC c, or a charset select like ESC ( B. A non-ASCII
+                // byte after ESC is text: skipping it would split a UTF-8 char.
+                let select = matches!(b[i], b'(' | b')' | b'*' | b'+' | b'#' | b'%');
                 i += 1;
+                if select && i < b.len() && b[i].is_ascii() {
+                    i += 1;
+                }
             }
             continue;
         }
@@ -82,15 +91,16 @@ pub fn interesting(line: &str) -> bool {
     IMPORTANT_MARKERS.iter().any(|m| l.contains(m))
 }
 
-fn push_capped(out: &mut String, line: &str) {
+/// Appends the line, cut at `MAX_LINE_CHARS`; true when it was cut (the caller spools the original).
+fn push_capped(out: &mut String, line: &str) -> bool {
     let n = line.chars().count();
-    if n > MAX_LINE_CHARS {
-        out.extend(line.chars().take(MAX_LINE_CHARS));
+    out.push_str(&line[..line.char_indices().nth(MAX_LINE_CHARS).map_or(line.len(), |(i, _)| i)]);
+    let cut = n > MAX_LINE_CHARS;
+    if cut {
         out.push_str(&format!(" ...[+{} chars]", n - MAX_LINE_CHARS));
-    } else {
-        out.push_str(line);
     }
     out.push('\n');
+    cut
 }
 
 /// Collapse runs of three or more identical lines into `line  (xN)`.
@@ -118,6 +128,133 @@ fn collapse(lines: &[&str]) -> (Vec<String>, usize) {
     (out, collapsed)
 }
 
+/// Runs of 8+ lines that differ only in their digits (progress counters,
+/// timestamps) keep the first and last line plus a count. Only used over budget,
+/// where head/tail would drop them anyway; diagnostics are never collapsed.
+fn collapse_similar(lines: Vec<String>) -> (Vec<String>, bool) {
+    let keys: Vec<String> = lines
+        .iter()
+        .map(|l| {
+            let mut k = String::with_capacity(l.len());
+            let mut digits = false;
+            for c in l.chars() {
+                if c.is_ascii_digit() {
+                    if !digits {
+                        k.push('#');
+                    }
+                } else {
+                    k.push(c);
+                }
+                digits = c.is_ascii_digit();
+            }
+            k
+        })
+        .collect();
+    let mut out = Vec::with_capacity(lines.len());
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < lines.len() {
+        let mut j = i + 1;
+        while j < keys.len() && keys[j] == keys[i] {
+            j += 1;
+        }
+        if j - i >= 8 && keys[i].contains('#') && !interesting(&lines[i]) {
+            out.push(lines[i].clone());
+            out.push(format!("[qx] ... {} similar lines (only digits differ) ...", j - i - 2));
+            out.push(lines[j - 1].clone());
+            changed = true;
+        } else {
+            out.extend_from_slice(&lines[i..j]);
+        }
+        i = j;
+    }
+    (out, changed)
+}
+
+/// Drop the working directory from located paths (`C:\proj\src\a.rs:3` ->
+/// `src\a.rs:3`); the caller already knows it. Returns how many were shortened.
+pub fn relative_paths(text: &mut String, cwd: &str) -> usize {
+    let dir = cwd.trim_end_matches(['\\', '/']);
+    if dir.len() < 3 {
+        return 0;
+    }
+    let mut total = 0;
+    for sep in ['\\', '/'] {
+        let pat = format!("{}{sep}", dir.replace(['\\', '/'], &sep.to_string())).to_ascii_lowercase();
+        let hay = text.to_ascii_lowercase(); // same byte offsets as `text`
+        let mut out = String::with_capacity(text.len());
+        let mut at = 0;
+        while let Some(p) = hay[at..].find(&pat) {
+            let p = at + p;
+            // Mid-word or mid-path means a different (longer) path, not ours.
+            let glued = text[..p]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || "_-./\\".contains(c));
+            out.push_str(&text[at..p]);
+            if glued {
+                out.push_str(&text[p..p + pat.len()]);
+            } else {
+                total += 1;
+            }
+            at = p + pat.len();
+        }
+        out.push_str(&text[at..]);
+        *text = out;
+    }
+    total
+}
+
+/// Save the uncut output (already redacted) so a truncation never loses facts:
+/// the agent can grep the file. Keeps the newest 40; None on any I/O error.
+pub fn spool(stdout: &str, stderr: &str) -> Option<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir().join("qx-spool");
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut old: Vec<_> = std::fs::read_dir(&dir).ok()?.flatten().map(|e| e.path()).collect();
+    old.sort();
+    for p in &old[..old.len().saturating_sub(39)] {
+        let _ = std::fs::remove_file(p);
+    }
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let path = dir.join(format!("{ms:015}-{}-{}.log", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    let mut body = stdout.to_string();
+    if !stderr.is_empty() {
+        body.push_str("\n[stderr]\n");
+        body.push_str(stderr);
+    }
+    std::fs::write(&path, body).ok()?;
+    Some(path)
+}
+
+/// `relative_paths` on both streams of a digested build/test/traceback, with a
+/// note saying what the paths are relative to. Under 3 hits the note costs more
+/// than it saves, so nothing changes.
+pub fn relative_to_cwd(so: &mut String, se: &mut String, cwd: Option<&std::path::Path>) {
+    let Some(dir) = cwd
+        .and_then(|d| std::path::absolute(d).ok())
+        .or_else(|| std::env::current_dir().ok())
+    else {
+        return;
+    };
+    let dir = dir.to_string_lossy();
+    let dir = dir.trim_start_matches(r"\\?\");
+    let (mut a, mut b) = (so.clone(), se.clone());
+    let (na, nb) = (relative_paths(&mut a, dir), relative_paths(&mut b, dir));
+    if na + nb < 3 {
+        return;
+    }
+    let t = if na > 0 { &mut a } else { &mut b };
+    if !t.is_empty() && !t.ends_with('\n') {
+        t.push('\n');
+    }
+    t.push_str(&format!("[qx] paths relative to {dir}\n"));
+    (*so, *se) = (a, b);
+}
+
 /// Keep the first `head` and last `tail` lines when output exceeds `max_lines`.
 /// Diagnostic-looking lines from the omitted middle are rescued first.
 /// Returns the compacted text and whether anything was omitted.
@@ -125,7 +262,11 @@ pub fn compact(text: &str, max_lines: usize, head: usize, tail: usize) -> (Strin
     if text.is_empty() {
         return (String::new(), false);
     }
-    let normalized = text.replace("\r\n", "\n");
+    let normalized = if text.contains('\r') {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
     let trailing = normalized.ends_with('\n');
     let mut lines: Vec<&str> = normalized.split('\n').collect();
     if trailing {
@@ -133,16 +274,22 @@ pub fn compact(text: &str, max_lines: usize, head: usize, tail: usize) -> (Strin
     }
 
     let (lines, collapsed) = collapse(&lines);
+    let (lines, similar) = if lines.len() > max_lines {
+        collapse_similar(lines)
+    } else {
+        (lines, false)
+    };
 
     if lines.len() <= max_lines {
         let mut out = String::with_capacity(normalized.len());
+        let mut capped = false;
         for l in &lines {
-            push_capped(&mut out, l);
+            capped |= push_capped(&mut out, l);
         }
         if collapsed > 0 {
             out.push_str(&format!("[qx] collapsed {collapsed} repeated line(s)\n"));
         }
-        return (out, false);
+        return (out, similar || capped);
     }
 
     let h = head.min(lines.len());
@@ -151,32 +298,35 @@ pub fn compact(text: &str, max_lines: usize, head: usize, tail: usize) -> (Strin
     let omitted = remaining - t;
     let middle = &lines[h..lines.len() - t];
 
-    // Rescue diagnostics from the middle, with a bounded budget so a log that
-    // is nothing but "error" lines cannot defeat compaction.
-    const BUDGET: usize = 40;
-    let mut rescued: Vec<&String> = middle.iter().filter(|l| interesting(l)).collect();
+    // Rescue diagnostics from the middle with their message/location lines, with a bounded budget so a
+    // log that is nothing but "error" lines cannot defeat compaction.
+    const BUDGET: usize = 40; // marker lines kept (first half, last half)
+    const MAX_RESCUED: usize = 120; // hard cap on lines, context included
+    let mut groups = rescue_groups(middle, 3);
     let mut rescued_elided = 0usize;
-    if rescued.len() > BUDGET {
-        let keep_first = BUDGET / 2;
-        let keep_last = BUDGET - keep_first;
-        rescued_elided = rescued.len() - BUDGET;
-        let mut picked: Vec<&String> = Vec::with_capacity(BUDGET);
-        picked.extend(rescued.iter().take(keep_first).copied());
-        picked.extend(rescued.iter().skip(rescued.len() - keep_last).copied());
-        rescued = picked;
+    if groups.len() > BUDGET {
+        rescued_elided = groups.len() - BUDGET;
+        groups.drain(BUDGET / 2..groups.len() - (BUDGET - BUDGET / 2));
     }
+    if groups.iter().map(|g| g.len()).sum::<usize>() > MAX_RESCUED {
+        for g in &mut groups {
+            g.end = g.end.min(g.start + MAX_RESCUED / BUDGET);
+        }
+    }
+    let rescued: usize = groups.iter().map(|g| g.len()).sum();
 
     let mut out = String::new();
     for l in &lines[..h] {
         push_capped(&mut out, l);
     }
-    if !rescued.is_empty() {
+    if rescued > 0 {
         out.push_str(&format!(
-            "[qx] --- {} important line(s) rescued from the omitted region ---\n",
-            rescued.len()
+            "[qx] --- {rescued} important line(s) rescued from the omitted region ---\n"
         ));
-        for l in &rescued {
-            push_capped(&mut out, l);
+        for g in &groups {
+            for l in &middle[g.clone()] {
+                push_capped(&mut out, l);
+            }
         }
         if rescued_elided > 0 {
             out.push_str(&format!(
@@ -198,9 +348,97 @@ pub fn compact(text: &str, max_lines: usize, head: usize, tail: usize) -> (Strin
     (out, true)
 }
 
+/// Each diagnostic line in `middle` with up to `follow` plain lines under it: those carry the
+/// `--> file:line:col` or the panic message that makes the marker line usable. A following marker
+/// line starts its own group, so every group holds exactly one marker.
+fn rescue_groups(middle: &[String], follow: usize) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut i = 0;
+    while i < middle.len() {
+        if !interesting(&middle[i]) {
+            i += 1;
+            continue;
+        }
+        let mut end = i + 1;
+        while end < middle.len() && end - i <= follow && !middle[end].trim().is_empty() && !interesting(&middle[end]) {
+            end += 1;
+        }
+        groups.push(i..end);
+        i = end;
+    }
+    groups
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Filler that differs in letters, so head/tail is what gets tested.
+    fn word(i: usize) -> String {
+        format!("{}{}", (b'a' + (i / 26) as u8) as char, (b'a' + (i % 26) as u8) as char)
+    }
+
+    #[test]
+    fn stray_escape_before_multibyte_text_does_not_panic() {
+        let out = strip_ansi("a\x1bé b\x1b(é c");
+        assert!(out.contains('é') && out.contains('b') && out.contains('c'));
+    }
+
+    #[test]
+    fn progress_runs_collapse_but_numbered_errors_stay() {
+        let mut s = String::new();
+        for i in 0..300 {
+            s.push_str(&format!("step {i}/300 ok\n"));
+        }
+        s.push_str("error: boom\n");
+        let (out, cut) = compact(&s, 50, 10, 10);
+        assert!(cut && out.contains("298 similar lines") && out.contains("error: boom"));
+        assert!(out.contains("step 0/300") && out.contains("step 299/300"));
+        assert!(out.lines().count() < 10, "{out}");
+        let e: String = (0..60).map(|i| format!("error: item {i} failed\n")).collect();
+        assert!(!compact(&e, 20, 5, 5).0.contains("similar lines"));
+        // under budget nothing is touched
+        let small: String = (0..12).map(|i| format!("n {i}\n")).collect();
+        assert_eq!(compact(&small, 50, 10, 10).0, small);
+    }
+
+    #[test]
+    fn rescued_errors_keep_their_location_and_message() {
+        let mut s = String::new();
+        for i in 0..200 {
+            s.push_str(&format!("noise {}\n", word(i)));
+        }
+        s.push_str("error[E0308]: mismatched types\n  --> src/main.rs:42:18\n   |\n   | ^^^\n42 | let x: u32 = \"a\";\n\n");
+        s.push_str("thread 'main' panicked at src/lib.rs:77:9:\nindex out of bounds: the len is 3\n");
+        for i in 200..400 {
+            s.push_str(&format!("noise {}\n", word(i)));
+        }
+        let (out, cut) = compact(&s, 100, 20, 20);
+        assert!(cut && out.contains("src/main.rs:42:18") && out.contains("index out of bounds"), "{out}");
+        assert!(!out.contains("42 | let x"), "context stops at 3 lines: {out}");
+        // a log of nothing but multi-line errors still compacts under the hard cap
+        let many: String = (0..300).map(|i| format!("error: e{i}\n  --> a.rs:{i}\n  | x\n  | y\n")).collect();
+        let (out, _) = compact(&many, 100, 10, 10);
+        assert!(out.lines().count() < 150 && out.contains("more important line(s) omitted"), "{}", out.lines().count());
+    }
+
+    #[test]
+    fn spool_keeps_both_streams_whole() {
+        let p = spool("out\n", "err\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "out\n\n[stderr]\nerr\n");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn relative_paths_shorten_only_paths_that_start_at_the_cwd() {
+        let mut t = String::from(
+            r"C:\Proj\src\a.rs:3, c:\proj\b.rs, é D:\x\C:\proj\no, C:/proj/c.rs, C:\ProjX\z",
+        );
+        assert_eq!(relative_paths(&mut t, r"C:\proj\"), 3);
+        assert_eq!(t, r"src\a.rs:3, b.rs, é D:\x\C:\proj\no, c.rs, C:\ProjX\z");
+        let mut root = String::from(r"C:\a");
+        assert_eq!(relative_paths(&mut root, "C:\\"), 0);
+    }
 
     #[test]
     fn ansi_is_removed() {
@@ -216,13 +454,13 @@ mod tests {
 
     #[test]
     fn large_output_keeps_edges() {
-        let text: String = (0..100).map(|i| format!("line{i}\n")).collect();
+        let text: String = (0..100).map(|i| format!("line-{}\n", word(i))).collect();
         let (s, cut) = compact(&text, 10, 3, 2);
         assert!(cut);
-        assert!(s.contains("line0"));
-        assert!(s.contains("line99"));
+        assert!(s.contains("line-aa"));
+        assert!(s.contains("line-dv"));
         assert!(s.contains("95 lines omitted"));
-        assert!(!s.contains("line50"));
+        assert!(!s.contains("line-by"));
     }
 
     #[test]
@@ -232,7 +470,7 @@ mod tests {
             if i == 50 {
                 text.push_str("ERROR: database connection failed\n");
             } else {
-                text.push_str(&format!("line{i}\n"));
+                text.push_str(&format!("line-{}\n", word(i)));
             }
         }
         let (s, cut) = compact(&text, 10, 3, 2);
@@ -266,5 +504,12 @@ mod tests {
         let (s, _) = compact(&text, 20, 5, 5);
         assert!(s.contains("more important line(s) omitted"));
         assert!(s.matches("error ").count() < 100);
+    }
+
+    #[test]
+    fn a_capped_line_reports_the_cut() {
+        let (out, cut) = compact(&"x".repeat(5000), 200, 80, 60);
+        assert!(cut && out.contains("...[+1000 chars]"), "{out}");
+        assert!(!compact("short\n", 200, 80, 60).1);
     }
 }

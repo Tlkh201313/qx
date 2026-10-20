@@ -5,6 +5,9 @@ mod compact;
 mod digest;
 mod doctor;
 mod exec;
+mod fsops;
+#[cfg(test)]
+mod fuzz;
 mod guard;
 mod mcp;
 mod npm;
@@ -82,6 +85,8 @@ fn parse_num(v: Option<&String>, fallback: usize) -> usize {
 
 fn run_cli(args: &[String], force_raw: bool) -> i32 {
     let mut o = RunOpts::default();
+    // `echo data | qx grep x`: the command reads qx's stdin. At a terminal it already does.
+    exec::INHERIT_STDIN.store(!std::io::stdin().is_terminal(), std::sync::atomic::Ordering::Relaxed);
     if force_raw {
         o.stream = false;
         o.compact = false;
@@ -161,6 +166,12 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
         }
     }
 
+    // A bad cwd must fail loudly: built-ins would otherwise run against the wrong place.
+    if let Some(d) = o.cwd.as_ref().filter(|d| !d.is_dir()) {
+        eprintln!("qx: --cwd is not a directory: {}", d.display());
+        return 2;
+    }
+
     // Safety gate: qx is auto-approved in Claude Code, so this is the boundary.
     // It runs before built-ins too, because rm/cp/mv are built-ins.
     let guard_command = match &shell_cmd {
@@ -189,31 +200,29 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
     guard::record("cli", &guard_command, &decision);
 
     let (mut cmd, label) = if let Some(sh) = shell_cmd {
+        // `CI=1 npm test`: the prefix goes to the child only, never into qx's own environment
+        // (that would also reach qx's switches such as QX_REDACT).
+        let (envs, run) = exec::peel_env(&sh);
+        let run = run.to_string();
         // A quoted command with no shell syntax does not need a shell at all.
-        if let Some((prog, sargs)) = exec::split_simple(&sh) {
-            if let Some(b) = builtin::try_exec(&prog, &sargs, o.cwd.as_deref()) {
-                let outcome = exec::Outcome {
-                    code: b.code,
-                    stdout: b.stdout,
-                    stderr: b.stderr,
-                    elapsed: b.elapsed,
-                    timed_out: false,
-                };
-                return emit(outcome, &o, &sh);
+        if let Some((prog, sargs)) = exec::split_simple(&run) {
+            if let Some(b) = builtin::try_exec(&prog, &sargs, o.cwd.as_deref(), &envs) {
+                return emit(b.into(), &o, &sh);
             }
-            if let Some(code) = npm_fast_exec(&prog, &sargs, &o, &sh) {
+            if let Some(code) = direct_exec(&prog, &sargs, &envs, &o, &sh) {
                 return code;
             }
-            if let Some(code) = npx_fast_exec(&prog, &sargs, &o, &sh) {
-                return code;
-            }
-            if let Ok(mut c) = exec::build_command(&prog, &sargs) {
+            if let Ok(mut c) = exec::build_command_at(&prog, &sargs, o.cwd.as_deref()) {
+                exec::apply_envs(&mut c, &envs);
                 exec::apply_cwd(&mut c, &o.cwd);
-                return execute(c, &o, &sh);
+                return execute(vec![c], &o, &sh);
             }
         }
-        match exec::build_shell(&sh, &o.shell) {
-            Ok(c) => (c, sh),
+        match exec::build_shell(&run, &o.shell) {
+            Ok(mut c) => {
+                exec::apply_envs(&mut c, &envs);
+                (c, sh)
+            }
             Err(e) => {
                 eprintln!("qx: {e}");
                 return 2;
@@ -226,30 +235,20 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
         };
         let rest = &args[i + 1..];
         let mut label = program.clone();
-        for a in rest.iter().take(2) {
+        for a in rest.iter().take(4) {
             if label.len() > 80 {
                 break;
             }
             label.push(' ');
             label.push_str(a);
         }
-        if let Some(code) = npm_fast_exec(program, rest, &o, &label) {
+        if let Some(code) = direct_exec(program, rest, &[], &o, &label) {
             return code;
         }
-        if let Some(code) = npx_fast_exec(program, rest, &o, &label) {
-            return code;
+        if let Some(b) = builtin::try_exec(program, rest, o.cwd.as_deref(), &[]) {
+            return emit(b.into(), &o, &label);
         }
-        if let Some(b) = builtin::try_exec(program, rest, o.cwd.as_deref()) {
-            let outcome = exec::Outcome {
-                code: b.code,
-                stdout: b.stdout,
-                stderr: b.stderr,
-                elapsed: b.elapsed,
-                timed_out: false,
-            };
-            return emit(outcome, &o, &label);
-        }
-        match exec::build_command(program, rest) {
+        match exec::build_command_at(program, rest, o.cwd.as_deref()) {
             Ok(c) => (c, label),
             Err(e) => {
                 eprintln!("qx: {e}");
@@ -259,50 +258,77 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
     };
 
     exec::apply_cwd(&mut cmd, &o.cwd);
-    execute(cmd, &o, &label)
+    execute(vec![cmd], &o, &label)
 }
 
-/// `npm run/test/start` without npm's ~100 ms CLI startup. Strictly falls back.
-fn npm_fast_exec(program: &str, args: &[String], o: &RunOpts, label: &str) -> Option<i32> {
-    Some(execute(
-        npm::fast_command(program, args, o.cwd.as_deref())?,
-        o,
-        label,
-    ))
+/// `npm run/test/start` and local-bin `npx` without npm's ~100 ms CLI startup.
+/// Strictly falls back (None) to the real tool.
+fn direct_exec(program: &str, args: &[String], envs: &[(String, String)], o: &RunOpts, label: &str) -> Option<i32> {
+    if exec::sets_npm_config(envs) {
+        return None;
+    }
+    let mut cmds = npm::direct(program, args, o.cwd.as_deref())?;
+    for c in &mut cmds {
+        exec::apply_envs(c, envs);
+    }
+    Some(execute(cmds, o, label))
 }
 
-fn npx_fast_exec(program: &str, args: &[String], o: &RunOpts, label: &str) -> Option<i32> {
-    Some(execute(
-        npm::fast_npx_command(program, args, o.cwd.as_deref())?,
-        o,
-        label,
-    ))
-}
-
-fn execute(mut cmd: Command, o: &RunOpts, label: &str) -> i32 {
+/// Run commands in order, stopping at the first failure (npm pre/main/post).
+fn execute(cmds: Vec<Command>, o: &RunOpts, label: &str) -> i32 {
     if o.stream {
         let start = Instant::now();
-        return match exec::run_stream(&mut cmd) {
-            Ok(code) => {
-                if std::env::var("QX_TIME").ok().as_deref() == Some("1") {
-                    eprintln!("[qx] {} ms, exit {}", start.elapsed().as_millis(), code);
+        let mut code = 0;
+        for mut cmd in cmds {
+            code = match exec::run_stream(&mut cmd, o.timeout) {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("qx: {e}");
+                    return 127;
                 }
-                code
+            };
+            if code != 0 {
+                break;
             }
-            Err(e) => {
-                eprintln!("qx: {e}");
-                127
-            }
-        };
+        }
+        if let (124, Some(t)) = (code, o.timeout) {
+            eprintln!("[qx] timed out after {}s", t.as_secs());
+        }
+        if std::env::var("QX_TIME").ok().as_deref() == Some("1") {
+            eprintln!("[qx] {} ms, exit {}", start.elapsed().as_millis(), code);
+        }
+        return code;
     }
 
-    match exec::run_captured(cmd, o.timeout) {
+    match exec::run_chain(cmds, o.timeout) {
         Ok(out) => emit(out, o, label),
         Err(e) => {
             eprintln!("qx: {e}");
             127
         }
     }
+}
+
+/// `head` closing the pipe must not panic qx (`print!` does): the write error is the reader's choice.
+fn write_out(so: &str, se: &str) {
+    if !so.is_empty() {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(so.as_bytes()).and_then(|()| out.flush());
+    }
+    if !se.is_empty() {
+        let mut err = std::io::stderr();
+        let _ = err.write_all(se.as_bytes()).and_then(|()| err.flush());
+    }
+}
+
+/// Redact on an ANSI-free copy: a colour code between a key and its `=` would hide the secret.
+/// With no secret found the original bytes (colour included) are kept.
+fn redact_text(s: String) -> (String, usize) {
+    if !s.contains('\x1b') {
+        return redact::redact(&s);
+    }
+    let (r, n) = redact::redact(&compact::strip_ansi(&s));
+    if n > 0 { (r, n) } else { (s, 0) }
 }
 
 /// Print a captured result through the compaction pipeline.
@@ -319,51 +345,57 @@ fn emit(out: exec::Outcome, o: &RunOpts, label: &str) -> i32 {
     let do_redact = setting != Some("off") && (setting == Some("1") || !o.stream);
     let mut redactions = 0usize;
     if do_redact {
-        let (a, n) = redact::redact(&so);
+        let (a, n) = redact_text(so);
         so = a;
         redactions += n;
-        let (b, n) = redact::redact(&se);
+        let (b, n) = redact_text(se);
         se = b;
         redactions += n;
     }
 
     if o.stream {
-        if !so.is_empty() {
-            print!("{so}");
-            let _ = std::io::stdout().flush();
-        }
-        if !se.is_empty() {
-            eprint!("{se}");
-            let _ = std::io::stderr().flush();
-        }
+        write_out(&so, &se);
         if redactions > 0 {
             eprintln!("[qx] redacted {redactions} secret(s)");
         }
         return out.code;
     }
 
+    // Compaction or a digest that dropped content leaves the full text on disk, as the MCP path does,
+    // so a slow or non-repeatable command never has to be re-run to see what was cut.
+    let mut spool = None;
     if o.compact {
-        so = compact::strip_ansi(&so);
-        se = compact::strip_ansi(&se);
-        if let Some(d) = digest::digest(label, &so, &se, out.code) {
-            so = d.stdout;
-            se = d.stderr;
-        } else {
-            let (a, _) = compact::compact(&so, o.max_lines, o.head, o.tail);
-            so = a;
-            let (b, _) = compact::compact(&se, o.max_lines.min(120), o.head.min(50), o.tail.min(40));
-            se = b;
+        if so.contains('\x1b') {
+            so = compact::strip_ansi(&so);
+        }
+        if se.contains('\x1b') {
+            se = compact::strip_ansi(&se);
+        }
+        let (kept_so, kept_se, lossy, profile) = match digest::digest(label, &so, &se, out.code) {
+            Some(d) => {
+                let lossy = d.lossy();
+                (d.stdout, d.stderr, lossy, d.profile)
+            }
+            None => {
+                let (a, cut) = compact::compact(&so, o.max_lines, o.head, o.tail);
+                let (b, cut_err) = compact::compact(&se, o.max_lines.min(120), o.head.min(50), o.tail.min(40));
+                (a, b, cut | cut_err, "")
+            }
+        };
+        if lossy {
+            spool = compact::spool(&so, &se);
+        }
+        so = kept_so;
+        se = kept_se;
+        if matches!(profile, "build" | "test" | "traceback") {
+            compact::relative_to_cwd(&mut so, &mut se, o.cwd.as_deref());
         }
     }
 
     let bytes_out = so.len() + se.len();
-    if !so.is_empty() {
-        print!("{so}");
-        let _ = std::io::stdout().flush();
-    }
-    if !se.is_empty() {
-        eprint!("{se}");
-        let _ = std::io::stderr().flush();
+    write_out(&so, &se);
+    if let Some(p) = &spool {
+        eprintln!("[qx] full output: {}", p.display());
     }
     if out.timed_out {
         eprintln!(
@@ -447,14 +479,14 @@ fn gain() -> i32 {
     }
 
     let saved = bin.saturating_sub(bout);
-    let pct = if bin == 0 { 0 } else { saved * 100 / bin };
+    let pct = (saved * 100).checked_div(bin).unwrap_or(0);
     println!("qx gain");
     println!("  calls      : {calls}");
     println!("  exec time  : {:.1}s", ms as f64 / 1000.0);
     println!("  output     : {} KiB -> {} KiB ({}% saved)", bin / 1024, bout / 1024, pct);
     if !per.is_empty() {
         let mut rows: Vec<_> = per.into_iter().collect();
-        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
         println!("  top:");
         for (name, n) in rows.into_iter().take(8) {
             println!("    {n:>5}  {name}");
@@ -562,7 +594,7 @@ fn which(names: &[String]) -> i32 {
             println!("{name} -> qx builtin (in-process, no spawn)");
             continue;
         }
-        match resolve::resolve(name) {
+        match resolve::resolve(name, None) {
             resolve::Target::Direct { exe, prefix } => {
                 if prefix.is_empty() {
                     println!("{name} -> {}", exe.display());
@@ -589,7 +621,7 @@ fn print_help() {
 USAGE
   qx [flags] <program> [args...]     direct exec, shims bypassed
   qx [flags] -c "<command line>"     shell string (auto: cmd or Git Bash)
-  qx mcp                             MCP stdio server (tool: run)
+  qx mcp                             MCP stdio server (tools: run, fs)
   qx doctor                          diagnose why commands are slow
   qx which <command>...              show the real binary that will run
   qx gain                            output savings (needs QX_STATS=1)
@@ -605,7 +637,7 @@ FLAGS
   --tail N            lines kept at the end (default 60)
   --timeout SECS      kill after N seconds
   --cwd DIR           working directory
-  --shell cmd|bash    shell for -c (default auto)
+  --shell cmd|bash|powershell    shell for -c (default auto)
 
 SAFETY GATE
   QX_GUARD=safe|strict|off   default safe (deny catastrophic, warn risky)
@@ -615,6 +647,10 @@ SAFETY GATE
   QX_AUDIT=1                 log every command, not only warnings/blocks
   QX_NPM_FAST=off            disable the npm run/test/start fast path
   QX_NODE_CACHE=off          disable Node's compile cache
+  QX_PYTHON_FAST=1|off       default skips startup hooks keeping system certs; 1 drops certs (fastest), off disables
+  QX_PS_PROFILE=1            keep the PowerShell profile (qx adds -NoProfile by default)
+  QX_MCP_WORKERS=N           parallel MCP tool calls (default 4)
+  QX_FS_THREADS=N            fs grep scan threads (default CPUs/2, max 8)
 
 BUILT-INS (no process spawn)
   pwd echo true false sleep clear cls

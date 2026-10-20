@@ -2,16 +2,25 @@
 //!
 //! npm's CLI costs ~100 ms before the script even starts. This path skips it and
 //! reproduces the parts scripts actually depend on: package root, local bins on
-//! PATH, lifecycle env, and `--` args. Anything unusual returns `None` and the
-//! real npm handles it, so behavior never silently drifts.
+//! PATH, lifecycle env, pre/post hooks and `--` args. Anything unusual returns
+//! `None` and the real npm handles it. Known drift: the resolved `npm_config_*`
+//! values (cache, prefix, registry...) and COLOR are not exported.
 
 use serde_json::Value;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub struct Fast {
+/// One lifecycle script: npm runs `pre<name>`, `<name>`, `post<name>` in turn,
+/// each with its own `npm_lifecycle_*` env.
+pub struct Step {
+    pub event: String,
+    pub script: String,
     pub command: String,
+}
+
+pub struct Fast {
+    pub steps: Vec<Step>,
     pub cwd: PathBuf,
     pub path: OsString,
     pub env: Vec<(&'static str, String)>,
@@ -40,30 +49,36 @@ pub fn is_npx(program: &str) -> bool {
 
 fn basename(program: &str) -> &str {
     program
-        .rsplit(|c| c == '\\' || c == '/')
+        .rsplit(['\\', '/'])
         .next()
         .unwrap_or(program)
 }
 
-pub fn command(f: &Fast) -> Result<Command, String> {
-    let mut c = crate::exec::build_shell(&f.command, "cmd")?;
-    c.current_dir(&f.cwd);
-    c.env("PATH", &f.path);
-    for (k, v) in &f.env {
-        c.env(k, v);
-    }
-    crate::exec::apply_node_cache(&mut c);
-    Ok(c)
+pub fn commands(f: &Fast) -> Result<Vec<Command>, String> {
+    f.steps
+        .iter()
+        .map(|s| {
+            let mut c = crate::exec::build_shell(&s.command, "cmd")?;
+            c.current_dir(&f.cwd);
+            c.env("PATH", &f.path);
+            for (k, v) in &f.env {
+                c.env(k, v);
+            }
+            c.env("npm_lifecycle_event", &s.event);
+            c.env("npm_lifecycle_script", &s.script);
+            crate::exec::apply_child_defaults(&mut c, true);
+            crate::exec::apply_node_cache(&mut c);
+            Ok(c)
+        })
+        .collect()
 }
 
-pub fn fast_command(program: &str, args: &[String], cwd: Option<&Path>) -> Option<Command> {
-    if !is_npm(program) {
-        return None;
+/// Commands to run in order (stop at the first failure) for `npm run/test/start`
+/// or a local-bin `npx`; None means "let the real tool handle it".
+pub fn direct(program: &str, args: &[String], cwd: Option<&Path>) -> Option<Vec<Command>> {
+    if is_npm(program) {
+        return commands(&fast(args, cwd)?).ok();
     }
-    command(&fast(args, cwd)?).ok()
-}
-
-pub fn fast_npx_command(program: &str, args: &[String], cwd: Option<&Path>) -> Option<Command> {
     if !is_npx(program) {
         return None;
     }
@@ -72,7 +87,7 @@ pub fn fast_npx_command(program: &str, args: &[String], cwd: Option<&Path>) -> O
     c.current_dir(&n.cwd);
     c.env("PATH", &n.path);
     crate::exec::apply_node_cache(&mut c);
-    Some(c)
+    Some(vec![c])
 }
 
 /// `npx <local-bin>`: run the local package bin directly instead of paying for
@@ -155,13 +170,6 @@ pub fn fast(args: &[String], cwd: Option<&Path>) -> Option<Fast> {
         "npm_config_prefix",
         "npm_config_userconfig",
         "npm_config_globalconfig",
-        "NPM_CONFIG_SCRIPT_SHELL",
-        "NPM_CONFIG_WORKSPACE",
-        "NPM_CONFIG_WORKSPACES",
-        "NPM_CONFIG_IGNORE_SCRIPTS",
-        "NPM_CONFIG_PREFIX",
-        "NPM_CONFIG_USERCONFIG",
-        "NPM_CONFIG_GLOBALCONFIG",
     ] {
         if std::env::var_os(k).is_some() {
             return None;
@@ -187,28 +195,36 @@ pub fn fast(args: &[String], cwd: Option<&Path>) -> Option<Fast> {
     }
 
     let scripts = pkg.get("scripts")?.as_object()?;
-    let script = scripts.get(&name)?.as_str()?.trim();
-    if script.is_empty() || script.contains("npm_") {
-        return None;
-    }
-    // Pre/post hooks get their own lifecycle env; let npm own that shape.
-    if scripts.contains_key(&format!("pre{name}")) || scripts.contains_key(&format!("post{name}")) {
-        return None;
-    }
     if npmrc_overrides(&root) {
         return None;
     }
-
-    let mut command = script.to_string();
-    for a in &extra {
-        command.push(' ');
-        command.push_str(a);
+    // npm runs pre<name>, <name>, post<name>; only <name> gets the `--` args.
+    let mut steps = Vec::new();
+    for event in [format!("pre{name}"), name.clone(), format!("post{name}")] {
+        let script = match scripts.get(&event) {
+            Some(v) => v.as_str()?.trim(),
+            None if event == name => return None,
+            None => continue,
+        };
+        if script.is_empty() || script.contains("npm_") {
+            return None;
+        }
+        let mut command = script.to_string();
+        if event == name {
+            for a in &extra {
+                command.push(' ');
+                command.push_str(a);
+            }
+        }
+        steps.push(Step {
+            event,
+            script: script.to_string(),
+            command,
+        });
     }
 
     let mut env = vec![
-        ("npm_lifecycle_event", name.clone()),
-        ("npm_lifecycle_script", script.to_string()),
-        ("npm_command", kind.to_string()),
+        ("npm_command", kind),
         ("INIT_CWD", start.to_string_lossy().into_owned()),
         (
             "npm_config_local_prefix",
@@ -225,20 +241,84 @@ pub fn fast(args: &[String], cwd: Option<&Path>) -> Option<Fast> {
     if let Some(v) = pkg.get("version").and_then(Value::as_str) {
         env.push(("npm_package_version", v.to_string()));
     }
+    env.extend(identity());
     Some(Fast {
-        command,
+        steps,
         cwd: root.clone(),
         path: bin_path(&root),
         env,
     })
 }
 
-fn parse(args: &[String]) -> Option<(String, Vec<String>, &'static str)> {
+/// Env real npm exports that tools sniff to detect the package manager
+/// (`npm_config_user_agent`) or to re-invoke npm/node. Omitted when npm or node
+/// cannot be located, never guessed.
+fn identity() -> Vec<(&'static str, String)> {
+    use crate::resolve::Target;
+    let Target::Direct { exe, prefix } = crate::resolve::resolve("npm", None) else {
+        return Vec::new();
+    };
+    let Some(cli) = prefix.first().map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let node = exe.to_string_lossy().into_owned();
+    let mut env = vec![
+        ("npm_execpath", cli.to_string_lossy().into_owned()),
+        ("npm_node_execpath", node.clone()),
+        ("NODE", node),
+    ];
+    let version = cli
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|d| std::fs::read_to_string(d.join("package.json")).ok())
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|p| p.get("version")?.as_str().map(str::to_string));
+    if let (Some(npm), Some(node)) = (version, node_version(&exe)) {
+        env.push((
+            "npm_config_user_agent",
+            format!("npm/{npm} node/{node} win32 x64 workspaces/false"),
+        ));
+    }
+    env
+}
+
+/// `node -v` costs ~50 ms, so keep the answer keyed by node.exe's identity.
+fn node_version(node: &Path) -> Option<String> {
+    let meta = std::fs::metadata(node).ok()?;
+    let secs = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let stamp = format!("{}|{}|{secs}", node.display(), meta.len());
+    let file = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+        .join("qx")
+        .join("node-version");
+    if let Some((s, v)) = std::fs::read_to_string(&file)
+        .ok()
+        .as_deref()
+        .and_then(|t| t.trim().split_once('\n'))
+    {
+        if s == stamp {
+            return Some(v.to_string());
+        }
+    }
+    let mut c = Command::new(node);
+    c.arg("-v");
+    crate::exec::prepare(&mut c);
+    let out = c.output().ok()?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || !v.starts_with('v') {
+        return None;
+    }
+    let _ = std::fs::create_dir_all(file.parent()?);
+    let _ = std::fs::write(&file, format!("{stamp}\n{v}"));
+    Some(v)
+}
+
+fn parse(args: &[String]) -> Option<(String, Vec<String>, String)> {
+    // `kind` is exported as npm_command; npm reports the `run-script` alias as `run`.
     let (name, rest, kind) = match args {
         [cmd, name, rest @ ..] if cmd == "run" || cmd == "run-script" => {
-            (name.clone(), rest, "run-script")
+            (name.clone(), rest, "run".to_string())
         }
-        [cmd, rest @ ..] if cmd == "test" || cmd == "start" => (cmd.clone(), rest, "run-script"),
+        [cmd, rest @ ..] if cmd == "test" || cmd == "start" => (cmd.clone(), rest, cmd.clone()),
         _ => return None,
     };
     if name.is_empty() || name.starts_with('-') || name == "env" {
@@ -366,7 +446,30 @@ mod tests {
         .unwrap();
         assert_eq!(n, "build");
         assert_eq!(a, vec!["--watch"]);
-        assert_eq!(k, "run-script");
+        assert_eq!(k, "run");
+        assert_eq!(parse(&["test".into()]).unwrap().2, "test");
+    }
+
+    #[test]
+    fn pre_and_post_run_around_the_script() {
+        let d = std::env::temp_dir().join(format!("qx-npmchain-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("package.json"),
+            r#"{"scripts":{"prebuild":"echo pre","build":"echo main","postbuild":"echo post","solo":"echo solo","prebad":"echo x","bad":"echo npm_foo"}}"#,
+        )
+        .unwrap();
+        let f = fast(&["run".into(), "build".into(), "--".into(), "--x".into()], Some(&d)).unwrap();
+        let got: Vec<_> = f.steps.iter().map(|s| (s.event.as_str(), s.command.as_str())).collect();
+        assert_eq!(
+            got,
+            [("prebuild", "echo pre"), ("build", "echo main --x"), ("postbuild", "echo post")]
+        );
+        assert_eq!(fast(&["run".into(), "solo".into()], Some(&d)).unwrap().steps.len(), 1);
+        // A script that reads npm_* env falls back, and so does a missing main script.
+        assert!(fast(&["run".into(), "bad".into()], Some(&d)).is_none());
+        assert!(fast(&["run".into(), "pre".into()], Some(&d)).is_none());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -7,9 +7,12 @@
 const KEYS: &[&str] = &[
     "password",
     "passwd",
-    "pwd",
     "secret",
     "secret_access_key",
+    "secret_key",
+    "accountkey",
+    "sharedaccesskey",
+    "_auth",
     "token",
     "api_key",
     "apikey",
@@ -52,25 +55,44 @@ const PREFIXES: &[(&str, usize)] = &[
     ("eyJ", 40),
 ];
 
+use std::borrow::Cow;
+
+fn contains_ci(line: &str, needle: &str) -> bool {
+    let n = needle.as_bytes();
+    line.as_bytes().windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+/// A key block that never closes (a source line that merely mentions the header) stops hiding output after this many lines.
+const KEY_BLOCK_CAP: usize = 200;
+
+/// Hot path: runs on every captured line, so a clean line allocates nothing.
 pub fn redact(input: &str) -> (String, usize) {
     let mut out = String::with_capacity(input.len());
     let mut count = 0usize;
-    let mut in_key_block = false;
-    let lines: Vec<&str> = input.split('\n').collect();
+    let mut hidden: Option<usize> = None; // lines swallowed so far inside an open key block
+    let mut lines = input.split('\n').peekable();
 
-    for (i, line) in lines.iter().enumerate() {
-        let upper = line.to_ascii_uppercase();
-        let has_begin = upper.contains("BEGIN") && upper.contains("PRIVATE KEY");
-        let has_end = upper.contains("END") && upper.contains("PRIVATE KEY");
+    while let Some(line) = lines.next() {
+        let nl = if lines.peek().is_some() { "\n" } else { "" };
+        // `PRIVATE KEY BLOCK-----` is PGP's spelling; one scan rejects the clean lines.
+        let pk = contains_ci(line, "PRIVATE KEY")
+            && (contains_ci(line, "PRIVATE KEY-----") || contains_ci(line, "PRIVATE KEY BLOCK-----"));
+        let has_begin = pk && contains_ci(line, "-----BEGIN");
+        let has_end = pk && contains_ci(line, "-----END");
 
-        if in_key_block {
+        if let Some(n) = hidden {
             if has_end {
-                in_key_block = false;
+                hidden = None;
+                out.push_str(nl);
+                continue;
             }
-            if i + 1 < lines.len() {
-                out.push('\n');
+            if n < KEY_BLOCK_CAP {
+                hidden = Some(n + 1);
+                out.push_str(nl);
+                continue;
             }
-            continue;
+            hidden = None;
+            out.push_str(&format!("[qx] no END line within {KEY_BLOCK_CAP} lines; showing output again\n"));
         }
 
         if has_begin {
@@ -79,31 +101,27 @@ pub fn redact(input: &str) -> (String, usize) {
             // A JSON-encoded key keeps BEGIN and END on one line; a PEM dump
             // spreads them across lines and must stay suppressed until END.
             if !has_end {
-                in_key_block = true;
+                hidden = Some(0);
             }
-            if i + 1 < lines.len() {
-                out.push('\n');
-            }
+            out.push_str(nl);
             continue;
         }
 
         // Bearer first: masking the word "Bearer" as a key value would hide the
         // anchor and leave the actual token exposed.
-        let (masked, n1) = mask_bearer(line);
+        let (masked, n1) = mask_auth(line);
         let (masked, n2) = mask_conn_strings(&masked);
         let (masked, n3) = mask_key_values(&masked);
         let (masked, n4) = mask_tokens(&masked);
         count += n1 + n2 + n3 + n4;
         out.push_str(&masked);
-        if i + 1 < lines.len() {
-            out.push('\n');
-        }
+        out.push_str(nl);
     }
     (out, count)
 }
 
 /// `postgres://user:password@host` -> `postgres://user:***@host`.
-fn mask_conn_strings(line: &str) -> (String, usize) {
+fn mask_conn_strings(line: &str) -> (Cow<'_, str>, usize) {
     let bytes = line.as_bytes();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut search = 0usize;
@@ -117,7 +135,8 @@ fn mask_conn_strings(line: &str) -> (String, usize) {
                 at = Some(k);
                 break;
             }
-            if b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b',' | b';' | b'|' | b'&') {
+            // Userinfo ends at the path: `http://localhost:4873/@scope/pkg` has no password.
+            if b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b',' | b';' | b'|' | b'&' | b'/' | b'?' | b'#') {
                 break;
             }
             k += 1;
@@ -130,56 +149,111 @@ fn mask_conn_strings(line: &str) -> (String, usize) {
                 }
             }
         }
-        search = after;
+        search = k.max(after); // resume where the scan stopped: no rescanning a long line per `://`
     }
     mask_ranges(line, ranges)
 }
 
-fn mask_key_values(line: &str) -> (String, usize) {
-    let lower = line.to_ascii_lowercase();
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
+/// Where a key name may begin: a word start, `accessToken` (camelCase) or `PGPASSWORD` (an all-caps name).
+/// Not `nopassword`: a lowercase key glued to a lowercase word is some other word.
+fn key_starts(b: &[u8], s: usize, e: usize) -> bool {
+    let Some(&prev) = s.checked_sub(1).map(|i| &b[i]) else {
+        return true;
+    };
+    !prev.is_ascii_alphanumeric()
+        || (prev.is_ascii_lowercase() && b[s].is_ascii_uppercase())
+        || (prev.is_ascii_uppercase() && !b[s..e].iter().any(u8::is_ascii_lowercase))
+}
 
-    for key in KEYS {
-        let mut from = 0usize;
-        while from < lower.len() {
-            let Some(pos) = lower[from..].find(key) else {
-                break;
-            };
-            let abs = from + pos;
-            let before_ok = abs == 0 || !line.as_bytes()[abs - 1].is_ascii_alphanumeric();
-            let mut j = abs + key.len();
-            while j < line.len() && (line.as_bytes()[j] == b' ' || line.as_bytes()[j] == b'\t') {
-                j += 1;
+/// Looks backwards from each `=`/`:` (or the space in `--password x`) for a secret-looking
+/// name, so one pass over the line replaces a scan per key.
+fn mask_key_values(line: &str) -> (Cow<'_, str>, usize) {
+    let b = line.as_bytes();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let flags = line.contains("--");
+
+    for (p, &sep) in b.iter().enumerate() {
+        let flag = sep == b' ' && flags;
+        if sep != b'=' && sep != b':' && !flag {
+            continue;
+        }
+        let mut e = p;
+        while e > 0 && matches!(b[e - 1], b' ' | b'\t') {
+            e -= 1;
+        }
+        if e > 0 && matches!(b[e - 1], b'"' | b'\'') {
+            e -= 1; // the key's closing quote: `"password": "x"`
+        }
+        let key_at = KEYS.iter().find_map(|k| {
+            let kb = k.as_bytes();
+            (e >= kb.len()
+                && b[e - kb.len()..e].eq_ignore_ascii_case(kb)
+                && if flag { e >= kb.len() + 2 && &b[e - kb.len() - 2..e - kb.len()] == b"--" } else { key_starts(b, e - kb.len(), e) })
+            .then_some(e - kb.len())
+        });
+        let Some(key_at) = key_at else {
+            continue;
+        };
+        let mut j = p + 1;
+        while j < b.len() && matches!(b[j], b' ' | b'\t') {
+            j += 1;
+        }
+        if let Some(&q) = b.get(j).filter(|c| matches!(c, b'"' | b'\'')) {
+            // A quoted value is one secret, spaces and `;` included; an unclosed quote runs to the end of
+            // the line (fail closed). `password=""` has nothing to mask.
+            let start = j + 1;
+            let mut k = start;
+            while k < b.len() && b[k] != q {
+                k += if b[k] == b'\\' { 2 } else { 1 };
             }
-            if before_ok && j < line.len() && (line.as_bytes()[j] == b'=' || line.as_bytes()[j] == b':') {
-                j += 1;
-                while j < line.len()
-                    && matches!(line.as_bytes()[j], b' ' | b'\t' | b'"' | b'\'')
-                {
-                    j += 1;
-                }
-                let start = j;
-                while j < line.len() {
-                    let b = line.as_bytes()[j];
-                    if matches!(b, b' ' | b'\t' | b',' | b';' | b'"' | b'\'' | b'\r' | b'\n') {
-                        break;
-                    }
-                    j += 1;
-                }
-                if j - start >= 4 {
-                    ranges.push((start, j));
-                }
+            let end = k.min(b.len());
+            if end - start >= 4 {
+                ranges.push((start, end));
             }
-            from = abs + key.len();
+            continue;
+        }
+        let start = j;
+        while j < b.len() && !matches!(b[j], b' ' | b'\t' | b',' | b';' | b'"' | b'\'' | b'\r' | b'\n') {
+            j += 1;
+        }
+        if j - start >= 4 && !is_code_or_prose(b, key_at, sep, start > p + 1, &b[start..j], &b[j..]) {
+            ranges.push((start, j));
         }
     }
 
     mask_ranges(line, ranges)
 }
 
-fn mask_ranges(line: &str, mut ranges: Vec<(usize, usize)>) -> (String, usize) {
+/// An unquoted value that is plainly source or a sentence, not a credential: a path or generic
+/// (`std::env::var(`, `Option<String>`), or, after another word and without a digit, a bare type or the
+/// start of a sentence (`pub token: String`, `error: invalid secret: expected 32 bytes`). A key that opens
+/// a line (`password: Welcome`) is a config entry, so its value is always masked.
+fn is_code_or_prose(b: &[u8], key_at: usize, sep: u8, spaced: bool, value: &[u8], rest: &[u8]) -> bool {
+    // `::`/`<>` mark code only after `name: ` mid-line or `name = `; a glued `KEY=v` or `--flag v` is config.
+    let code_form = match sep {
+        b':' => !b[..key_at].trim_ascii_end().is_empty(),
+        b'=' => spaced,
+        _ => false,
+    };
+    if code_form && (value.windows(2).any(|w| w == b"::") || value.iter().any(|c| matches!(c, b'<' | b'>'))) {
+        return true;
+    }
+    if sep != b':' || value.iter().any(u8::is_ascii_digit) {
+        return false;
+    }
+    let before = &b[..key_at];
+    let after_word = before.last().is_some_and(u8::is_ascii_whitespace)
+        && before.trim_ascii_end().last().is_some_and(u8::is_ascii_alphanumeric);
+    let camel = value[0].is_ascii_uppercase()
+        && value.iter().all(u8::is_ascii_alphabetic)
+        && value.iter().any(u8::is_ascii_lowercase);
+    let sentence = rest.trim_ascii_start().first().is_some_and(u8::is_ascii_alphanumeric);
+    after_word && (camel || sentence)
+}
+
+fn mask_ranges(line: &str, mut ranges: Vec<(usize, usize)>) -> (Cow<'_, str>, usize) {
     if ranges.is_empty() {
-        return (line.to_string(), 0);
+        return (Cow::Borrowed(line), 0);
     }
     ranges.sort();
     let mut merged: Vec<(usize, usize)> = Vec::new();
@@ -194,7 +268,7 @@ fn mask_ranges(line: &str, mut ranges: Vec<(usize, usize)>) -> (String, usize) {
         }
         merged.push((s, e));
     }
-    let mut out = String::new();
+    let mut out = String::with_capacity(line.len());
     let mut pos = 0usize;
     for (s, e) in &merged {
         out.push_str(&line[pos..*s]);
@@ -202,36 +276,51 @@ fn mask_ranges(line: &str, mut ranges: Vec<(usize, usize)>) -> (String, usize) {
         pos = *e;
     }
     out.push_str(&line[pos..]);
-    (out, merged.len())
+    (Cow::Owned(out), merged.len())
 }
 
-fn mask_tokens(line: &str) -> (String, usize) {
+/// First byte of every entry in `PREFIXES` (a test keeps the two in sync), so
+/// most bytes skip the prefix table entirely.
+fn is_prefix_start(b: u8) -> bool {
+    matches!(b, b's' | b'p' | b'r' | b'g' | b'A' | b'x' | b'y' | b'h' | b'n' | b'd' | b'S' | b'e')
+}
+
+fn mask_tokens(line: &str) -> (Cow<'_, str>, usize) {
     let bytes = line.as_bytes();
     let mut out = String::new();
-    let mut i = 0usize;
+    let mut copied = 0usize;
     let mut count = 0usize;
+    let mut i = 0usize;
 
     while i < bytes.len() {
-        if line.is_char_boundary(i) {
-            if let Some((plen, min)) = prefix_at(bytes, i) {
+        if is_prefix_start(bytes[i]) {
+            // `risk-assessment` is not an `sk-` key: a token starts at a word edge.
+            let edge = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || matches!(bytes[i - 1], b'_' | b'-'));
+            // The table scan is the costly part: run it only at a word edge.
+            if let Some((plen, min)) = if edge { prefix_at(bytes, i) } else { None } {
                 let mut j = i + plen;
                 while j < bytes.len() && is_token_byte(bytes[j]) {
                     j += 1;
                 }
-                if j - (i + plen) >= min {
-                    out.push_str(&line[i..i + plen]);
+                // Real npm tokens are plain alphanumerics; `npm_package_name` is an env var.
+                let plain = &bytes[i..i + plen] != b"npm_" || bytes[i + plen..j].iter().all(u8::is_ascii_alphanumeric);
+                if plain && j - (i + plen) >= min {
+                    out.push_str(&line[copied..i + plen]);
                     out.push_str("***");
                     count += 1;
+                    copied = j;
                     i = j;
                     continue;
                 }
             }
         }
-        let ch = line[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
+        i += 1;
     }
-    (out, count)
+    if count == 0 {
+        return (Cow::Borrowed(line), 0);
+    }
+    out.push_str(&line[copied..]);
+    (Cow::Owned(out), count)
 }
 
 fn prefix_at(bytes: &[u8], i: usize) -> Option<(usize, usize)> {
@@ -248,26 +337,28 @@ fn is_token_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'+' | b'/' | b'=')
 }
 
-fn mask_bearer(line: &str) -> (String, usize) {
-    let lower = line.to_ascii_lowercase();
-    let Some(pos) = lower.find("bearer ") else {
-        return (line.to_string(), 0);
-    };
-    let start = pos + 7;
+/// `Bearer <token>` anywhere in the line, and `Basic <base64>` when the line is an Authorization header.
+fn mask_auth(line: &str) -> (Cow<'_, str>, usize) {
     let bytes = line.as_bytes();
-    let mut end = start;
-    while end < bytes.len() && bytes[end].is_ascii_graphic() && !matches!(bytes[end], b'"' | b'\'') {
-        end += 1;
+    let basic = contains_ci(line, "authorization");
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (scheme, min) in [("bearer ", 12), ("basic ", 8)] {
+        if scheme == "basic " && !basic {
+            continue;
+        }
+        let n = scheme.len();
+        for pos in (0..bytes.len().saturating_sub(n - 1)).filter(|&p| bytes[p..p + n].eq_ignore_ascii_case(scheme.as_bytes())) {
+            let start = pos + n;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_graphic() && !matches!(bytes[end], b'"' | b'\'') {
+                end += 1;
+            }
+            if end - start >= min {
+                ranges.push((start, end));
+            }
+        }
     }
-    if end - start >= 12 {
-        let mut out = String::with_capacity(line.len());
-        out.push_str(&line[..start]);
-        out.push_str("***");
-        out.push_str(&line[end..]);
-        (out, 1)
-    } else {
-        (line.to_string(), 0)
-    }
+    mask_ranges(line, ranges)
 }
 
 #[cfg(test)]
@@ -338,5 +429,127 @@ mod tests {
         let (s, n) = redact(input);
         assert_eq!(s, input);
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn prefix_start_table_matches_prefixes() {
+        for (p, _) in PREFIXES {
+            assert!(is_prefix_start(p.as_bytes()[0]), "{p}");
+        }
+    }
+
+    #[test]
+    fn key_value_forms() {
+        let (s, n) = redact("PASSWORD = hunter2xyz and client_secret:\"abcd1234\" x-token=abc key: value\nnopassword=abcdefgh\n");
+        assert_eq!(n, 2, "{s}");
+        assert!(s.contains("PASSWORD = ***") && s.contains("client_secret:\"***\""));
+        assert!(s.contains("nopassword=abcdefgh")); // key must start at a word boundary
+        assert!(s.contains("x-token=abc")); // value under 4 bytes is not a secret
+    }
+
+    #[test]
+    fn masks_json_and_compound_secret_keys() {
+        for (line, secret) in [
+            (r#"{"password": "hunter2hunter2", "user": "bob"}"#, "hunter2hunter2"),
+            (r#"{"api_key":"abcdef0123456789"}"#, "abcdef0123456789"),
+            ("PGPASSWORD=hunter2xyz psql", "hunter2xyz"),
+            ("DJANGO_SECRET_KEY=abcd1234wxyz", "abcd1234wxyz"),
+            (r#"{"accessToken":"abcd1234wxyz"}"#, "abcd1234wxyz"),
+            ("//registry.npmjs.org/:_authToken=abcd1234wxyz", "abcd1234wxyz"),
+            ("//registry.npmjs.org/:_auth=abcd1234wxyz", "abcd1234wxyz"),
+            ("Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA=="),
+            ("DefaultEndpointsProtocol=https;AccountKey=abcd1234wxyz==;", "abcd1234wxyz"),
+            ("Endpoint=sb://x;SharedAccessKey=abcd1234wxyz", "abcd1234wxyz"),
+            ("mytool --password hunter2xyz --verbose", "hunter2xyz"),
+        ] {
+            let (s, n) = redact(line);
+            assert!(n >= 1 && !s.contains(secret), "{line} -> {s}");
+        }
+        assert_eq!(redact("Basic usage of the tool: see docs").0, "Basic usage of the tool: see docs");
+        assert!(redact("nopassword=abcdefgh").0.contains("abcdefgh"));
+    }
+
+    #[test]
+    fn paths_branches_and_env_names_are_not_secrets() {
+        for ok in [
+            "On branch feature/risk-assessment-engine-refactor",
+            "src/disk-usage-monitor-service.ts",
+            "npm_package_dependencies_left_pad_version=1.3.0",
+            "PWD=/c/Users/x/project",
+            "fetching http://localhost:4873/@scope/pkg/-/pkg-1.0.0.tgz",
+        ] {
+            assert_eq!(redact(ok), (ok.to_string(), 0), "{ok}");
+        }
+        assert!(!redact("export NPM=npm_abcdefghijklmnopqrstuvwxyz0123456789").0.contains("abcdefghijklmnop"));
+        assert!(!redact("url sk-abcdefghijklmnopqrstuvwxyz0123").0.contains("abcdefghijklmnop"));
+    }
+
+    #[test]
+    fn a_key_header_in_source_does_not_hide_the_rest() {
+        let (s, _) = redact("let hdr = \"BEGIN PRIVATE KEY\";\nnext line\n");
+        assert!(s.contains("next line"));
+        let open = format!("-----BEGIN PRIVATE KEY-----\n{}tail-marker\n", "AAAA\n".repeat(300));
+        let (s, n) = redact(&open);
+        assert_eq!(n, 1);
+        assert!(s.matches("AAAA").count() == 100 && s.contains("no END line") && s.contains("tail-marker"), "{s}");
+    }
+
+    #[test]
+    fn pgp_blocks_and_quoted_values_are_masked_whole() {
+        let pgp = "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQdGBGabcdef\n-----END PGP PRIVATE KEY BLOCK-----\nafter\n";
+        let (s, n) = redact(pgp);
+        assert!(n == 1 && !s.contains("lQdGBG") && s.contains("after"), "{s}");
+        for (line, secret) in [
+            (r#"password="correct horse; battery""#, "horse"),
+            (r#"password = "correct horse battery staple""#, "staple"),
+            ("secret='my long passphrase here'", "passphrase"),
+            (r#"mytool --password "correct horse" --v"#, "horse"),
+            (r#"{"token": "ab cd\" ef gh"}"#, "ef gh"),
+            ("password=\"unclosed secret words", "words"),
+        ] {
+            let (s, n) = redact(line);
+            assert!(n >= 1 && !s.contains(secret), "{line} -> {s}");
+        }
+        assert_eq!(redact(r#"password="" next=abcdefgh"#).1, 0); // an empty quoted value masks nothing
+    }
+
+    #[test]
+    fn source_code_and_error_text_after_a_key_name_survive() {
+        for ok in [
+            "pub token: String,",
+            "pub password: Option<String>,",
+            "let secret = std::env::var(\"SECRET_KEY\")?;",
+            "error: invalid secret: expected 32 bytes",
+            "Unexpected token: ExpiredSignature",
+        ] {
+            assert_eq!(redact(ok), (ok.to_string(), 0), "{ok}");
+        }
+        // a key that opens the line, or a value with a digit, is still a credential
+        // glued `KEY=value` and `--flag value` are config even when the value holds `::` or `<>`
+        for line in [
+            "password: Welcome",
+            "  token: abcdefgh",
+            "db password: hunter2xyz",
+            "api secret=Welcome",
+            "password=a>b1234",
+            "DB_PASSWORD=Ab12<Cd34xyz",
+            "token=a::b1234",
+            "api_key=abcd>efghijkl",
+            "x --password a>b1234",
+            "password: a>b1234",
+        ] {
+            let (s, n) = redact(line);
+            assert!(n == 1 && s.contains("***"), "{line} -> {s}");
+        }
+    }
+
+    #[test]
+    fn every_bearer_is_masked_and_long_urls_are_linear() {
+        let (s, n) = redact("a Bearer aaaaaaaaaaaaaaaa b Bearer bbbbbbbbbbbbbbbb");
+        assert!(n == 2 && !s.contains("aaaaaaaa") && !s.contains("bbbbbbbb"), "{s}");
+        let long = "://".repeat(100_000);
+        let t = std::time::Instant::now();
+        let _ = redact(&long);
+        assert!(t.elapsed().as_secs() < 2, "quadratic scan: {:?}", t.elapsed());
     }
 }
