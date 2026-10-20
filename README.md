@@ -321,6 +321,21 @@ For `fs`, structured results carry counts, truncation flags, skips, and
 `duration_ms`; errors carry a stable `FS_*` code and a `fallback` hint naming
 the native dsh tool.
 
+### Limits and shutdown
+
+The server runs at most 4 commands at once (`QX_MCP_WORKERS`, clamped 1–16) and
+queues at most 64 more beyond that (`QX_MCP_QUEUE`, clamped 0–1024). A call past
+the limit is refused immediately with `qx busy: N calls already running or
+queued (limit 4+64); retry shortly`, so a runaway client cannot queue unbounded
+work. Requests are routed by their JSON-RPC method, not by text: only a call
+carrying an `id` takes a worker slot, so a `tools/call` notification never
+starts a command.
+
+When the client closes stdin the server stops rather than wait: running
+commands are cancelled (their reply carries `timed_out: true`), calls still
+waiting for a slot are refused with `qx is shutting down; the call was not run`,
+and the server returns within about 3 s. Child processes die with qx's job object.
+
 ## Measured on this machine (AV active)
 
 | command | time |

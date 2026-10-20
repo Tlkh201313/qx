@@ -2,7 +2,7 @@
 
 use crate::{builtin, compact, digest, exec, guard, npm, redact};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,19 +12,45 @@ use std::time::Duration;
 /// only states the routing rule and the output contract.
 const MCP_INSTRUCTIONS: &str = r#"qx is the preferred tool layer for this session. Call `mcp__qx__run` for commands: prefer `program` + `args`, pass the session `cwd`; for env vars use `command: "NAME=v prog args"` (runs prog directly, ~0.15 s) instead of a powershell wrapper (~0.4 s start, ~1.5 s with Start-Process), and keep `mode: "compact"`. Call `mcp__qx__fs` for filesystem work: `op=read|write|edit|glob|grep|list|stat`, always with `cwd`. Use qx fs first for read, glob, and literal grep; qx grep is literal-only, so use native grep for regex. qx fs is workspace-confined, and write/edit require a prior qx read. If a qx call errors, or the task needs dsh sandbox escalation, images, or regex, fall back to the native dsh tool of the same purpose. Native tools always remain available. If a qx `run` is truncated, read its `full_output` spool instead of re-running."#;
 
+/// Bounds the server: concurrent commands, how many more may queue, and how long
+/// shutdown waits for them.
+struct Limits {
+    workers: usize,
+    queue: usize,
+    drain: Duration,
+}
+
+impl Limits {
+    fn from_env() -> Self {
+        let workers = std::env::var("QX_MCP_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, 16);
+        let queue = std::env::var("QX_MCP_QUEUE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64)
+            .min(1024);
+        Limits { workers, queue, drain: Duration::from_secs(3) }
+    }
+}
+
 pub fn serve() -> i32 {
-    let workers = std::env::var("QX_MCP_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(4)
-        .clamp(1, 16);
-
     let stdin = std::io::stdin();
-    let out = Arc::new(Mutex::new(std::io::stdout()));
-    let gate = Gate::new(workers);
-    let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    serve_io(stdin.lock(), std::io::stdout(), Limits::from_env())
+}
 
-    let mut reader = BufReader::new(stdin.lock());
+/// Reads requests from `reader`, answers on `out`. Separated from `serve` so a test can drive it.
+fn serve_io<R: BufRead, W: Write + Send + 'static>(mut reader: R, out: W, limits: Limits) -> i32 {
+    // One process serves one session, so this starts fresh: a shutdown flag from a previous
+    // session must never refuse the first call of this one.
+    SHUTDOWN.store(false, Ordering::SeqCst);
+    let out = Arc::new(Mutex::new(out));
+    let gate = Gate::new(limits.workers);
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let limit = limits.workers + limits.queue;
+
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -36,43 +62,116 @@ pub fn serve() -> i32 {
         if line.trim().is_empty() {
             continue;
         }
-        // Only `tools/call` runs long. ping, cancel and listing answer at once, even when every worker is busy.
-        if !line.contains("tools/call") {
-            if let Some(resp) = respond(line.trim()) {
+        // Parse once here: routing on the decoded method cannot be fooled by text that merely
+        // mentions `tools/call` in its params.
+        let req = match serde_json::from_str::<Value>(line.trim()) {
+            Ok(req) => req,
+            Err(_) => {
+                send(&out, &rpc_error(Value::Null, -32700, "parse error"));
+                continue;
+            }
+        };
+        // Only a call runs long. ping, cancel and listing answer at once, even when every worker is busy.
+        if route(&req) == Route::Inline {
+            if let Some(resp) = respond_value(&req) {
                 send(&out, &resp);
             }
             continue;
         }
-        // Backpressure: the gate bounds running commands, but the wait for a slot happens on the
-        // worker so this loop keeps reading (cancel, ping) while every slot is busy.
-        active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Admission: a call past `workers + queue` is refused at once, so a runaway client cannot
+        // queue unbounded work. The wait for a slot happens on the worker thread, so this loop keeps
+        // reading (cancel, ping) while every slot is busy.
+        active.fetch_add(1, Ordering::SeqCst);
+        let n = active.load(Ordering::SeqCst);
+        if n > limit {
+            active.fetch_sub(1, Ordering::SeqCst);
+            for id in worker_ids(&req) {
+                let text = format!(
+                    "qx busy: {} calls already running or queued (limit {}+{}); retry shortly",
+                    n - 1,
+                    limits.workers,
+                    limits.queue
+                );
+                send(&out, &tool_result(Some(id), &text, true, json!({ "source": "busy" })));
+            }
+            continue;
+        }
         let out = out.clone();
         let active = active.clone();
         let gate = gate.clone();
         std::thread::spawn(move || {
             let _active = Active(active);
             let _slot = gate.acquire();
-            if let Some(resp) = respond(line.trim()) {
+            if SHUTDOWN.load(Ordering::SeqCst) {
+                // The client is gone: never start work nobody will read.
+                for id in worker_ids(&req) {
+                    send(&out, &tool_text(Some(id), "qx is shutting down; the call was not run", true));
+                }
+                return;
+            }
+            if let Some(resp) = respond_value(&req) {
                 send(&out, &resp);
             }
         });
     }
 
-    // Let in-flight requests finish so their replies are flushed.
-    while active.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    // The client closed stdin. Stop the work rather than let it run to its own timeout: children
+    // die with qx's job object, and a call still waiting for a slot never starts.
+    cancel_all();
+    let deadline = std::time::Instant::now() + limits.drain;
+    while active.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
     }
     0
 }
 
-fn send(out: &Mutex<std::io::Stdout>, resp: &Value) {
+/// Inline answers and worker answers differ only in where they run, never in content: this is the
+/// routing rule, so a `tools/call` notification is never handed to a worker.
+#[derive(Debug, PartialEq)]
+enum Route {
+    Inline,
+    Worker,
+}
+
+fn is_worker(req: &Value) -> bool {
+    req.get("method").and_then(Value::as_str) == Some("tools/call") && req.get("id").is_some()
+}
+
+fn route(req: &Value) -> Route {
+    let worker = match req {
+        Value::Array(batch) => batch.iter().any(is_worker),
+        one => is_worker(one),
+    };
+    if worker {
+        Route::Worker
+    } else {
+        Route::Inline
+    }
+}
+
+/// Request ids a refused or shutdown reply must cover: one per call in a batch.
+fn worker_ids(req: &Value) -> Vec<Value> {
+    match req {
+        Value::Array(batch) => batch
+            .iter()
+            .filter(|v| is_worker(v))
+            .filter_map(|v| v.get("id").cloned())
+            .collect(),
+        one => one.get("id").cloned().into_iter().collect(),
+    }
+}
+
+fn send<W: Write>(out: &Mutex<W>, resp: &Value) {
     if let Ok(s) = serde_json::to_string(resp) {
-        // A poisoned lock still holds a usable stdout.
+        // A poisoned lock still holds a usable writer.
         let mut o = out.lock().unwrap_or_else(|e| e.into_inner());
         let _ = writeln!(o, "{s}");
         let _ = o.flush();
     }
 }
+
+/// Set once the client has closed its end: no command may start after it.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Running `tools/call`s by request id, so `notifications/cancelled` can stop the right one.
 static INFLIGHT: Mutex<Vec<(String, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
@@ -96,7 +195,9 @@ impl Inflight {
             let mut early = EARLY_CANCELS.lock().unwrap_or_else(|e| e.into_inner());
             let before = early.len();
             early.retain(|k| *k != key);
-            let flag = Arc::new(AtomicBool::new(early.len() != before));
+            let flag = Arc::new(AtomicBool::new(
+                SHUTDOWN.load(Ordering::SeqCst) || early.len() != before,
+            ));
             running.push((key.clone(), flag.clone()));
             flag
         };
@@ -130,6 +231,15 @@ fn cancel(id: &Value) {
             early.remove(0);
         }
         early.push(key);
+    }
+}
+
+/// The client is gone: refuse new work and stop what runs. Children are killed by qx's job object.
+fn cancel_all() {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+    let running = INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    for (_, flag) in running.iter() {
+        flag.store(true, Ordering::Relaxed);
     }
 }
 
@@ -180,17 +290,22 @@ impl Drop for Active {
 /// One input line to its reply. Malformed input and handler panics still get an
 /// answer: a client waiting on an id would otherwise hang forever.
 fn respond(line: &str) -> Option<Value> {
-    let Ok(req) = serde_json::from_str::<Value>(line) else {
-        return Some(rpc_error(Value::Null, -32700, "parse error"));
-    };
-    if let Value::Array(batch) = &req {
+    match serde_json::from_str::<Value>(line) {
+        Ok(req) => respond_value(&req),
+        Err(_) => Some(rpc_error(Value::Null, -32700, "parse error")),
+    }
+}
+
+/// The same answer for an already-parsed request, so the server parses each line once.
+fn respond_value(req: &Value) -> Option<Value> {
+    if let Value::Array(batch) = req {
         if batch.is_empty() {
             return Some(rpc_error(Value::Null, -32600, "invalid request: empty batch"));
         }
         let replies: Vec<Value> = batch.iter().filter_map(guarded).collect();
         return (!replies.is_empty()).then_some(Value::Array(replies));
     }
-    guarded(&req)
+    guarded(req)
 }
 
 fn guarded(req: &Value) -> Option<Value> {
@@ -755,5 +870,162 @@ mod tests {
         assert_eq!(code("5"), json!(-32600));
         let batch = respond("[1]").unwrap();
         assert_eq!(batch[0]["error"]["code"], json!(-32600));
+    }
+
+    #[test]
+    fn route_is_by_method_not_by_text() {
+        assert_eq!(
+            route(&json!({"jsonrpc":"2.0","id":"tools/call","method":"ping"})),
+            Route::Inline
+        );
+        assert_eq!(
+            route(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"tools/call"}})),
+            Route::Inline
+        );
+        // A notification is never run, so it must never take a worker slot.
+        assert_eq!(
+            route(&json!({"jsonrpc":"2.0","method":"tools/call","params":{}})),
+            Route::Inline
+        );
+        assert_eq!(
+            route(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{}})),
+            Route::Worker
+        );
+        assert_eq!(
+            route(&json!([{"jsonrpc":"2.0","id":4,"method":"ping"},{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{}}])),
+            Route::Worker
+        );
+    }
+
+    #[test]
+    fn unknown_methods_like_server_discover_get_method_not_found() {
+        // dsh probes a throwaway sibling qx with this before it starts the real one.
+        let r = respond(r#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}"#).unwrap();
+        assert_eq!(r.pointer("/error/code"), Some(&json!(-32601)));
+    }
+
+    /// Replies land here instead of stdout, so `serve_io` can be driven by a test.
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Sink {
+        fn replies(&self) -> Vec<Value> {
+            let buf = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            String::from_utf8_lossy(&buf)
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("every reply is one JSON line"))
+                .collect()
+        }
+        fn reply(&self, id: u64) -> Option<Value> {
+            self.replies().into_iter().find(|v| v.get("id") == Some(&json!(id)))
+        }
+    }
+
+    /// A line source that answers everything at once and only then pauses before EOF, so the
+    /// server's reader loop has admitted the calls it was given.
+    struct SlowEof(std::io::Cursor<Vec<u8>>, bool, Duration);
+
+    impl SlowEof {
+        fn new(text: &str, pause: Duration) -> Self {
+            SlowEof(std::io::Cursor::new(text.as_bytes().to_vec()), false, pause)
+        }
+        fn pause_once(&mut self) {
+            if !self.1 {
+                self.1 = true;
+                std::thread::sleep(self.2);
+            }
+        }
+    }
+
+    impl std::io::Read for SlowEof {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(buf)?;
+            if n == 0 {
+                self.pause_once();
+            }
+            Ok(n)
+        }
+    }
+
+    impl BufRead for SlowEof {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if self.0.fill_buf()?.is_empty() {
+                self.pause_once();
+            }
+            self.0.fill_buf()
+        }
+        fn consume(&mut self, n: usize) {
+            self.0.consume(n)
+        }
+    }
+
+    /// `SHUTDOWN` is process-wide, so the tests that drive a whole server run one at a time.
+    static SERVER: Mutex<()> = Mutex::new(());
+
+    fn server_lock() -> std::sync::MutexGuard<'static, ()> {
+        let guard = SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        SHUTDOWN.store(false, Ordering::SeqCst);
+        guard
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn eof_cancels_running_and_queued_calls_promptly() {
+        let _server = server_lock();
+        // The pause before EOF is what makes "running" and "queued" deterministic: the first call
+        // has really started when the client closes.
+        let limits = Limits { workers: 1, queue: 4, drain: Duration::from_secs(3) };
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"run","arguments":{"program":"ping","args":["-n","30","127.0.0.1"],"timeout_ms":60000}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"run","arguments":{"program":"ping","args":["-n","30","127.0.0.1"],"timeout_ms":60000}}}"#,
+            "\n",
+        );
+        let sink = Sink::default();
+        let t = std::time::Instant::now();
+        let code = serve_io(SlowEof::new(input, Duration::from_millis(700)), sink.clone(), limits);
+        assert!(t.elapsed() < Duration::from_secs(6), "shutdown took {:?}", t.elapsed());
+        assert_eq!(code, 0);
+        let running = sink.reply(11).expect("the running call answers");
+        assert_eq!(running.pointer("/result/structuredContent/timed_out"), Some(&json!(true)));
+        let queued = sink.reply(12).expect("the queued call answers");
+        assert_eq!(queued.pointer("/result/isError"), Some(&json!(true)));
+        let text = queued.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
+        assert!(text.contains("qx is shutting down"), "queued call text: {text}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn calls_beyond_the_limit_get_busy() {
+        let _server = server_lock();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"run","arguments":{"program":"ping","args":["-n","30","127.0.0.1"],"timeout_ms":60000}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"run","arguments":{"command":"pwd"}}}"#,
+            "\n",
+        );
+        let sink = Sink::default();
+        let limits = Limits { workers: 1, queue: 0, drain: Duration::from_secs(3) };
+        let code = serve_io(std::io::Cursor::new(input.as_bytes().to_vec()), sink.clone(), limits);
+        assert_eq!(code, 0);
+        let busy = sink.reply(22).expect("the over-limit call answers");
+        assert_eq!(busy.pointer("/result/isError"), Some(&json!(true)));
+        assert_eq!(busy.pointer("/result/structuredContent/source"), Some(&json!("busy")));
+        let text = busy.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
+        assert!(text.contains("qx busy"), "over-limit text: {text}");
     }
 }
