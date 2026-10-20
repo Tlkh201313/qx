@@ -5,7 +5,7 @@
 //! reads pi's own `package.json`: guessing from a config path would silently install
 //! the wrong half.
 
-use super::jsonc::{set_member, to_strict_json};
+use super::jsonc::{member as jsonc_member, set_member, to_strict_json};
 use super::{Action, Edit, Paths};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -73,10 +73,22 @@ pub fn edit_pi(
     };
     if version >= BUILTIN_MCP {
         let file = mcp_file(p);
+        // Keep the env keys a user already set on the qx entry.
+        let existing = std::fs::read_to_string(&file).ok().and_then(|text| {
+            let range = jsonc_member(&text, &["mcpServers", "qx"]).ok()??;
+            serde_json::from_str::<Value>(&to_strict_json(&text[range])).ok()
+        });
+        let mut env = serde_json::Map::new();
+        if let Some(Value::Object(map)) = existing.as_ref().and_then(|e| e.get("env")) {
+            for (k, v) in map {
+                env.insert(k.clone(), v.clone());
+            }
+        }
+        env.insert("QX_CLIENT".to_string(), json!("pi"));
         let entry = json!({
             "command": exe.to_string_lossy(),
             "args": ["mcp"],
-            "env": { "QX_CLIENT": "pi" },
+            "env": env,
             "exposure": "direct",
             "timeout": 600,
         });

@@ -86,15 +86,16 @@ fn serve_io<R: BufRead, W: Write + Send + 'static>(mut reader: R, out: W, limits
         let n = active.load(Ordering::SeqCst);
         if n > limit {
             active.fetch_sub(1, Ordering::SeqCst);
-            for id in worker_ids(&req) {
-                let text = format!(
-                    "qx busy: {} calls already running or queued (limit {}+{}); retry shortly",
-                    n - 1,
-                    limits.workers,
-                    limits.queue
-                );
-                send(&out, &tool_result(Some(id), &text, true, json!({ "source": "busy" })));
-            }
+            let text = format!(
+                "qx busy: {} calls already running or queued (limit {}+{}); retry shortly",
+                n - 1,
+                limits.workers,
+                limits.queue
+            );
+            // Every request that carries an id gets an answer, and a batch stays a batch.
+            send_all(&out, &req, |id| {
+                tool_result(Some(id), &text, true, json!({ "source": "busy" }))
+            });
             continue;
         }
         let out = out.clone();
@@ -104,10 +105,11 @@ fn serve_io<R: BufRead, W: Write + Send + 'static>(mut reader: R, out: W, limits
             let _active = Active(active);
             let _slot = gate.acquire();
             if SHUTDOWN.load(Ordering::SeqCst) {
-                // The client is gone: never start work nobody will read.
-                for id in worker_ids(&req) {
-                    send(&out, &tool_text(Some(id), "qx is shutting down; the call was not run", true));
-                }
+                // The client is gone: never start work nobody will read, but still answer
+                // every id that was waiting.
+                send_all(&out, &req, |id| {
+                    tool_text(Some(id), "qx is shutting down; the call was not run", true)
+                });
                 return;
             }
             if let Some(resp) = respond_value(&req) {
@@ -150,15 +152,25 @@ fn route(req: &Value) -> Route {
     }
 }
 
-/// Request ids a refused or shutdown reply must cover: one per call in a batch.
-fn worker_ids(req: &Value) -> Vec<Value> {
+/// Request ids a refused reply must cover: every request that carries one, so a batch
+/// stays a batch and no id is left waiting.
+fn send_all<W: Write>(out: &Mutex<W>, req: &Value, reply: impl Fn(Value) -> Value) {
     match req {
-        Value::Array(batch) => batch
-            .iter()
-            .filter(|v| is_worker(v))
-            .filter_map(|v| v.get("id").cloned())
-            .collect(),
-        one => one.get("id").cloned().into_iter().collect(),
+        Value::Array(batch) => {
+            let replies: Vec<Value> = batch
+                .iter()
+                .filter_map(|item| item.get("id").cloned())
+                .map(&reply)
+                .collect();
+            if !replies.is_empty() {
+                send(out, &Value::Array(replies));
+            }
+        }
+        one => {
+            if let Some(id) = one.get("id").cloned() {
+                send(out, &reply(id));
+            }
+        }
     }
 }
 
@@ -1024,12 +1036,18 @@ mod tests {
     }
 
     impl Sink {
+        /// Every reply, with a batch reply spread out so an id can be looked up directly.
         fn replies(&self) -> Vec<Value> {
             let buf = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            String::from_utf8_lossy(&buf)
-                .lines()
-                .map(|l| serde_json::from_str(l).expect("every reply is one JSON line"))
-                .collect()
+            let mut out = Vec::new();
+            for line in String::from_utf8_lossy(&buf).lines() {
+                let value: Value = serde_json::from_str(line).expect("every reply is one JSON line");
+                match value {
+                    Value::Array(items) => out.extend(items),
+                    one => out.push(one),
+                }
+            }
+            out
         }
         fn reply(&self, id: u64) -> Option<Value> {
             self.replies().into_iter().find(|v| v.get("id") == Some(&json!(id)))
@@ -1136,13 +1154,24 @@ mod tests {
             return;
         }
         let d = std::env::temp_dir().join(format!("qx-mcp-coreutil-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
+        std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("create_dir_all({}): {e}", d.display()));
         std::fs::write(d.join("a.txt"), "1\n").unwrap();
         std::fs::write(d.join("b.txt"), "1\n2\n").unwrap();
         let cwd = d.to_string_lossy().to_string();
         let r = client::scoped(Client::Dsh, || {
             call(json!({"program":"wc","args":["-l","a.txt","b.txt"],"cwd":cwd,"mode":"full"}))
         });
+        let stderr = r
+            .pointer("/result/structuredContent/stderr")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        // A sandbox that denies msys its named objects (NtCreateDirectoryObject) cannot run
+        // this at all; that is the environment refusing, not the fallback being wrong.
+        if stderr.contains("fatal error") && stderr.contains("NtCreateDirectoryObject") {
+            println!("skip: this process cannot run msys binaries (named-object access denied)");
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
         let text = r
             .pointer("/result/structuredContent/stdout")
             .and_then(Value::as_str)
@@ -1156,6 +1185,31 @@ mod tests {
         );
         assert!(text.contains("total"), "{text}");
         assert!(text.contains('3'), "{text}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_busy_batch_answers_every_id() {
+        let _server = server_lock();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"run","arguments":{"program":"ping","args":["-n","8","127.0.0.1"],"timeout_ms":60000}}}"#,
+            "\n",
+            r#"[{"jsonrpc":"2.0","id":32,"method":"ping"},{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"run","arguments":{"command":"pwd"}}}]"#,
+            "\n",
+        );
+        let sink = Sink::default();
+        let limits = Limits { workers: 1, queue: 0, drain: Duration::from_secs(3) };
+        let code = serve_io(std::io::Cursor::new(input.as_bytes().to_vec()), sink.clone(), limits);
+        assert_eq!(code, 0);
+        let replies = sink.replies();
+        let by_id = |id: u64| replies.iter().find(|v| v.get("id") == Some(&json!(id))).cloned();
+        // A busy batch must answer its non-call requests too, and stay an array.
+        let ping = by_id(32).unwrap_or_else(|| panic!("id 32 unanswered: {replies:?}"));
+        assert!(ping.get("result").is_some(), "{ping}");
+        let refused = by_id(33).unwrap_or_else(|| panic!("id 33 unanswered: {replies:?}"));
+        assert_eq!(refused.pointer("/result/structuredContent/source"), Some(&json!("busy")));
     }
 
     #[cfg(windows)]

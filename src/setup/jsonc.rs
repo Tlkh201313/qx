@@ -240,12 +240,10 @@ fn insert_into_object(text: &str, path: &[&str], value: &Value) -> Result<String
         .unwrap_or_else(|| format!("{close_indent}  "));
     // What precedes the closing brace decides the separator: an empty object needs a
     // leading newline, a trailing comma needs none, anything else needs a comma.
-    let mut last = close;
-    while last > parent + 1 && b[last - 1].is_ascii_whitespace() {
-        last -= 1;
-    }
     let empty = list.is_empty();
-    let trailing_comma = !empty && b.get(last.wrapping_sub(1)) == Some(&b',');
+    // A comment may sit between the last member and the closing brace, so a backwards
+    // whitespace skip would miss a trailing comma and write a second one.
+    let trailing_comma = !empty && last_significant(&b[parent..close]) == Some(b',');
     let key = serde_json::to_string(path[path.len() - 1]).map_err(|e| e.to_string())?;
     let mut member_text = String::new();
     if !empty && !trailing_comma {
@@ -331,6 +329,42 @@ fn skip(b: &[u8], i: &mut usize) {
         }
         return;
     }
+}
+
+/// The last byte outside strings, whitespace and comments.
+fn last_significant(bytes: &[u8]) -> Option<u8> {
+    let mut i = 0;
+    let mut last = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let mut j = i;
+                if string_bytes(bytes, &mut j).is_err() {
+                    return last;
+                }
+                last = Some(b'"');
+                i = j;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            c if c.is_ascii_whitespace() => i += 1,
+            c => {
+                last = Some(c);
+                i += 1;
+            }
+        }
+    }
+    last
 }
 
 fn string_value(text: &str, i: &mut usize) -> Result<String, String> {
@@ -542,5 +576,17 @@ mod tests {
         // A //-comment inside a string is not a comment.
         let v: Value = serde_json::from_str(&to_strict_json(r#"{"u":"http://x"}"#)).unwrap();
         assert_eq!(v["u"], "http://x");
+    }
+
+    #[test]
+    fn a_comment_after_a_trailing_comma_is_not_a_second_comma() {
+        let src = "{\n  \"servers\": {\n    \"other\": {\"x\": 1}, // keep me\n  },\n}\n";
+        let out = set_member(src, &["servers", "qx"], &json!({"type":"local"})).unwrap();
+        assert!(out.contains("// keep me"), "{out}");
+        let strict = to_strict_json(&out);
+        assert!(!strict.contains(",,"), "{strict}");
+        let v: Value = serde_json::from_str(&strict).unwrap();
+        assert_eq!(v["servers"]["qx"]["type"], "local");
+        assert_eq!(v["servers"]["other"]["x"], 1);
     }
 }

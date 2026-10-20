@@ -61,6 +61,14 @@ pub fn edit_dsh(text: Option<&str>, exe: &Path, a: Action) -> Edit {
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         dsh_item(&refs)
     };
+    // An item spelled some other way (flow mapping, quoted id) is not ours to rewrite:
+    // appending a second mcp-qx registration would give dsh two qx servers.
+    if block.is_none() && text.is_some_and(|t| t.contains("mcp-qx")) {
+        return Edit::Refuse(refusal_dsh(
+            exe,
+            "this file already has an mcp-qx item in a shape qx does not rewrite",
+        ));
+    }
     match (block, a) {
         (None, Action::Remove) => Edit::Unchanged,
         (None, Action::Install) => {
@@ -95,19 +103,19 @@ pub fn edit_dsh(text: Option<&str>, exe: &Path, a: Action) -> Edit {
                         let Some(command) =
                             (start..end).find(|i| lines[*i].trim().starts_with("command:"))
                         else {
-                            return Edit::Refuse(refusal(exe, "the mcp-qx item has no config.command"));
+                            return Edit::Refuse(refusal_dsh(exe, "the mcp-qx item has no config.command"));
                         };
                         let Some((env, env_indent)) = dsh_env(&refs, start, end) else {
-                            return Edit::Refuse(refusal(exe, "the mcp-qx item has no config.env block"));
+                            return Edit::Refuse(refusal_dsh(exe, "the mcp-qx item has no config.env block"));
                         };
                         (command, env, env_indent)
                     };
                     let ci = indent_of(lines[command].as_str());
-                    lines[command] = format!("{}command: '{}'", " ".repeat(ci), slash(exe));
+                    lines[command] = format!("{}command: '{}'", " ".repeat(ci), yaml_path(exe));
 
                     let after = lines[env].trim()["env:".len()..].trim().to_string();
                     if !after.is_empty() && after != "{}" {
-                        return Edit::Refuse(refusal(exe, "config.env is a flow-style mapping"));
+                        return Edit::Refuse(refusal_dsh(exe, "config.env is a flow-style mapping"));
                     }
                     if after == "{}" {
                         lines[env] = format!("{}env:", " ".repeat(env_indent));
@@ -154,8 +162,19 @@ fn dsh_new_item(exe: &Path) -> String {
         toolCallTimeoutMs: 300000
         failOnStartupError: true
 ",
-        slash(exe)
+        yaml_path(exe)
     )
+}
+
+/// A dsh path with `/` separators, safe inside a YAML single-quoted scalar: a quote in
+/// the path is doubled, which is how YAML escapes it.
+fn yaml_path(p: &Path) -> String {
+    slash(p).replace('\'', "''")
+}
+
+/// The raw path, safe inside a YAML single-quoted scalar.
+fn yaml_scalar_path(p: &Path) -> String {
+    p.to_string_lossy().replace('\'', "''")
 }
 
 pub fn dsh_command(text: &str) -> Option<String> {
@@ -186,7 +205,7 @@ fn verdict(out: String, original: Option<&str>) -> Edit {
 pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
     let source = text.unwrap_or("");
     if has_tab_indent(source) {
-        return Edit::Refuse(refusal(exe, "config.yaml uses tab indentation"));
+        return Edit::Refuse(refusal_hermes(exe, "config.yaml uses tab indentation"));
     }
     let had_newline = text.is_some_and(|t| t.ends_with('\n') || t.is_empty());
     let mut lines: Vec<String> = source.lines().map(str::to_string).collect();
@@ -211,7 +230,7 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
     // A flow-style mapping hides the whole server list on one line.
     let inline = lines[servers].trim()["mcp_servers:".len()..].trim().to_string();
     if !inline.is_empty() && inline != "{}" {
-        return Edit::Refuse(refusal(exe, "mcp_servers is a flow-style mapping"));
+        return Edit::Refuse(refusal_hermes(exe, "mcp_servers is a flow-style mapping"));
     }
     if inline == "{}" {
         lines[servers] = "mcp_servers:".to_string();
@@ -251,6 +270,11 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
                     verdict(finish(lines, had_newline), text)
                 }
                 Action::Install => {
+                    // `qx: {…}` keeps the user's keys on one line; rewriting it would drop them.
+                    let inline = lines[start].trim()["qx:".len()..].trim().to_string();
+                    if !inline.is_empty() && inline != "{}" {
+                        return Edit::Refuse(refusal_hermes(exe, "the qx server is a flow-style mapping"));
+                    }
                     let kept = kept_env(&lines, start, qend);
                     let block = hermes_block(exe, &" ".repeat(child_indent), &kept);
                     lines.splice(start..qend, std::iter::once(block));
@@ -274,7 +298,7 @@ fn hermes_block(exe: &Path, indent: &str, kept: &[String]) -> String {
     let deeper = format!("{indent}  ");
     let mut out = format!(
         "{indent}qx:\n{deeper}command: '{}'\n{deeper}args: [mcp]\n{deeper}env:\n{deeper}  QX_CLIENT: hermes\n{deeper}timeout: 600\n{deeper}connect_timeout: 60",
-        exe.to_string_lossy()
+        yaml_scalar_path(exe)
     );
     for line in kept {
         out.push('\n');
@@ -334,10 +358,17 @@ fn finish(lines: Vec<String>, trailing_newline: bool) -> String {
     out
 }
 
-fn refusal(exe: &Path, why: &str) -> String {
+fn refusal_dsh(exe: &Path, why: &str) -> String {
     format!(
         "{why}. Edit it by hand, or paste this equivalent:\n{}",
         dsh_new_item(exe)
+    )
+}
+
+fn refusal_hermes(exe: &Path, why: &str) -> String {
+    format!(
+        "{why}. Edit it by hand, or paste this under `mcp_servers:`:\n{}",
+        hermes_block(exe, "  ", &[])
     )
 }
 
@@ -358,13 +389,10 @@ pub fn prune_dsh_binaries(dsh_home: &Path) -> usize {
         if !path.is_file() || !name.starts_with("qx") || !name.ends_with(".exe") {
             continue;
         }
-        // Match on the file name too: a patch may name the copy through another prefix
-        // (forward slashes, another drive) and that copy is still in use.
+        // Match on the file name anywhere in the patch text: a config may spell the copy
+        // through another prefix or quoting style and that copy is still in use.
         let text = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
-        if referenced
-            .iter()
-            .any(|r| *r == text || r.rsplit('/').next().is_some_and(|n| n == name))
-        {
+        if referenced.iter().any(|r| r.contains(&text) || r.contains(&name)) {
             continue;
         }
         // A running server holds its image open; that copy is not ours to remove.
@@ -399,11 +427,9 @@ fn dsh_references(dsh_home: &Path) -> Vec<String> {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            for line in text.lines() {
-                if let Some(value) = yaml_scalar(line, "command") {
-                    out.push(value.replace('\\', "/").to_ascii_lowercase());
-                }
-            }
+            // The whole file, not parsed scalars: a reference spelled with double quotes,
+            // a `command :` space, or another path prefix still means "this copy is in use".
+            out.push(text.replace('\\', "/").to_ascii_lowercase());
         }
     }
     out
@@ -472,6 +498,41 @@ mod tests {
         assert!(out.contains("    connect_timeout: 60\n"), "{out}");
         assert!(matches!(edit_hermes(Some(&out), exe, Action::Install), Edit::Unchanged));
         assert_eq!(hermes_command(&out).as_deref(), Some(r"C:\q\qx.exe"));
+    }
+
+    #[test]
+    fn yaml_paths_with_an_apostrophe_are_escaped() {
+        // A quote in the install path must be doubled, or the YAML stops parsing.
+        let exe = Path::new(r"C:\Users\O'Brien\qx.exe");
+        let dsh = changed(edit_dsh(Some(DSH), exe, Action::Install));
+        assert!(dsh.contains("command: 'C:/Users/O''Brien/qx.exe'"), "{dsh}");
+        let hermes = changed(edit_hermes(None, exe, Action::Install));
+        assert!(hermes.contains(r"command: 'C:\Users\O''Brien\qx.exe'"), "{hermes}");
+    }
+
+    #[test]
+    fn yaml_refuses_shapes_it_cannot_rewrite() {
+        let exe = Path::new(r"C:\q\qx.exe");
+        // A quoted id is still an mcp-qx registration: a second one would give dsh two servers.
+        let quoted = "- insert:\n    - id: \"mcp-qx\"\n      config:\n        command: c\n";
+        match edit_dsh(Some(quoted), exe, Action::Install) {
+            Edit::Refuse(reason) => assert!(reason.contains("mcp-qx"), "{reason}"),
+            _ => panic!("a quoted item must be refused"),
+        }
+        // A flow-style Hermes server keeps the user's keys on one line: refuse, never drop.
+        let flow = "mcp_servers:\n  qx: {command: c, env: {QX_GUARD: safe}}\n";
+        assert!(matches!(
+            edit_hermes(Some(flow), exe, Action::Install),
+            Edit::Refuse(_)
+        ));
+        // A Hermes refusal must not tell the user to paste a dsh item.
+        let refusal = match edit_hermes(Some("mcp_servers: {a: {command: c}}\n"), exe, Action::Install) {
+            Edit::Refuse(reason) => reason,
+            _ => panic!("expected a refusal"),
+        };
+        assert!(!refusal.contains("- insert:"), "{refusal}");
+        assert!(!refusal.contains("QX_CLIENT: dsh"), "{refusal}");
+        assert!(refusal.contains("qx:"), "{refusal}");
     }
 
     #[test]

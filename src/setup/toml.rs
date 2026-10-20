@@ -1,15 +1,44 @@
 //! Codex's `~/.codex/config.toml`: a line-based block editor.
 //!
 //! TOML has no stable round-trip crate in this project's dependency budget
-//! (`serde_json` only), so the qx entry is treated as text: the block is found by
-//! its header, replaced line by line, and every other byte is copied through. A
-//! shape we do not recognise is refused with a paste-ready snippet rather than
-//! rewritten.
+//! (`serde_json` only), so the qx tables are treated as text: every table in the
+//! `[mcp_servers.qx]` namespace is found wherever it sits, its env keys are kept and
+//! the block is regenerated. A shape we do not recognise is refused with a
+//! paste-ready snippet rather than rewritten.
 
 use super::{Action, Edit};
 use std::path::Path;
 
-const HEADER: &[&str] = &["[mcp_servers.qx]", "[mcp_servers.\"qx\"]"];
+/// `[mcp_servers.qx]`, `[mcp_servers."qx"]` and any subtable of either.
+fn is_qx_header(trimmed: &str) -> bool {
+    trimmed == "[mcp_servers.qx]"
+        || trimmed == "[mcp_servers.\"qx\"]"
+        || trimmed.starts_with("[mcp_servers.qx.")
+        || trimmed.starts_with("[mcp_servers.\"qx\".")
+}
+
+fn is_env_header(trimmed: &str) -> bool {
+    matches!(trimmed, "[mcp_servers.qx.env]" | "[mcp_servers.\"qx\".env]")
+}
+
+/// Every run of lines belonging to a qx table, in file order.
+fn qx_tables(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if is_qx_header(lines[i].trim()) {
+            let mut end = i + 1;
+            while end < lines.len() && !lines[end].trim().starts_with('[') {
+                end += 1;
+            }
+            out.push((i, end));
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
 
 pub fn edit_codex(text: Option<&str>, exe: &Path, a: Action) -> Edit {
     let Some(text) = text else {
@@ -24,92 +53,84 @@ pub fn edit_codex(text: Option<&str>, exe: &Path, a: Action) -> Edit {
     let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let trailing_newline = text.ends_with('\n');
     let lines: Vec<&str> = text.lines().collect();
-    let block = find_block(&lines);
+    let tables = qx_tables(&lines);
+    let first = tables.first().map(|(start, _)| *start);
+
+    if tables.is_empty() {
+        if a == Action::Remove {
+            return Edit::Unchanged;
+        }
+        let mut out: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+        if out.last().is_some_and(|l| !l.trim().is_empty()) {
+            out.push(String::new());
+        }
+        out.extend(render(exe, &[], eol).lines().map(str::to_string));
+        let refs: Vec<&str> = out.iter().map(String::as_str).collect();
+        return verdict(join(&refs, eol, true), text);
+    }
+
+    // The env keys the user may have set live in one of those tables, wherever it is.
+    let env = kept_env(&lines, &tables);
+    let mut out: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    // Remove in reverse so earlier ranges keep their offsets.
+    for (start, end) in tables.iter().rev() {
+        out.drain(*start..*end);
+    }
+    let at = first.unwrap_or(0).min(out.len());
+    let block_line = |i: usize| -> Option<&str> { out.get(i).map(String::as_str) };
+    let _ = block_line;
     match a {
-        Action::Remove => match block {
-            None => Edit::Unchanged,
-            Some((start, end)) => {
-                let kept: Vec<&str> = lines[..start].iter().chain(&lines[end..]).copied().collect();
-                let out = join(&kept, eol, trailing_newline);
-                if out == text {
-                    Edit::Unchanged
-                } else {
-                    Edit::Changed(out)
-                }
+        Action::Remove => {
+            // A blank line that used to separate the block from what followed stays one.
+            while at + 1 < out.len() && out[at].trim().is_empty() && out[at + 1].trim().is_empty() {
+                out.remove(at);
             }
-        },
+        }
         Action::Install => {
-            let env = block.map(|(s, e)| kept_env(&lines[s..e])).unwrap_or_default();
-            let body = render(exe, &env, eol);
-            let mut out: Vec<String> = Vec::new();
-            match block {
-                Some((start, end)) => {
-                    out.extend(lines[..start].iter().map(|s| s.to_string()));
-                    // A blank line that separated the block from what follows belongs to
-                    // the file, not to the entry: keep it.
-                    let trailing_blank = lines[start..end].last().is_some_and(|l| l.trim().is_empty());
-                    out.extend(body.lines().map(str::to_string));
-                    if trailing_blank {
-                        out.push(String::new());
-                    }
-                    out.extend(lines[end..].iter().map(|s| s.to_string()));
-                }
-                None => {
-                    out.extend(lines.iter().map(|s| s.to_string()));
-                    if out.last().is_some_and(|l| !l.trim().is_empty()) {
-                        out.push(String::new());
-                    }
-                    out.extend(body.lines().map(str::to_string));
-                }
+            let block: Vec<String> = render(exe, &env, eol).lines().map(str::to_string).collect();
+            let block_len = block.len();
+            let needs_gap = out.get(at).is_some_and(|l| !l.trim().is_empty());
+            for (offset, line) in block.into_iter().enumerate() {
+                out.insert(at + offset, line);
             }
-            let refs: Vec<&str> = out.iter().map(String::as_str).collect();
-            let text_out = join(&refs, eol, true);
-            if text_out == text {
-                Edit::Unchanged
-            } else {
-                Edit::Changed(text_out)
+            if needs_gap {
+                out.insert(at + block_len, String::new());
             }
         }
     }
+    let refs: Vec<&str> = out.iter().map(String::as_str).collect();
+    verdict(join(&refs, eol, trailing_newline), text)
 }
 
 /// The `command` of the qx entry, for `qx doctor`.
 pub fn codex_command(text: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
-    let (start, end) = find_block(&lines)?;
-    lines[start..end]
-        .iter()
-        .find_map(|line| toml_value(line, "command"))
-}
-
-fn find_block(lines: &[&str]) -> Option<(usize, usize)> {
-    let start = lines
-        .iter()
-        .position(|line| HEADER.contains(&line.trim()))?;
-    let end = lines
-        .iter()
-        .enumerate()
-        .skip(start + 1)
-        .find(|(_, line)| {
-            let t = line.trim();
-            t.starts_with('[') && !t.starts_with("[mcp_servers.qx.")
-        })
-        .map(|(i, _)| i)
-        .unwrap_or(lines.len());
-    Some((start, end))
-}
-
-/// `KEY = "value"` lines under the qx env subtable, which the user may have set.
-fn kept_env(block: &[&str]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut in_env = false;
-    for line in block {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_env = t.starts_with("[mcp_servers.qx.env") || t.starts_with("[mcp_servers.\"qx\".env");
+    for (start, end) in qx_tables(&lines) {
+        if is_env_header(lines[start].trim()) {
             continue;
         }
-        if in_env && !t.is_empty() && !t.starts_with('#') && t.contains('=') {
+        if let Some(value) = lines[start..end]
+            .iter()
+            .find_map(|line| toml_value(line, "command"))
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// `KEY = "value"` lines under any qx env table.
+fn kept_env(lines: &[&str], tables: &[(usize, usize)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (start, end) in tables {
+        if !is_env_header(lines[*start].trim()) {
+            continue;
+        }
+        for line in &lines[start + 1..*end] {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') || !t.contains('=') {
+                continue;
+            }
             let key = t.split('=').next().unwrap_or("").trim();
             if key != "QX_CLIENT" {
                 out.push(t.to_string());
@@ -184,7 +205,7 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-/// Flow-style tables hide the entry inside one line: refuse instead of guessing.
+/// Inline tables and dotted keys hide the entry inside one line: refuse, never guess.
 fn refuses(text: &str) -> bool {
     let mut in_mcp_servers = false;
     for line in text.lines() {
@@ -194,10 +215,10 @@ fn refuses(text: &str) -> bool {
             continue;
         }
         let squashed: String = t.chars().filter(|c| !c.is_whitespace()).collect();
-        if squashed.starts_with("mcp_servers={") {
+        if squashed.starts_with("mcp_servers={") || squashed.starts_with("mcp_servers.qx") {
             return true;
         }
-        if in_mcp_servers && squashed.starts_with("qx={") {
+        if in_mcp_servers && (squashed.starts_with("qx={") || squashed.starts_with("qx.")) {
             return true;
         }
     }
@@ -206,9 +227,17 @@ fn refuses(text: &str) -> bool {
 
 fn refusal(exe: &Path) -> String {
     format!(
-        "config.toml uses a flow-style (inline) table qx will not rewrite. Paste this instead:\n{}",
+        "config.toml uses an inline table or dotted key qx will not rewrite. Paste this instead:\n{}",
         render(exe, &[], "\n")
     )
+}
+
+fn verdict(out: String, original: &str) -> Edit {
+    if out == original {
+        Edit::Unchanged
+    } else {
+        Edit::Changed(out)
+    }
 }
 
 fn join(lines: &[&str], eol: &str, trailing_newline: bool) -> String {
@@ -233,6 +262,10 @@ mod tests {
         }
     }
 
+    fn count(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
     #[test]
     fn codex_appends_and_preserves_unrelated_bytes() {
         let src = "# >>> caveman\nmodel = \"x\"\n\n[mcp_servers.caveman]\ncommand = 'c'\n# --- end\n";
@@ -243,9 +276,8 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("[mcp_servers.qx.env]\nQX_CLIENT = \"codex\"\n"), "{out}");
-        // A comment-only file stays readable, and running again changes nothing.
         let again = edit_codex(Some(&out), Path::new(EXE), Action::Install);
-        assert!(matches!(again, Edit::Unchanged), "second run rewrote the file");
+        assert!(matches!(again, Edit::Unchanged), "second run rewrote the file:\n{out}");
     }
 
     #[test]
@@ -269,6 +301,7 @@ model = \"y\"
         assert!(out.contains("QX_CLIENT = \"codex\""), "{out}");
         assert!(out.contains("[profiles.fast]\nmodel = \"y\""), "{out}");
         assert!(out.starts_with("model = \"x\"\n"), "{out}");
+        assert_eq!(count(&out, "[mcp_servers.qx.env]"), 1, "{out}");
         assert!(
             matches!(edit_codex(Some(&out), Path::new(EXE), Action::Install), Edit::Unchanged),
             "second run rewrote the file:\n{out}"
@@ -277,16 +310,52 @@ model = \"y\"
     }
 
     #[test]
+    fn codex_handles_quoted_env_tables_and_env_before_the_block() {
+        // Valid TOML the old line scan missed: a quoted header, and the env table first.
+        let quoted = "\
+[mcp_servers.\"qx\"]
+command = 'old'
+[mcp_servers.\"qx\".env]
+HTTP_PROXY = \"http://proxy\"
+";
+        let out = changed(edit_codex(Some(quoted), Path::new(EXE), Action::Install));
+        assert_eq!(count(&out, ".env]"), 1, "{out}");
+        assert!(out.contains("HTTP_PROXY = \"http://proxy\""), "{out}");
+        assert!(out.contains("QX_CLIENT = \"codex\""), "{out}");
+
+        let env_first = "\
+[mcp_servers.qx.env]
+HTTP_PROXY = \"http://proxy\"
+
+[mcp_servers.qx]
+command = 'old'
+
+[profiles.fast]
+model = \"y\"
+";
+        let out = changed(edit_codex(Some(env_first), Path::new(EXE), Action::Install));
+        assert_eq!(count(&out, "[mcp_servers.qx.env]"), 1, "{out}");
+        assert!(out.contains("HTTP_PROXY"), "{out}");
+        assert!(out.contains("[profiles.fast]\nmodel = \"y\""), "{out}");
+    }
+
+    #[test]
     fn codex_refuses_unknown_shapes() {
-        let flow = "mcp_servers = { qx = { command = 'x' } }\n";
-        assert!(matches!(
-            edit_codex(Some(flow), Path::new(EXE), Action::Install),
-            Edit::Refuse(_)
-        ));
-        let nested = "[mcp_servers]\nqx = { command = 'x' }\n";
-        match edit_codex(Some(nested), Path::new(EXE), Action::Install) {
-            Edit::Refuse(reason) => assert!(reason.contains("[mcp_servers.qx]"), "{reason}"),
-            _ => panic!("an inline qx table must be refused"),
+        for src in [
+            "mcp_servers = { qx = { command = 'x' } }\n",
+            "[mcp_servers]\nqx = { command = 'x' }\n",
+            "[mcp_servers]\nqx.command = 'x'\n",
+            "mcp_servers.qx.command = 'x'\n",
+        ] {
+            match edit_codex(Some(src), Path::new(EXE), Action::Install) {
+                Edit::Refuse(reason) => {
+                    assert!(reason.contains("[mcp_servers.qx]"), "{src}: {reason}")
+                }
+                other => panic!(
+                    "{src} was not refused (unchanged: {})",
+                    matches!(other, Edit::Unchanged)
+                ),
+            }
         }
     }
 

@@ -196,10 +196,10 @@ fn edit_json_file(
     match text.as_deref() {
         None => match a {
             Action::Remove => Edit::Unchanged,
-            Action::Install => Edit::Changed(match jsonc::set_member("{}", path, &entry(None)) {
-                Ok(text) => text,
-                Err(e) => return Edit::Refuse(e),
-            }),
+            Action::Install => match jsonc::set_member("{}", path, &entry(None)) {
+                Ok(text) => Edit::Changed(text),
+                Err(e) => Edit::Refuse(e),
+            },
         },
         Some(current) => {
             let existing = jsonc::member(current, path)
@@ -212,19 +212,34 @@ fn edit_json_file(
             };
             match updated {
                 Ok(text) if text == current => Edit::Unchanged,
-                Ok(text) => Edit::Changed(text),
+                Ok(text) => match parse_strict(&text) {
+                    // A config the client cannot read is worse than no change at all.
+                    Some(_) => Edit::Changed(text),
+                    None => Edit::Refuse(format!(
+                        "the edit would leave {} unparseable; edit it by hand",
+                        file.display()
+                    )),
+                },
                 Err(e) => Edit::Refuse(e),
             }
         }
     }
 }
 
-/// `env` is merged: a user's own keys survive, ours overwrite.
+/// The document as strict JSON, or `None` when the edit broke it.
+fn parse_strict(text: &str) -> Option<Value> {
+    serde_json::from_str(&jsonc::to_strict_json(text)).ok()
+}
+
+/// `key` is merged: a user's own keys survive, ours overwrite. Clients disagree on the
+/// name (`env` on Claude Code and pi, `environment` on OpenCode).
 fn merge_env(existing: Option<&Value>, client: &str, extra: &[(String, Value)]) -> Value {
     let mut env = serde_json::Map::new();
-    if let Some(Value::Object(map)) = existing.and_then(|e| e.get("env")) {
-        for (k, v) in map {
-            env.insert(k.clone(), v.clone());
+    for key in ["env", "environment"] {
+        if let Some(Value::Object(map)) = existing.and_then(|e| e.get(key)) {
+            for (k, v) in map {
+                env.insert(k.clone(), v.clone());
+            }
         }
     }
     for (k, v) in extra {
@@ -445,6 +460,7 @@ pub fn run(args: &[String]) -> i32 {
     };
     let mut refused = false;
     let mut dsh_seen = false;
+    let mut dsh_refused = false;
     for c in clients {
         let changes = match plan(c, &paths, &exe, action) {
             Ok(changes) => changes,
@@ -461,6 +477,9 @@ pub fn run(args: &[String]) -> i32 {
             let key = change.client.key();
             if change.client == Client::Dsh {
                 dsh_seen = true;
+                if matches!(change.edit, Edit::Refuse(_)) {
+                    dsh_refused = true;
+                }
             }
             match &change.edit {
                 Edit::Unchanged => println!("{key}: unchanged ({})", change.file.display()),
@@ -479,9 +498,9 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
     }
-    // Runs whether or not the dsh entry needed changing: the copies are what a previous
-    // install style left behind, and an idempotent run still has to clean them up.
-    if dsh_seen && action == Action::Install {
+    // Never on a dry run (that would delete files from a preview), and never when the dsh
+    // entry could not be read: the copies it names may still be the ones in use.
+    if dsh_seen && !dsh_refused && !dry && action == Action::Install {
         // dsh used to need a versioned copy per build; now one canonical binary is enough,
         // and every stale copy is a different qx under a client.
         let removed = yaml::prune_dsh_binaries(&paths.dsh_home);
@@ -563,7 +582,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("opencode.json"),
-            "{\n  // hand-edited\n  \"mcp\": {\"servers\": {\"qx\": {\"type\": \"local\"}}},\n}\n",
+            "{\n  // hand-edited\n  \"mcp\": {\"servers\": {\"qx\": {\"type\": \"local\", \"environment\": {\"QX_GUARD\": \"safe\"}}}},\n}\n",
         )
         .unwrap();
         std::fs::write(dir.join("opencode.jsonc"), "{}\n").unwrap();
@@ -574,6 +593,8 @@ mod tests {
         assert_eq!(v["mcp"]["servers"]["qx"]["codemode"], false);
         assert_eq!(v["mcp"]["servers"]["qx"]["timeout"]["execution"], 600000);
         assert_eq!(v["mcp"]["servers"]["qx"]["environment"]["QX_CLIENT"], "opencode");
+        // OpenCode calls the map `environment`; a user's own keys must survive.
+        assert_eq!(v["mcp"]["servers"]["qx"]["environment"]["QX_GUARD"], "safe");
         assert_eq!(v["mcp"]["servers"]["qx"]["command"][1], "mcp");
         assert!(text.contains("// hand-edited"), "the comment must survive");
         let _ = std::fs::remove_dir_all(&p.home);
