@@ -110,6 +110,20 @@ const COREUTILS: &[&str] = &[
     "realpath", "rm", "seq", "sleep", "tail", "touch", "true", "wc", "which",
 ];
 
+/// Like `resolve`, but a fixed list of extra directories is searched first and is never
+/// cached: npm's `node_modules\.bin` belongs to one project, not to the process.
+pub fn resolve_in(program: &str, first: &[PathBuf], cwd: Option<&Path>) -> Target {
+    if !program.contains(['\\', '/']) && !Path::new(program).is_absolute() {
+        let exts = pathext();
+        for dir in first {
+            if let Some(hit) = find_in_dir(dir, program, &exts) {
+                return classify(hit);
+            }
+        }
+    }
+    resolve(program, cwd)
+}
+
 /// `<Git>\usr\bin\<name>.exe`, for a name in `COREUTILS` only.
 pub fn git_coreutil(name: &str) -> Option<PathBuf> {
     let lower = name.to_ascii_lowercase();

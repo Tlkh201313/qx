@@ -59,7 +59,11 @@ the command itself.
      match real npm (not exported: the resolved `npm_config_*` values, `COLOR`).
      Anything unusual - workspaces, `script-shell`, relevant `npm_config_*`
      overrides, scripts that read `npm_*` vars, or flags/args outside a strict
-     allowlist - falls back to real npm.
+     allowlist - falls back to real npm. Each step also skips `cmd.exe`: when the
+     script is a plain command (no shell syntax, no `cmd` internal, and its
+     program resolves to a real executable) qx execs it directly, unwrapping a
+     stock `.bin` shim to `node`. `a && b`, `echo hi`, an unknown program, or a
+     shim that contains script logic keep npm's shell.
    - **npx local-bin fast path** - `npx <declared local tool>` runs the local bin
      directly instead of spawning npx; anything that might download falls back.
    - **generic `.cmd` parser** — reads a stock npm/Scoop-style shim, extracts the

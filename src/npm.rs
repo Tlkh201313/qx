@@ -57,20 +57,67 @@ fn basename(program: &str) -> &str {
 pub fn commands(f: &Fast) -> Result<Vec<Command>, String> {
     f.steps
         .iter()
-        .map(|s| {
-            let mut c = crate::exec::build_shell(&s.command, "cmd")?;
-            c.current_dir(&f.cwd);
-            c.env("PATH", &f.path);
-            for (k, v) in &f.env {
-                c.env(k, v);
+        .map(|s| match direct_step(f, s) {
+            Some(c) => Ok(c),
+            None => {
+                // Anything a plain exec cannot reproduce keeps npm's own shell.
+                let mut c = crate::exec::build_shell(&s.command, "cmd")?;
+                decorate(&mut c, f, s);
+                Ok(c)
             }
-            c.env("npm_lifecycle_event", &s.event);
-            c.env("npm_lifecycle_script", &s.script);
-            crate::exec::apply_child_defaults(&mut c, true);
-            crate::exec::apply_node_cache(&mut c);
-            Ok(c)
         })
         .collect()
+}
+
+/// Names `cmd.exe` answers itself. A script naming one of these can never be exec'd.
+const CMD_INTERNALS: &[&str] = &[
+    "assoc", "break", "call", "cd", "chcp", "chdir", "cls", "color", "copy", "date", "del", "dir",
+    "echo", "endlocal", "erase", "exit", "for", "ftype", "goto", "if", "md", "mkdir", "mklink",
+    "move", "path", "pause", "popd", "prompt", "pushd", "rd", "rem", "ren", "rename", "rmdir",
+    "set", "setlocal", "shift", "start", "time", "title", "type", "ver", "verify", "vol",
+];
+
+/// The `node_modules\.bin` dirs from `root` upward, nearest first.
+fn local_bins(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut cur = Some(root);
+    while let Some(p) = cur {
+        let bin = p.join("node_modules").join(".bin");
+        if bin.is_dir() {
+            dirs.push(bin);
+        }
+        cur = p.parent();
+    }
+    dirs
+}
+
+/// A plain script (no shell syntax, no cmd internal) whose program is a real executable:
+/// `cmd.exe` would only add a process.
+fn direct_step(f: &Fast, s: &Step) -> Option<Command> {
+    let (program, args) = crate::exec::split_simple(&s.command)?;
+    if CMD_INTERNALS.iter().any(|n| n.eq_ignore_ascii_case(&program)) {
+        return None;
+    }
+    let target = crate::resolve::resolve_in(&program, &local_bins(&f.cwd), Some(&f.cwd));
+    if !matches!(target, crate::resolve::Target::Direct { .. }) {
+        return None;
+    }
+    let mut c = crate::exec::command_for(&program, target, &args).ok()?;
+    decorate(&mut c, f, s);
+    Some(c)
+}
+
+/// Everything a script expects from npm, applied the same way to both kinds of command.
+fn decorate(c: &mut Command, f: &Fast, s: &Step) {
+    c.current_dir(&f.cwd);
+    c.env("PATH", &f.path);
+    for (k, v) in &f.env {
+        c.env(k, v);
+    }
+    c.env("npm_lifecycle_event", &s.event);
+    c.env("npm_lifecycle_script", &s.script);
+    crate::exec::apply_child_defaults(c, true);
+    crate::exec::apply_node_cache(c);
 }
 
 /// Commands to run in order (stop at the first failure) for `npm run/test/start`
@@ -403,15 +450,7 @@ fn npmrc_overrides(root: &Path) -> bool {
 }
 
 fn bin_path(root: &Path) -> OsString {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut cur = Some(root);
-    while let Some(p) = cur {
-        let bin = p.join("node_modules").join(".bin");
-        if bin.is_dir() {
-            dirs.push(bin);
-        }
-        cur = p.parent();
-    }
+    let mut dirs: Vec<PathBuf> = local_bins(root);
     for p in crate::resolve::path_dirs() {
         let lower = p.to_string_lossy().to_ascii_lowercase();
         if !dirs
@@ -496,6 +535,64 @@ mod tests {
         assert!(fast_npx(&["tool@latest".to_string()], Some(&d)).is_none());
         assert!(fast_npx(&["-y".to_string(), "tool".to_string()], Some(&d)).is_none());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The `.cmd` npm itself writes for a package bin: a stock shim that only forwards to
+    /// node, which is what makes it safe to unwrap.
+    const STOCK_SHIM: &str = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\..\\tool\\cli.js\" %*\r\n";
+
+    #[test]
+    fn a_plain_script_runs_its_local_bin_without_cmd() {
+        if crate::resolve::find_on_path("node").is_none() {
+            println!("skip: node is not on PATH");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("qx-npmplain-{}", std::process::id()));
+        let bin = root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(root.join("node_modules").join("tool")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(root.join("package.json"), r#"{"scripts":{"build":"tool --flag"}}"#).unwrap();
+        std::fs::write(bin.join("tool.cmd"), STOCK_SHIM).unwrap();
+        std::fs::write(root.join("node_modules").join("tool").join("cli.js"), "").unwrap();
+
+        let f = fast(&["run".into(), "build".into()], Some(&root)).unwrap();
+        let c = &commands(&f).unwrap()[0];
+        assert_eq!(
+            Path::new(c.get_program()).file_name().unwrap().to_string_lossy(),
+            "node.exe"
+        );
+        let args: Vec<String> = c
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|a| a.ends_with("cli.js")), "{args:?}");
+        assert!(args.iter().any(|a| a == "--flag"), "{args:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shell_syntax_cmd_internals_and_logic_shims_keep_cmd() {
+        let root = std::env::temp_dir().join(format!("qx-npmkeep-{}", std::process::id()));
+        let bin = root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"a":"tool && tool","b":"echo hi","c":"no-such-tool-zz x","d":"logic"}}"#,
+        )
+        .unwrap();
+        std::fs::write(bin.join("tool.cmd"), STOCK_SHIM).unwrap();
+        // A shim that does real work cannot be unwrapped into `node`.
+        std::fs::write(bin.join("logic.cmd"), "@echo off\r\nset FOO=1\r\nnode \"%dp0%\\..\\tool\\cli.js\" %*\r\n").unwrap();
+        for script in ["a", "b", "c", "d"] {
+            let f = fast(&["run".into(), script.into()], Some(&root)).unwrap();
+            let cmd = &commands(&f).unwrap()[0];
+            assert_eq!(
+                Path::new(cmd.get_program()).file_name().unwrap().to_string_lossy().to_ascii_lowercase(),
+                "cmd.exe",
+                "script {script} must keep cmd.exe"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

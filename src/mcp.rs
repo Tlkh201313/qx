@@ -1091,6 +1091,33 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn qx_npm_run_plain_script_end_to_end() {
+        // A plain script must not pay for cmd.exe, and it must still see the script's own output.
+        if crate::resolve::find_on_path("node").is_none() {
+            println!("skip: node is not on PATH");
+            return;
+        }
+        let _server = server_lock();
+        let d = std::env::temp_dir().join(format!("qx-mcp-npmplain-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("package.json"), r#"{"scripts":{"v":"node --version"}}"#).unwrap();
+        let cwd = d.to_string_lossy().to_string();
+        let r = client::scoped(Client::Dsh, || {
+            call(json!({"program":"npm","args":["run","v"],"cwd":cwd,"mode":"full"}))
+        });
+        let text = r
+            .pointer("/result/structuredContent/stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(r.pointer("/result/structuredContent/exit_code"), Some(&json!(0)), "{r}");
+        assert!(text.starts_with('v'), "stdout: {text}");
+        assert_eq!(r.pointer("/result/structuredContent/source"), Some(&json!("direct")));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn a_declined_builtin_reaches_git_coreutils() {
         // Runs a real child, so it must not overlap a server test that sets `SHUTDOWN`.
         let _server = server_lock();

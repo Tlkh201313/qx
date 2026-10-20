@@ -407,7 +407,7 @@ pub fn build_command_at(
     args: &[String],
     cwd: Option<&std::path::Path>,
 ) -> Result<Command, String> {
-    let npmish = crate::npm::is_npm(program) || crate::npm::is_npx(program);
+    let npmish = npmish(program);
     if let Some(r) = resolve::rustup_direct(program, args, cwd) {
         let mut c = Command::new(r.exe);
         c.args(args);
@@ -431,7 +431,18 @@ pub fn build_command_at(
         apply_child_defaults(&mut c, false);
         return Ok(c);
     }
-    match resolve::resolve(program, cwd) {
+    command_for(program, resolve::resolve(program, cwd), args)
+}
+
+fn npmish(program: &str) -> bool {
+    crate::npm::is_npm(program) || crate::npm::is_npx(program)
+}
+
+/// One resolved target to the command that runs it. `build_command_at` and the npm fast
+/// path share this, so a script step and a direct call cannot drift apart.
+pub fn command_for(program: &str, target: Target, args: &[String]) -> Result<Command, String> {
+    let npmish = npmish(program);
+    match target {
         Target::Direct { exe, prefix } => {
             let node = exe
                 .file_name()
