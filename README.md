@@ -471,10 +471,22 @@ profile.
 
 ## Measured on this machine (AV active)
 
+0.7 numbers, median of 5 through `Measure-Command`, against the 0.6 build that
+was on `PATH`:
+
+| what | 0.6 | 0.7 | why |
+|---|---|---|---|
+| `qx --raw python -c pass` | 539 ms | **105 ms** | one process: the stale 0.6 copy predated the site-hook fix |
+| `qx --raw pytest --version` | 718 ms | **311 ms** | any pip/uv launcher runs as `python.exe <launcher>` |
+| `qx --raw hermes --version` (venv console script) | 26 134 ms | **571 ms** | launcher + venv redirect, both one process |
+| `qx pnpm run <script>` | 569 ms | **67 ms** | pnpm fast path for a pinned, non-workspace project |
+| `qx npm run <plain script>` | 92 ms | **60 ms** | the script step no longer spawns `cmd.exe` |
+| `qx mcp` exit with a 7 s call running | 6 817 ms | **377 ms** | EOF cancels the call instead of waiting for it |
+
 | command | time |
 |---|---|
 | `qx git --version` | **0.1-0.3 s** |
-| `qx npm run <script>` | **~0.08-0.13 s** |
+| `qx npm run <script>` | **~0.06-0.13 s** |
 | `npm run <script>` (PowerShell) | 0.4-0.6 s |
 | `bash -c "git --version"` | 3.0 s |
 | `rtk git --version` | 3.7 s |

@@ -358,13 +358,29 @@ pub fn status(c: Client, p: &Paths) -> Status {
             (Some(file), command)
         }
         Client::Pi => {
-            let file = p.home.join(".pi").join("agent").join("mcp.json");
-            let command = read_json_command(&file, &["mcpServers", "qx", "command"]);
+            let mcp = p.home.join(".pi").join("agent").join("mcp.json");
+            let extension = p
+                .home
+                .join(".pi")
+                .join("agent")
+                .join("extensions")
+                .join("qx.js");
+            let mut command = read_json_command(&mcp, &["mcpServers", "qx", "command"]);
+            let mut file = mcp;
             match pi::pi_version(p) {
                 None => notes.push("pi not found on PATH".into()),
-                Some((major, minor)) if (major, minor) < (0, 99) => notes.push(
-                    "pi has no MCP client here: run `qx setup pi` to install the qx extension".into(),
-                ),
+                Some(version) if version < (0, 99) => {
+                    // No MCP client in this pi: the extension is the registration.
+                    if let Ok(text) = std::fs::read_to_string(&extension) {
+                        command = extension_exe(&text);
+                        file = extension;
+                    } else {
+                        notes.push(
+                            "pi has no MCP client here: run `qx setup pi` to install the qx extension"
+                                .into(),
+                        );
+                    }
+                }
                 Some(_) => {}
             }
             (Some(file), command)
@@ -377,6 +393,15 @@ pub fn status(c: Client, p: &Paths) -> Status {
         command,
         notes,
     }
+}
+
+/// The exe the installed pi extension was generated for (`const EXE = "…";`).
+fn extension_exe(text: &str) -> Option<String> {
+    let start = text.find("const EXE = \"")? + "const EXE = ".len();
+    let rest = &text[start..];
+    let end = rest.find('\n')?;
+    let literal = rest[..end].trim().trim_end_matches(';');
+    serde_json::from_str::<String>(literal).ok()
 }
 
 fn read_json_command(file: &Path, path: &[&str]) -> Option<String> {
@@ -419,7 +444,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     let mut refused = false;
-    let mut dsh_applied = false;
+    let mut dsh_seen = false;
     for c in clients {
         let changes = match plan(c, &paths, &exe, action) {
             Ok(changes) => changes,
@@ -434,6 +459,9 @@ pub fn run(args: &[String]) -> i32 {
         }
         for change in changes {
             let key = change.client.key();
+            if change.client == Client::Dsh {
+                dsh_seen = true;
+            }
             match &change.edit {
                 Edit::Unchanged => println!("{key}: unchanged ({})", change.file.display()),
                 Edit::Refuse(reason) => {
@@ -442,12 +470,7 @@ pub fn run(args: &[String]) -> i32 {
                 }
                 Edit::Changed(_) if dry => println!("{key}: would update {}", change.file.display()),
                 Edit::Changed(_) => match apply(&change) {
-                    Ok(()) => {
-                        if change.client == Client::Dsh {
-                            dsh_applied = true;
-                        }
-                        println!("{key}: updated {}", change.file.display());
-                    }
+                    Ok(()) => println!("{key}: updated {}", change.file.display()),
                     Err(e) => {
                         refused = true;
                         println!("{key}: cannot write {}: {e}", change.file.display());
@@ -456,7 +479,9 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
     }
-    if dsh_applied && action == Action::Install {
+    // Runs whether or not the dsh entry needed changing: the copies are what a previous
+    // install style left behind, and an idempotent run still has to clean them up.
+    if dsh_seen && action == Action::Install {
         // dsh used to need a versioned copy per build; now one canonical binary is enough,
         // and every stale copy is a different qx under a client.
         let removed = yaml::prune_dsh_binaries(&paths.dsh_home);

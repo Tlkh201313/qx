@@ -808,6 +808,10 @@ mod tests {
     #[test]
     fn initialize_learns_the_client_from_client_info() {
         let _global = client::lock_global();
+        // A parent that sets QX_CLIENT (a qx-spawned test run does) would win over clientInfo,
+        // which is the documented order; this test is about the clientInfo path.
+        let saved = std::env::var_os("QX_CLIENT");
+        std::env::remove_var("QX_CLIENT");
         let init = |name: &str| {
             handle(&json!({
                 "jsonrpc": "2.0",
@@ -823,6 +827,9 @@ mod tests {
         init("dsh-mcp-client");
         assert_eq!(client::current(), Client::Dsh);
         client::set_current(previous);
+        if let Some(value) = saved {
+            std::env::set_var("QX_CLIENT", value);
+        }
     }
 
     #[test]
