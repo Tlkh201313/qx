@@ -66,6 +66,15 @@ the command itself.
      shim that contains script logic keep npm's shell.
    - **npx local-bin fast path** - `npx <declared local tool>` runs the local bin
      directly instead of spawning npx; anything that might download falls back.
+   - **pnpm run/test/start fast path** - same idea for pnpm, which pays even more
+     startup than npm (~500 ms vs ~60 ms here). It only fires for a project that
+     pins itself (`packageManager: pnpm@<version>`), has no `pnpm-workspace.yaml`
+     in the root or any ancestor, no `workspaces` key, no `pre`/`post` script,
+     and no `.npmrc` key pnpm would honor differently (`shell-emulator`,
+     `enable-pre-post-scripts`, and the shared list below). Scripts see
+     `PNPM_SCRIPT_SRC_DIR`, `npm_package_json`, `INIT_CWD`, `npm_execpath`,
+     `npm_node_execpath`, `NODE`, and - when node's version is known -
+     `npm_config_user_agent = pnpm/<version> …`. Everything else goes to pnpm.
    - **generic `.cmd` parser** — reads a stock npm/Scoop-style shim, extracts the
      `%~dp0` target, and runs `node + script` or the target `.exe` directly.
      This covers every npm-installed CLI: eslint, prettier, jest, vitest, next,

@@ -47,6 +47,13 @@ pub fn is_npx(program: &str) -> bool {
         || name.eq_ignore_ascii_case("npx.exe")
 }
 
+pub fn is_pnpm(program: &str) -> bool {
+    let name = basename(program);
+    name.eq_ignore_ascii_case("pnpm")
+        || name.eq_ignore_ascii_case("pnpm.cmd")
+        || name.eq_ignore_ascii_case("pnpm.exe")
+}
+
 fn basename(program: &str) -> &str {
     program
         .rsplit(['\\', '/'])
@@ -125,6 +132,9 @@ fn decorate(c: &mut Command, f: &Fast, s: &Step) {
 pub fn direct(program: &str, args: &[String], cwd: Option<&Path>) -> Option<Vec<Command>> {
     if is_npm(program) {
         return commands(&fast(args, cwd)?).ok();
+    }
+    if is_pnpm(program) {
+        return commands(&fast_pnpm(args, cwd)?).ok();
     }
     if !is_npx(program) {
         return None;
@@ -205,7 +215,27 @@ fn find_bin(start: &Path, name: &str) -> Option<PathBuf> {
     }
 }
 
+/// Which package manager's `run` semantics `fast_with` is reproducing.
+enum Pm {
+    Npm,
+    /// The version pinned by `packageManager`, which is what pnpm itself would use.
+    Pnpm { version: String },
+}
+
 pub fn fast(args: &[String], cwd: Option<&Path>) -> Option<Fast> {
+    fast_with(Pm::Npm, args, cwd)
+}
+
+pub fn fast_pnpm(args: &[String], cwd: Option<&Path>) -> Option<Fast> {
+    let start = cwd
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())?;
+    // Without a pinned version pnpm's own resolution decides; keep it.
+    let version = pnpm_version(&find_package(&start)?.1)?;
+    fast_with(Pm::Pnpm { version }, args, cwd)
+}
+
+fn fast_with(pm: Pm, args: &[String], cwd: Option<&Path>) -> Option<Fast> {
     if std::env::var("QX_NPM_FAST").ok().as_deref() == Some("off") {
         return None;
     }
@@ -232,16 +262,33 @@ pub fn fast(args: &[String], cwd: Option<&Path>) -> Option<Fast> {
     }
     let (root, pkg) = find_package(&start)?;
 
-    if pkg.get("workspaces").is_some() {
-        return None;
-    }
-    if let Some(pm) = pkg.get("packageManager").and_then(Value::as_str) {
-        if !pm.starts_with("npm@") {
-            return None;
+    match &pm {
+        Pm::Npm => {
+            if pkg.get("workspaces").is_some() {
+                return None;
+            }
+            if let Some(declared) = pkg.get("packageManager").and_then(Value::as_str) {
+                if !declared.starts_with("npm@") {
+                    return None;
+                }
+            }
+        }
+        Pm::Pnpm { .. } => {
+            // A workspace root runs its scripts through pnpm's own graph.
+            if pkg.get("workspaces").is_some() || pnpm_workspace(&root) {
+                return None;
+            }
         }
     }
 
     let scripts = pkg.get("scripts")?.as_object()?;
+    if matches!(pm, Pm::Pnpm { .. })
+        && (scripts.contains_key(&format!("pre{name}")) || scripts.contains_key(&format!("post{name}")))
+    {
+        // `enable-pre-post-scripts` is off by default in pnpm; reproducing its defaults
+        // without them is the only case we can promise.
+        return None;
+    }
     if npmrc_overrides(&root) {
         return None;
     }
@@ -270,31 +317,86 @@ pub fn fast(args: &[String], cwd: Option<&Path>) -> Option<Fast> {
         });
     }
 
-    let mut env = vec![
-        ("npm_command", kind),
-        ("INIT_CWD", start.to_string_lossy().into_owned()),
-        (
-            "npm_config_local_prefix",
-            root.to_string_lossy().into_owned(),
-        ),
-        (
-            "npm_package_json",
-            root.join("package.json").to_string_lossy().into_owned(),
-        ),
-    ];
+    let mut env = match &pm {
+        Pm::Npm => vec![
+            ("npm_command", kind),
+            ("INIT_CWD", start.to_string_lossy().into_owned()),
+            (
+                "npm_config_local_prefix",
+                root.to_string_lossy().into_owned(),
+            ),
+            (
+                "npm_package_json",
+                root.join("package.json").to_string_lossy().into_owned(),
+            ),
+        ],
+        Pm::Pnpm { version } => {
+            let mut env = vec![
+                ("INIT_CWD", start.to_string_lossy().into_owned()),
+                (
+                    "npm_package_json",
+                    root.join("package.json").to_string_lossy().into_owned(),
+                ),
+                // pnpm-only: the directory a script resolves relative files from.
+                ("PNPM_SCRIPT_SRC_DIR", root.to_string_lossy().into_owned()),
+            ];
+            env.extend(pnpm_identity(version));
+            env
+        }
+    };
     if let Some(n) = pkg.get("name").and_then(Value::as_str) {
         env.push(("npm_package_name", n.to_string()));
     }
     if let Some(v) = pkg.get("version").and_then(Value::as_str) {
         env.push(("npm_package_version", v.to_string()));
     }
-    env.extend(identity());
+    if matches!(pm, Pm::Npm) {
+        env.extend(identity());
+    }
     Some(Fast {
         steps,
         cwd: root.clone(),
         path: bin_path(&root),
         env,
     })
+}
+
+fn pnpm_version(pkg: &Value) -> Option<String> {
+    let declared = pkg.get("packageManager")?.as_str()?;
+    let version = declared.strip_prefix("pnpm@")?.split('+').next()?.trim();
+    (!version.is_empty()).then(|| version.to_string())
+}
+
+/// `pnpm-workspace.yaml` anywhere above the project means pnpm owns the run.
+fn pnpm_workspace(root: &Path) -> bool {
+    let mut cur = Some(root);
+    while let Some(p) = cur {
+        if p.join("pnpm-workspace.yaml").is_file() || p.join("pnpm-workspace.yml").is_file() {
+            return true;
+        }
+        cur = p.parent();
+    }
+    false
+}
+
+/// The env pnpm exports that tools sniff. Same rule as npm's: omitted when unknown.
+fn pnpm_identity(version: &str) -> Vec<(&'static str, String)> {
+    use crate::resolve::Target;
+    let Target::Direct { exe, prefix } = crate::resolve::resolve("pnpm", None) else {
+        return Vec::new();
+    };
+    let node = exe.to_string_lossy().into_owned();
+    let mut env = vec![("npm_node_execpath", node.clone()), ("NODE", node)];
+    if let Some(cli) = prefix.first() {
+        env.push(("npm_execpath", cli.clone()));
+    }
+    if let Some(node_version) = node_version(&exe) {
+        env.push((
+            "npm_config_user_agent",
+            format!("pnpm/{version} npm/? node/{node_version} win32 x64"),
+        ));
+    }
+    env
 }
 
 /// Env real npm exports that tools sniff to detect the package manager
@@ -438,6 +540,8 @@ fn npmrc_overrides(root: &Path) -> bool {
                     | "shell"
                     | "node-options"
                     | "ignore-scripts"
+                    | "shell-emulator"
+                    | "enable-pre-post-scripts"
                     | "workspace"
                     | "workspaces"
                     | "include-workspace-root"
@@ -593,6 +697,53 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pnpm_fast_path_requires_a_pinned_pnpm() {
+        let d = std::env::temp_dir().join(format!("qx-pnpm-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("package.json"),
+            r#"{"packageManager":"pnpm@9.1.0+sha512.abc","scripts":{"build":"tool"}}"#,
+        )
+        .unwrap();
+        let f = fast_pnpm(&["run".into(), "build".into()], Some(&d)).unwrap();
+        assert!(f
+            .env
+            .iter()
+            .any(|(k, v)| *k == "PNPM_SCRIPT_SRC_DIR" && Path::new(v) == d.as_path()));
+        // pnpm's own exports replace npm's: no npm_command, and a pnpm user agent when known.
+        assert!(f.env.iter().all(|(k, _)| *k != "npm_command"));
+        if let Some((_, ua)) = f.env.iter().find(|(k, _)| *k == "npm_config_user_agent") {
+            assert!(ua.starts_with("pnpm/9.1.0 "), "{ua}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn pnpm_falls_back_on_workspaces_hooks_and_unpinned() {
+        let d = std::env::temp_dir().join(format!("qx-pnpm-no-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let pkg = |text: &str| std::fs::write(d.join("package.json"), text).unwrap();
+        // No packageManager at all.
+        pkg(r#"{"scripts":{"build":"tool"}}"#);
+        assert!(fast_pnpm(&["run".into(), "build".into()], Some(&d)).is_none());
+        // A different package manager owns the project.
+        pkg(r#"{"packageManager":"npm@10.0.0","scripts":{"build":"tool"}}"#);
+        assert!(fast_pnpm(&["run".into(), "build".into()], Some(&d)).is_none());
+        // pnpm runs hooks only when asked; do not guess.
+        pkg(r#"{"packageManager":"pnpm@9.1.0","scripts":{"prebuild":"echo pre","build":"tool"}}"#);
+        assert!(fast_pnpm(&["run".into(), "build".into()], Some(&d)).is_none());
+        // A workspace file anywhere above the project.
+        pkg(r#"{"packageManager":"pnpm@9.1.0","scripts":{"build":"tool"}}"#);
+        std::fs::write(d.join("pnpm-workspace.yaml"), "packages:\n  - p\n").unwrap();
+        assert!(fast_pnpm(&["run".into(), "build".into()], Some(&d)).is_none());
+        std::fs::remove_file(d.join("pnpm-workspace.yaml")).unwrap();
+        // An .npmrc setting pnpm would honor and we do not.
+        std::fs::write(d.join(".npmrc"), "shell-emulator=true\n").unwrap();
+        assert!(fast_pnpm(&["run".into(), "build".into()], Some(&d)).is_none());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
