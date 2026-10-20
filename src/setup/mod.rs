@@ -5,6 +5,7 @@
 //! JSONC editor, a TOML block editor and a YAML block editor never share scope.
 
 pub mod jsonc;
+pub mod toml;
 
 use crate::client::Client;
 use serde_json::{json, Value};
@@ -95,7 +96,16 @@ pub fn plan(c: Client, p: &Paths, exe: &Path, a: Action) -> Result<Vec<Change>, 
                 edit: edit_json_file(&file, path, |existing| opencode_entry(exe, existing), a),
             }])
         }
-        Client::Codex | Client::Dsh | Client::Hermes | Client::Pi => Err(format!(
+        Client::Codex => {
+            let file = p.codex_home.join("config.toml");
+            let text = read_optional(&file)?;
+            Ok(vec![Change {
+                client: c,
+                file,
+                edit: toml::edit_codex(text.as_deref(), exe, a),
+            }])
+        }
+        Client::Dsh | Client::Hermes | Client::Pi => Err(format!(
             "{} setup is not implemented in this build",
             c.key()
         )),
@@ -297,7 +307,13 @@ pub fn status(c: Client, p: &Paths) -> Status {
             }
             (Some(file), command)
         }
-        Client::Codex => (None, None),
+        Client::Codex => {
+            let file = p.codex_home.join("config.toml");
+            let command = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|text| toml::codex_command(&text));
+            (Some(file), command)
+        }
         Client::Dsh => (None, None),
         Client::Hermes => (None, None),
         Client::Pi => {

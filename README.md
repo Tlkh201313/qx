@@ -304,6 +304,17 @@ Each client editor keeps the `env` keys the existing entry already had and sets
 claude mcp add --scope user qx "C:\Users\USER\.cargo\bin\qx.exe" mcp
 ```
 
+### Codex
+
+`qx setup codex` writes `[mcp_servers.qx]` into `%CODEX_HOME%\config.toml`
+(default `~\.codex\config.toml`), with `startup_timeout_sec = 20` and
+`tool_timeout_sec = 600`, plus a `[mcp_servers.qx.env]` subtable holding
+`QX_CLIENT = "codex"` and any keys you already had. Codex shows the model only
+`structuredContent`, so qx omits `stdout` duplication from the text view for
+this client. The block is edited line by line, so comments and every other table
+in the file survive; a flow-style `mcp_servers = { … }` table is refused with a
+paste-ready block instead.
+
 ### OpenCode
 
 ```powershell
