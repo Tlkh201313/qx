@@ -6,6 +6,7 @@
 
 pub mod jsonc;
 pub mod toml;
+pub mod yaml;
 
 use crate::client::Client;
 use serde_json::{json, Value};
@@ -105,7 +106,25 @@ pub fn plan(c: Client, p: &Paths, exe: &Path, a: Action) -> Result<Vec<Change>, 
                 edit: toml::edit_codex(text.as_deref(), exe, a),
             }])
         }
-        Client::Dsh | Client::Hermes | Client::Pi => Err(format!(
+        Client::Dsh => {
+            let file = p.dsh_home.join("cordis.patch.yml");
+            let text = read_optional(&file)?;
+            Ok(vec![Change {
+                client: c,
+                file,
+                edit: yaml::edit_dsh(text.as_deref(), exe, a),
+            }])
+        }
+        Client::Hermes => {
+            let file = p.hermes_home.join("config.yaml");
+            let text = read_optional(&file)?;
+            Ok(vec![Change {
+                client: c,
+                file,
+                edit: yaml::edit_hermes(text.as_deref(), exe, a),
+            }])
+        }
+        Client::Pi => Err(format!(
             "{} setup is not implemented in this build",
             c.key()
         )),
@@ -314,8 +333,20 @@ pub fn status(c: Client, p: &Paths) -> Status {
                 .and_then(|text| toml::codex_command(&text));
             (Some(file), command)
         }
-        Client::Dsh => (None, None),
-        Client::Hermes => (None, None),
+        Client::Dsh => {
+            let file = p.dsh_home.join("cordis.patch.yml");
+            let command = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|text| yaml::dsh_command(&text));
+            (Some(file), command)
+        }
+        Client::Hermes => {
+            let file = p.hermes_home.join("config.yaml");
+            let command = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|text| yaml::hermes_command(&text));
+            (Some(file), command)
+        }
         Client::Pi => {
             let file = p.home.join(".pi").join("agent").join("mcp.json");
             let command = read_json_command(&file, &["mcpServers", "qx", "command"]);
@@ -371,6 +402,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     let mut refused = false;
+    let mut dsh_applied = false;
     for c in clients {
         let changes = match plan(c, &paths, &exe, action) {
             Ok(changes) => changes,
@@ -393,13 +425,26 @@ pub fn run(args: &[String]) -> i32 {
                 }
                 Edit::Changed(_) if dry => println!("{key}: would update {}", change.file.display()),
                 Edit::Changed(_) => match apply(&change) {
-                    Ok(()) => println!("{key}: updated {}", change.file.display()),
+                    Ok(()) => {
+                        if change.client == Client::Dsh {
+                            dsh_applied = true;
+                        }
+                        println!("{key}: updated {}", change.file.display());
+                    }
                     Err(e) => {
                         refused = true;
                         println!("{key}: cannot write {}: {e}", change.file.display());
                     }
                 },
             }
+        }
+    }
+    if dsh_applied && action == Action::Install {
+        // dsh used to need a versioned copy per build; now one canonical binary is enough,
+        // and every stale copy is a different qx under a client.
+        let removed = yaml::prune_dsh_binaries(&paths.dsh_home);
+        if removed > 0 {
+            println!("dsh: removed {removed} unreferenced qx cop(ies) from {}", paths.dsh_home.join("bin").display());
         }
     }
     if refused {

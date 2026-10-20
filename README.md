@@ -328,8 +328,16 @@ holds the old executable image until it is restarted.
 
 ### DeepSeek Harness (dsh)
 
-Add qx to the global `$DSH_HOME/cordis.patch.yml` (or a profile's
-`cordis.patch.yml`):
+`qx setup dsh` rewrites the `mcp-qx` item in `$DSH_HOME/cordis.patch.yml`:
+`config.command` becomes the canonical `qx.exe` (with `/` separators, as dsh
+expects) and `config.env` gains `QX_CLIENT: dsh`, keeping the keys you already
+had. Every other line stays byte-identical; a flow-style `env: { … }` is refused
+with the block to paste. After a successful dsh install it also deletes
+`$DSH_HOME\bin\qx*.exe` copies that no `cordis.patch.yml` under `$DSH_HOME`
+references — one canonical binary is enough now that `qx deploy` can replace a
+file that a running server still holds.
+
+Doing it by hand looks like this:
 
 ```yaml
 - insert:
@@ -341,6 +349,7 @@ Add qx to the global `$DSH_HOME/cordis.patch.yml` (or a profile's
         command: C:/Users/USER/.cargo/bin/qx.exe
         args: [mcp]
         env:
+          QX_CLIENT: dsh
           QX_PYTHON_FAST: tls
         toolCallTimeoutMs: 300000
         failOnStartupError: true
@@ -350,10 +359,33 @@ The model sees `mcp__qx__run` and `mcp__qx__fs`. qx also sends MCP server
 instructions, so dsh injects the routing rule into the system prompt
 automatically: qx first for commands, read/glob/literal grep and guarded
 mutations; native dsh tools on any qx error, for regex/images, or for sandbox
-escalation. On Windows a running stdio server holds the old executable image,
-so keep a versioned copy under `$DSH_HOME/bin` and point `command` at it; a
-rebuild can then replace `target\release\qx.exe` without a sharing violation.
-Restart dsh after changing the `command` path.
+escalation. Restart dsh after changing the `command` path.
+
+### Hermes
+
+`qx setup hermes` writes a `qx:` child under `mcp_servers:` in
+`%HERMES_HOME%\config.yaml` (default `%LOCALAPPDATA%\hermes\config.yaml`):
+
+```yaml
+mcp_servers:
+  qx:
+    command: 'C:\Users\USER\.cargo\bin\qx.exe'
+    args: [mcp]
+    env:
+      QX_CLIENT: hermes
+    timeout: 600
+    connect_timeout: 60
+```
+
+Other servers and every other top-level key are left byte-identical. Hermes
+reports the SDK's default `mcp` as its client name, so `QX_CLIENT: hermes` is
+what selects its profile: qx then keeps the text output and puts only metadata
+in `structuredContent` (Hermes prints both copies). Two things to know: Hermes
+ignores MCP server instructions, so the routing rule has to live in its own
+prompt, and if `tool_search` is set to `auto` the qx tools may not be exposed at
+all — `qx doctor` flags that.
+
+### The `run` tool
 
 `run`:
 
