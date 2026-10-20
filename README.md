@@ -385,6 +385,23 @@ ignores MCP server instructions, so the routing rule has to live in its own
 prompt, and if `tool_search` is set to `auto` the qx tools may not be exposed at
 all — `qx doctor` flags that.
 
+### pi
+
+`qx setup pi` reads pi's own `package.json` version and picks the right half:
+
+- **pi 0.99 and later** - its built-in MCP client: `~\.pi\agent\mcp.json` gets
+  `mcpServers.qx` with `command`, `args: ["mcp"]`, `env.QX_CLIENT: "pi"`,
+  `exposure: "direct"` and `timeout: 600`.
+- **pi before 0.99** (0.85 is what ships today) - pi has no MCP support at all,
+  so the setup writes a small extension: `~\.pi\agent\extensions\qx.js`, plus
+  `qx\bridge.js` and a `package.json` marking that directory as ESM. The bridge
+  speaks stdio JSON-RPC to `qx mcp` (spawned lazily, respawned if it dies, an
+  aborted call sends `notifications/cancelled`) and the extension registers
+  `mcp__qx__run` and `mcp__qx__fs` with the parameter shapes qx expects.
+
+`node integrations/pi/smoke.mjs <path-to-qx.exe>` exercises the bridge against a
+real server and prints `pi bridge ok`.
+
 ### The `run` tool
 
 `run`:

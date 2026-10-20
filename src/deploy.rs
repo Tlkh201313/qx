@@ -176,6 +176,12 @@ pub fn run(args: &[String]) -> i32 {
         }
         return 0;
     }
+    // Siblings from a previous deploy can go now: the clients that held them have exited,
+    // and one still holding its file simply fails to delete and stays.
+    let swept = sweep_aside(&dst);
+    if swept > 0 {
+        println!("qx deploy: removed {swept} previous copy/copies");
+    }
     match install(&src, &dst) {
         Ok(Installed::Unchanged) => {
             println!("qx deploy: up to date ({})", dst.display());

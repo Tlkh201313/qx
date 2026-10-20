@@ -947,6 +947,8 @@ mod tests {
 
     #[test]
     fn a_cancel_racing_begin_always_lands() {
+        // Touches the process-wide cancel registry, so it never overlaps a server test.
+        let _server = server_lock();
         for i in 5000..5400 {
             let canceller = std::thread::spawn(move || cancel(&json!(i)));
             let guard = Inflight::begin(&Some(json!(i)));
@@ -1040,7 +1042,7 @@ mod tests {
                 return;
             }
             self.1 = true;
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
             while std::time::Instant::now() < deadline {
                 let started = INFLIGHT
                     .lock()

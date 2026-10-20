@@ -5,6 +5,7 @@
 //! JSONC editor, a TOML block editor and a YAML block editor never share scope.
 
 pub mod jsonc;
+pub mod pi;
 pub mod toml;
 pub mod yaml;
 
@@ -124,10 +125,10 @@ pub fn plan(c: Client, p: &Paths, exe: &Path, a: Action) -> Result<Vec<Change>, 
                 edit: yaml::edit_hermes(text.as_deref(), exe, a),
             }])
         }
-        Client::Pi => Err(format!(
-            "{} setup is not implemented in this build",
-            c.key()
-        )),
+        Client::Pi => Ok(pi::edit_pi(pi::pi_version(p), p, exe, a)
+            .into_iter()
+            .map(|(file, edit)| Change { client: c, file, edit })
+            .collect()),
         Client::Generic => Err("generic is not a client that can be configured".into()),
     }
 }
@@ -261,10 +262,19 @@ fn opencode_entry(exe: &Path, existing: Option<&Value>) -> Value {
 }
 
 /// Write one planned change: back up, write a temp file, rename over the original.
+/// Empty text removes the file — no config format qx writes is valid and empty, and
+/// removing an extension means removing its files.
 pub fn apply(ch: &Change) -> std::io::Result<()> {
     let Edit::Changed(text) = &ch.edit else {
         return Ok(());
     };
+    if text.is_empty() {
+        return match std::fs::remove_file(&ch.file) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
+    }
     if let Some(parent) = ch.file.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -350,6 +360,13 @@ pub fn status(c: Client, p: &Paths) -> Status {
         Client::Pi => {
             let file = p.home.join(".pi").join("agent").join("mcp.json");
             let command = read_json_command(&file, &["mcpServers", "qx", "command"]);
+            match pi::pi_version(p) {
+                None => notes.push("pi not found on PATH".into()),
+                Some((major, minor)) if (major, minor) < (0, 99) => notes.push(
+                    "pi has no MCP client here: run `qx setup pi` to install the qx extension".into(),
+                ),
+                Some(_) => {}
+            }
             (Some(file), command)
         }
         Client::Generic => (None, None),
