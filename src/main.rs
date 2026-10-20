@@ -16,6 +16,7 @@ mod npm;
 mod python;
 mod redact;
 mod resolve;
+mod setup;
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -73,6 +74,7 @@ fn dispatch(args: &[String]) -> i32 {
         }
         "doctor" | "bench" => doctor::run(),
         "deploy" => deploy::run(&args[1..]),
+        "setup" => setup::run(&args[1..]),
         "gain" => gain(),
         "mcp" | "serve" => mcp::serve(),
         "which" => which(&args[1..]),
@@ -631,6 +633,8 @@ USAGE
   qx mcp                             MCP stdio server (tools: run, fs)
   qx doctor                          diagnose why commands are slow
   qx deploy [--to PATH] [--dry-run]  install this build as the canonical qx.exe
+  qx setup [all|CLIENT...] [--dry-run] [--remove]
+                                     register qx in each agent CLI's config
   qx which <command>...              show the real binary that will run
   qx gain                            output savings (needs QX_STATS=1)
   qx check <program|command>         dry-run the safety gate

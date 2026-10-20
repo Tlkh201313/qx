@@ -278,6 +278,26 @@ Exit code and stdout/stderr are passed through unchanged (compaction aside).
 
 ## MCP setup
 
+### One command: `qx setup`
+
+```powershell
+cargo build --release; target\release\qx.exe deploy
+qx setup all              # or: qx setup claude-code opencode
+qx doctor                 # [install] and [clients] show what each CLI points at
+```
+
+`qx setup` edits each client's own config in place and nothing else: every byte
+outside the qx entry is preserved, so comments, key order and trailing commas in
+a hand-edited file survive. It backs the old file up next to itself as
+`<name>.<ext>.qx-bak`, writes a temp file and renames it over the original, so a
+crash cannot leave half a config. When a file's shape is not one qx recognises
+(a legacy key, a flow-style table, an unexpected nesting) it refuses that client
+and prints the snippet to paste instead. `--dry-run` prints what would change;
+`--remove` deletes the qx entry and leaves everything else.
+
+Each client editor keeps the `env` keys the existing entry already had and sets
+`QX_CLIENT` so the server knows which tool names and output shape to use.
+
 ### Claude Code
 
 ```powershell

@@ -124,6 +124,9 @@ pub fn run() -> i32 {
     }
     println!("\n[qx] git --version via direct exec: {} ms", t.elapsed().as_millis());
 
+    install_section();
+    clients_section();
+
     if ms >= 600 {
         println!("\nWhat to do:");
         println!("  1. Keep ONE real-time antivirus. Remove or fully disable the others.");
@@ -132,6 +135,96 @@ pub fn run() -> i32 {
         println!("  4. Route commands through `qx` or the `qx mcp` server, not a shell wrapper.");
     }
     0
+}
+
+/// Canonical binary plus the stale copies an old install style left behind.
+fn install_section() {
+    let paths = crate::setup::Paths::from_env();
+    let Some(canonical) = crate::deploy::canonical() else {
+        println!("\n[install] no cargo bin directory (set CARGO_HOME or USERPROFILE)");
+        return;
+    };
+    let running = std::env::current_exe().ok();
+    let state = match (&running, canonical.exists()) {
+        (Some(exe), true) => match crate::deploy::same_bytes(exe, &canonical) {
+            Ok(true) => "ok".to_string(),
+            Ok(false) => "STALE (run `qx deploy`)".to_string(),
+            Err(e) => format!("cannot compare: {e}"),
+        },
+        (Some(_), false) => "MISSING (run `qx deploy`)".to_string(),
+        (None, _) => "unknown".to_string(),
+    };
+    println!("\n[install] canonical: {} [{state}]", canonical.display());
+    if let Some(exe) = &running {
+        if exe != &canonical {
+            println!("          running from: {}", exe.display());
+        }
+    }
+    let stale = stale_dsh_binaries(&paths);
+    if !stale.is_empty() {
+        println!(
+            "          {} stale copy/copies in {} (one canonical qx.exe is enough)",
+            stale.len(),
+            paths.dsh_home.join("bin").display()
+        );
+    }
+}
+
+/// `dsh_home\bin\qx*.exe` files. dsh used to need a versioned copy per build; deploy makes
+/// them unnecessary, and each stale copy is a different qx behavior under a client.
+fn stale_dsh_binaries(p: &crate::setup::Paths) -> Vec<PathBuf> {
+    let dir = p.dsh_home.join("bin");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            path.is_file() && name.starts_with("qx") && name.ends_with(".exe")
+        })
+        .collect()
+}
+
+/// One line per client qx can register: where the config is and which binary it points at.
+fn clients_section() {
+    let paths = crate::setup::Paths::from_env();
+    let canonical = crate::deploy::canonical();
+    let mut drift = 0;
+    println!("\n[clients]");
+    for client in crate::client::Client::ALL {
+        let status = crate::setup::status(client, &paths);
+        let file = status
+            .file
+            .as_ref()
+            .map(|f| f.display().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let command = status.command.clone();
+        let same = match (&command, &canonical) {
+            (Some(c), Some(expected)) => Path::new(c) == expected.as_path(),
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        let state = if command.is_none() {
+            "not registered"
+        } else if same {
+            "ok"
+        } else {
+            drift += 1;
+            "points at another binary"
+        };
+        println!("  {:<12} {:<11} {}", status.client.key(), state, file);
+        for note in &status.notes {
+            println!("               note: {note}");
+        }
+    }
+    if drift > 0 {
+        println!("  {drift} client(s) point at a binary that is not the canonical one: run `qx setup all`");
+    }
 }
 
 struct ImportTime {
