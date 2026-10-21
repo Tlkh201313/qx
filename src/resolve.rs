@@ -140,19 +140,32 @@ pub fn git_coreutil(name: &str) -> Option<PathBuf> {
 fn git_root_dir() -> Option<PathBuf> {
     static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
     ROOT.get_or_init(|| {
-        if let Some(git) = find_on_path("git") {
-            let mut dir = git.parent()?.to_path_buf();
-            for _ in 0..3 {
-                if dir.join("usr").join("bin").is_dir() {
-                    return Some(dir);
-                }
-                dir = dir.parent()?.to_path_buf();
-            }
+        if let Some(root) = find_on_path("git").and_then(|git| git_root_above(&git)) {
+            return Some(root);
         }
         let bash = git_bash()?;
         bash.parent()?.parent().map(Path::to_path_buf)
     })
     .clone()
+}
+
+/// The Git for Windows root above a `git.exe`: the nearest ancestor (up to three levels) with `usr\bin`.
+fn git_root_above(git: &Path) -> Option<PathBuf> {
+    let mut dir = git.parent()?.to_path_buf();
+    for _ in 0..3 {
+        if dir.join("usr").join("bin").is_dir() {
+            return Some(dir);
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    None
+}
+
+/// `bash.exe` inside a Git for Windows root, never WSL's.
+fn bash_in(root: &Path) -> Option<PathBuf> {
+    [root.join("bin").join("bash.exe"), root.join("usr").join("bin").join("bash.exe")]
+        .into_iter()
+        .find(|p| p.is_file())
 }
 
 /// One PATH directory. On Windows a single listing answers every PATHEXT candidate at once (a miss would
@@ -184,16 +197,19 @@ fn stat_dir(dir: &Path, name: &str, exts: &[String]) -> Option<PathBuf> {
         }
     }
     let direct = dir.join(name);
-    if direct.is_file() && runnable_bare(&direct) {
+    if direct.is_file() && runnable_bare(&direct, exts) {
         return Some(direct);
     }
     None
 }
 
-/// An extensionless-in-PATHEXT hit counts only when the file itself is a real `.exe`/`.com`.
-fn runnable_bare(p: &Path) -> bool {
+/// A name that already carries its extension (`npm.cmd`) counts only when that is a real `.exe`/`.com`,
+/// or a `.cmd`/`.bat` PATHEXT lists. An extensionless `npm` shell script, or `notes.txt`, is no program.
+fn runnable_bare(p: &Path, exts: &[String]) -> bool {
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    ext == "exe" || ext == "com"
+    ext == "exe"
+        || ext == "com"
+        || (matches!(ext.as_str(), "cmd" | "bat") && exts.iter().any(|e| e.trim_start_matches('.') == ext))
 }
 
 #[cfg(windows)]
@@ -211,7 +227,7 @@ fn pick_listed(dir: &Path, name: &str, exts: &[String], entries: &[(String, bool
         }
     }
     let direct = dir.join(name);
-    if runnable_bare(&direct) && listed(name, &direct) {
+    if runnable_bare(&direct, exts) && listed(name, &direct) {
         return Some(direct);
     }
     None
@@ -757,28 +773,31 @@ fn generic_shim(shim: &Path) -> Option<Target> {
     let mut js: Option<PathBuf> = None;
     let mut exe: Option<PathBuf> = None;
 
-    for token in text.split('"') {
+    // Only the launch line: every quoted word on it must be accounted for below, or unwrapping
+    // would silently drop an argument (`"%~dp0python.exe" "%~dp0script.py" %*`).
+    let launch = text.lines().find(|l| l.contains("%*"))?;
+    for token in launch.split('"').skip(1).step_by(2) {
         let raw = token.trim();
-        if raw.is_empty() || raw.contains("%*") {
+        if raw.is_empty() || raw.contains("%*") || raw.eq_ignore_ascii_case("%_prog%") {
             continue;
         }
         if !(raw.contains("%~dp0") || raw.contains("%dp0%")) {
-            continue;
+            return None; // a fixed argument such as "serve"
         }
         let cleaned = raw.replace("%~dp0", "").replace("%dp0%", "");
         let cleaned = cleaned.trim_start_matches(['\\', '/']);
         if cleaned.contains('%') {
-            continue; // unresolved variable
+            return None; // unresolved variable
         }
         let lower = cleaned.to_ascii_lowercase();
         let is_js = lower.ends_with(".js") || lower.ends_with(".cjs") || lower.ends_with(".mjs");
         let is_exe = lower.ends_with(".exe");
         if !is_js && !is_exe {
-            continue;
+            return None; // a script this unwrapper cannot run (`.py`, ...)
         }
         let candidate = dir.join(cleaned.replace('/', "\\"));
         if !candidate.is_file() {
-            continue;
+            return None;
         }
         if is_exe {
             // Skip the interpreter itself; we want the payload.
@@ -795,15 +814,17 @@ fn generic_shim(shim: &Path) -> Option<Target> {
     }
 
     if let Some(script) = js {
+        let prefix = vec![script.to_string_lossy().into_owned()];
+        // A non-node exe that takes the script (`bun.exe cli.js`) keeps its own interpreter.
+        if let Some(e) = exe {
+            return Some(Target::Direct { exe: e, prefix });
+        }
         let node = if dir.join("node.exe").is_file() {
             dir.join("node.exe")
         } else {
             find_on_path("node")?
         };
-        return Some(Target::Direct {
-            exe: node,
-            prefix: vec![script.to_string_lossy().into_owned()],
-        });
+        return Some(Target::Direct { exe: node, prefix });
     }
     exe.map(|e| Target::Direct {
         exe: e,
@@ -824,7 +845,8 @@ pub fn git_bash() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    None
+    // A per-user, Scoop or other-drive install: the root the `git` on PATH implies.
+    find_on_path("git").and_then(|git| git_root_above(&git)).and_then(|root| bash_in(&root))
 }
 
 #[cfg(test)]
@@ -1026,6 +1048,64 @@ default_toolchain = "stable-x86_64-pc-windows-msvc"
             set(logic);
             assert!(generic_shim(&shim).is_none(), "{logic}");
         }
+    }
+
+    #[test]
+    fn a_bare_name_that_already_carries_cmd_or_bat_resolves() {
+        let d = tmp("bare-ext");
+        fs::write(d.join("tool.cmd"), "@echo hi\r\n").unwrap();
+        fs::write(d.join("tool2.bat"), "@echo hi\r\n").unwrap();
+        fs::write(d.join("plain"), "#!/bin/sh\n").unwrap();
+        fs::write(d.join("notes.txt"), "x").unwrap();
+        let exts = pathext();
+        for (name, file) in [("tool.cmd", "tool.cmd"), ("tool2.bat", "tool2.bat")] {
+            assert_eq!(find_in_dir(&d, name, &exts), Some(d.join(file)), "find_in_dir {name}");
+            assert_eq!(stat_dir(&d, name, &exts), Some(d.join(file)), "stat_dir {name}");
+        }
+        // an extensionless sh script and a non-executable extension are still not programs
+        assert_eq!(find_in_dir(&d, "plain", &exts), None);
+        assert_eq!(find_in_dir(&d, "notes.txt", &exts), None);
+        assert_eq!(stat_dir(&d, "plain", &exts), None);
+    }
+
+    #[test]
+    fn a_shim_with_a_quoted_script_it_cannot_run_is_not_unwrapped() {
+        let d = tmp("quoted");
+        for f in ["python.exe", "script.py", "foo.exe", "bun.exe", "cli.js"] {
+            fs::write(d.join(f), "").unwrap();
+        }
+        let shim = d.join("t.cmd");
+        for body in [
+            "@\"%~dp0python.exe\" \"%~dp0script.py\" %*\r\n",
+            "@\"%~dp0foo.exe\" \"serve\" %*\r\n",
+        ] {
+            fs::write(&shim, body).unwrap();
+            assert!(generic_shim(&shim).is_none(), "{body}");
+        }
+        // a non-node exe that takes a script keeps its own interpreter
+        fs::write(&shim, "@\"%~dp0bun.exe\" \"%~dp0cli.js\" %*\r\n").unwrap();
+        match generic_shim(&shim) {
+            Some(Target::Direct { exe, prefix }) => {
+                assert_eq!(exe, d.join("bun.exe"));
+                assert_eq!(prefix, vec![d.join("cli.js").to_string_lossy().into_owned()]);
+            }
+            _ => panic!("bun.exe + cli.js must stay bun.exe"),
+        }
+    }
+
+    #[test]
+    fn git_bash_is_found_from_the_git_on_path() {
+        let root = tmp("gitroot");
+        fs::create_dir_all(root.join("cmd")).unwrap();
+        fs::create_dir_all(root.join("usr").join("bin")).unwrap();
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("cmd").join("git.exe"), "").unwrap();
+        fs::write(root.join("bin").join("bash.exe"), "").unwrap();
+        assert_eq!(git_root_above(&root.join("cmd").join("git.exe")), Some(root.clone()));
+        assert_eq!(bash_in(&root), Some(root.join("bin").join("bash.exe")));
+        fs::remove_file(root.join("bin").join("bash.exe")).unwrap();
+        fs::write(root.join("usr").join("bin").join("bash.exe"), "").unwrap();
+        assert_eq!(bash_in(&root), Some(root.join("usr").join("bin").join("bash.exe")));
     }
 
     #[test]
