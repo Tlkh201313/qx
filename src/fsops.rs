@@ -219,8 +219,17 @@ struct Root {
 
 impl Root {
     fn new(args: &Value) -> Result<Self, FsError> {
-        let raw = req_str(args, "cwd").map_err(|e| e.fb("tool"))?;
-        let p = PathBuf::from(raw);
+        // Omitting `cwd` means "where the server was started", like the CLI. Every fs call
+        // otherwise fails on a field the model has no reason to know.
+        let p = match args.get("cwd") {
+            None | Some(Value::Null) => {
+                std::env::current_dir().map_err(|e| FsError::io("cannot resolve cwd", e))?
+            }
+            Some(Value::String(s)) if !s.trim().is_empty() => PathBuf::from(s),
+            Some(_) => {
+                return Err(FsError::arg("cwd must be a non-empty string").fb("tool"));
+            }
+        };
         let p = if p.is_absolute() {
             p
         } else {

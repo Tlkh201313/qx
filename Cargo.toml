@@ -1,6 +1,6 @@
 [package]
 name = "qx"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Fast local command executor for coding agents"
 license = "MIT"

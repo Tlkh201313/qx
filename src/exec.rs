@@ -357,6 +357,10 @@ pub(crate) fn apply_child_defaults(cmd: &mut Command, npm: bool) {
     const COMMON: &[(&str, &str)] = &[
         ("CARGO_TERM_COLOR", "never"),
         ("CARGO_TERM_PROGRESS_WHEN", "never"),
+        // An agent has no terminal, so a pager or editor prompt is a hang waiting to happen.
+        ("GIT_EDITOR", "true"),
+        ("GIT_SEQUENCE_EDITOR", "true"),
+        ("GIT_TERMINAL_PROMPT", "0"),
         ("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
         ("PYTHONIOENCODING", "utf-8"),
     ];
@@ -407,6 +411,10 @@ pub fn build_command_at(
     args: &[String],
     cwd: Option<&std::path::Path>,
 ) -> Result<Command, String> {
+    // A cmdlet is not a CreateProcess target; a `.ps1` is handled by `Target::Ps1`.
+    if verb_noun(program) {
+        return powershell_call(program, args);
+    }
     let npmish = npmish(program);
     if let Some(r) = resolve::rustup_direct(program, args, cwd) {
         let mut c = Command::new(r.exe);
@@ -551,22 +559,21 @@ fn git_root(cmd: &Command) -> Option<PathBuf> {
     (named(bin, "bin") && named(mingw, "mingw64")).then(|| mingw.parent().map(Path::to_path_buf))?
 }
 
+/// `cmd.exe` folds a line over ~8 KiB into "The command line is too long."
+const CMD_LINE_CAP: usize = 8_000;
+/// `-EncodedCommand` carries the script in argv as base64 (~2.7 bytes per character).
+const PS_SCRIPT_CAP: usize = 12_000;
+
 pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
-    let choice = match shell {
-        "auto" => {
-            if looks_powershell(command) {
-                "powershell"
-            } else if looks_posix(command) {
-                "bash"
-            } else {
-                "cmd"
-            }
-        }
-        other => other,
-    };
+    let choice = if shell == "auto" { pick_shell(command) } else { shell };
     match choice {
         "bash" => {
-            let b = resolve::git_bash().ok_or("Git Bash not found")?;
+            // `ls | head` has no cmd.exe equivalent: bash is the only shell that runs it.
+            let b = resolve::git_bash().ok_or_else(|| {
+                "this line needs a POSIX utility (ls/cat/grep/head…), but Git Bash was not found; \
+                 pass `program` + `args`, or install Git for Windows"
+                    .to_string()
+            })?;
             let mut c = Command::new(b);
             c.args(["-c", command]);
             prepare(&mut c);
@@ -575,6 +582,13 @@ pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
             Ok(c)
         }
         "cmd" => {
+            if command.len() > CMD_LINE_CAP {
+                return Err(format!(
+                    "command line is {} characters; cmd.exe stops near {CMD_LINE_CAP}. \
+                     Pass `program` + `args` instead of one long line",
+                    command.len()
+                ));
+            }
             let mut c = cmd_exe(command);
             prepare(&mut c);
             apply_python_fast(&mut c);
@@ -582,15 +596,20 @@ pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
             Ok(c)
         }
         "powershell" => {
+            if command.len() > PS_SCRIPT_CAP {
+                return Err(format!(
+                    "script is {} characters; `-EncodedCommand` carries it in one argv \
+                     (limit ~{PS_SCRIPT_CAP}). Split it, or pass `program` + `args`",
+                    command.len()
+                ));
+            }
             let mut c = Command::new("powershell.exe");
             // The user's profile costs 300+ ms and changes output; the prelude keeps
-            // piped output UTF-8 and drops progress-bar noise.
-            c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
-            // Own line, so parse errors point at the command, not the prelude.
-            // -Command folds every native exit code to 1; hand the real one back.
-            c.arg(format!(
-                "$ProgressPreference='SilentlyContinue';try{{[Console]::OutputEncoding=[Text.Encoding]::UTF8}}catch{{}}\n{command}\n$qxok=$?;if($LASTEXITCODE){{exit $LASTEXITCODE}};if(!$qxok){{exit 1}}"
-            ));
+            // piped output UTF-8 and drops progress-bar noise. `-NonInteractive` turns a
+            // prompt into an error instead of a hang, and `-EncodedCommand` deletes the
+            // quoting layer that cmd.exe and `Command` used to mangle.
+            c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+            c.arg(encoded_powershell(command));
             prepare(&mut c);
             apply_python_fast(&mut c);
             apply_child_defaults(&mut c, false);
@@ -599,6 +618,41 @@ pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
         "none" => Err("shell=none needs program+args".to_string()),
         other => Err(format!("unknown shell: {other}")),
     }
+}
+
+/// The script behind `-EncodedCommand`: the prelude keeps its own line so a parse error
+/// points at the command, and the trailer hands the native exit code back
+/// (`-Command` folds every failing native call to 1).
+fn encoded_powershell(command: &str) -> String {
+    let script = format!(
+        "$ProgressPreference='SilentlyContinue';try{{[Console]::OutputEncoding=[Text.Encoding]::UTF8}}catch{{}}\n{command}\n$qxok=$?;if($LASTEXITCODE){{exit $LASTEXITCODE}};if(!$qxok){{exit 1}}"
+    );
+    base64_utf16le(&script)
+}
+
+/// PowerShell decodes `-EncodedCommand` as base64 over UTF-16LE; one alphabet, no dependency.
+fn base64_utf16le(s: &str) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = u32::from(chunk[0]) << 16
+            | u32::from(*chunk.get(1).unwrap_or(&0)) << 8
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// The one way qx starts cmd.exe. The line goes in as raw command-line text: `Command`'s own
@@ -617,33 +671,148 @@ fn cmd_exe(line: &str) -> Command {
     c
 }
 
-/// PowerShell-only syntax: a `Verb-Noun` cmdlet in command position, or `$env:`.
-/// Quoted text (`git commit -m "Add Get-Thing"`) never starts a command segment.
-fn looks_powershell(s: &str) -> bool {
-    if s.contains("$env:") {
+/// `auto` picks the shell that can parse the line: PowerShell syntax, else a POSIX
+/// utility cmd.exe cannot run, else cmd. Getting this wrong is the usual cause of a
+/// wasted "'$x' is not recognized" round trip.
+fn pick_shell(s: &str) -> &'static str {
+    if powershell_syntax(s) {
+        "powershell"
+    } else if posix_syntax(s) {
+        "bash"
+    } else {
+        "cmd"
+    }
+}
+
+/// Command positions: `;`, `&&`, `||`, a newline, a pipe, or the brace/paren that opens a
+/// script block. A lone `&` is not a separator — it is the PowerShell call operator.
+fn segments(s: &str) -> Vec<&str> {
+    s.split(['|', ';', '\n', '{', '}', '(', ')'])
+        .flat_map(|piece| piece.split("&&"))
+        .flat_map(|piece| piece.split("||"))
+        .collect()
+}
+
+fn first_word(seg: &str) -> &str {
+    seg.trim_start().split_whitespace().next().unwrap_or("")
+}
+
+/// PowerShell-only syntax. Quoted text never starts a command segment, so
+/// `git commit -m "Add Get-Thing support"` stays on cmd.
+fn powershell_syntax(s: &str) -> bool {
+    const ANYWHERE: &[&str] = &[
+        "$env:",
+        "$LASTEXITCODE",
+        "$null",
+        "$true",
+        "$false",
+        "$_",
+        "]::",
+        "@'",
+        "@\"",
+        "2>$null",
+        " -eq ",
+        " -ne ",
+        " -gt ",
+        " -ge ",
+        " -lt ",
+        " -le ",
+        " -like ",
+        " -match ",
+        " -contains ",
+    ];
+    if ANYWHERE.iter().any(|m| s.contains(m)) {
         return true;
     }
-    s.split(['|', ';', '&', '(', '{', '\n']).any(|seg| {
-        let word = seg.split_whitespace().next().unwrap_or("");
-        match word.split_once('-') {
-            Some((verb, noun)) => {
-                verb.len() > 2
-                    && verb.starts_with(|c: char| c.is_ascii_uppercase())
-                    && verb.chars().all(|c| c.is_ascii_alphabetic())
-                    && noun.starts_with(|c: char| c.is_ascii_uppercase())
-                    && noun.chars().all(|c| c.is_ascii_alphanumeric())
-            }
-            None => false,
+    segments(s).into_iter().any(|seg| {
+        let w = first_word(seg);
+        // `$(…)` and `${…}` are bash command substitution, not a PS variable.
+        if w.is_empty() || w.starts_with("$(") || w.starts_with("${") {
+            return false;
         }
+        // A cmdlet, a `$variable` in command position (`$x = 1`, `$p.Foo()`), the call
+        // operator (`& $exe`), a script block, or a block keyword.
+        verb_noun(w)
+            || w.starts_with('$')
+            || w == "&"
+            || w.starts_with("%{")
+            || w.starts_with("?{")
+            || w.starts_with("@(")
+            || w.starts_with("@{")
+            || matches!(w, "try" | "catch" | "finally" | "foreach" | "trap")
     })
 }
 
-fn looks_posix(s: &str) -> bool {
+/// `Get-Item`, `Invoke-CimMethod`: a cmdlet is `Verb-Noun` with both halves capitalised.
+/// `docker-compose`, `git-log` and `rustc-workspace` are not cmdlets.
+fn verb_noun(w: &str) -> bool {
+    let Some((verb, noun)) = w.split_once('-') else {
+        return false;
+    };
+    verb.len() > 2
+        && verb.starts_with(|c: char| c.is_ascii_uppercase())
+        && verb.chars().all(|c| c.is_ascii_alphabetic())
+        && noun.starts_with(|c: char| c.is_ascii_uppercase())
+        && noun.chars().all(|c: char| c.is_ascii_alphanumeric())
+}
+
+/// Utilities cmd.exe has no built-in for; a pipeline that runs one is a POSIX pipeline.
+const BASH_ONLY: &[&str] = &[
+    "awk", "basename", "cat", "chmod", "cp", "cut", "date", "df", "diff", "dirname", "du",
+    "env", "find", "grep", "head", "ln", "ls", "md5sum", "mkdir", "mv", "nl", "printf",
+    "pwd", "readlink", "realpath", "rev", "rm", "sed", "seq", "sha256sum", "shasum",
+    "sleep", "sort", "stat", "tac", "tail", "tee", "test", "touch", "tr", "uniq", "uname",
+    "wc", "which", "xargs",
+];
+
+fn posix_syntax(s: &str) -> bool {
     // Only markers cmd.exe cannot handle; plain `&&`, `|` and `2>&1` stay on cmd.
     const MARKERS: &[&str] = &[
-        "$(", "${", "2>/dev/null", "|&", "<<'", "/c/", "/mnt/", "`", "source ", "export ",
+        "$(", "${", "2>/dev/null", "|&", "<<", "/c/", "/mnt/", "`", "source ", "export ",
+        "~/",
     ];
-    MARKERS.iter().any(|m| s.contains(m)) && !s.contains("\\")
+    // A Windows path in the line means the caller is not writing POSIX.
+    if !s.contains('\\') && MARKERS.iter().any(|m| s.contains(m)) {
+        return true;
+    }
+    let chained = s.contains('|') || s.contains('>') || s.contains(';');
+    chained && segments(s).into_iter().any(|seg| BASH_ONLY.contains(&first_word(seg)))
+}
+
+/// Run a cmdlet given as `program`. Arguments become single-quoted literals, so `$var`,
+/// quotes and redirection inside them are never re-evaluated.
+fn powershell_call(program: &str, args: &[String]) -> Result<Command, String> {
+    let mut script = program.to_string();
+    for a in args {
+        script.push(' ');
+        script.push_str(&ps_quote(a));
+    }
+    if script.len() > PS_SCRIPT_CAP {
+        return Err(format!(
+            "script is {} characters; `-EncodedCommand` carries it in one argv (limit ~{PS_SCRIPT_CAP})",
+            script.len()
+        ));
+    }
+    let mut c = Command::new("powershell.exe");
+    c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+    c.arg(encoded_powershell(&script));
+    prepare(&mut c);
+    apply_python_fast(&mut c);
+    apply_child_defaults(&mut c, false);
+    Ok(c)
+}
+
+/// Bare words stay bare (`-Path`, `src`); anything else is single-quoted, the one form
+/// PowerShell never expands.
+fn ps_quote(s: &str) -> String {
+    let bare = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./\\:@".contains(c));
+    if bare {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "''"))
+    }
 }
 
 fn cmd_quote(s: &str) -> String {
@@ -954,6 +1123,36 @@ pub fn run_captured(mut cmd: Command, timeout: Option<Duration>) -> std::io::Res
     })
 }
 
+/// Run one `command` through `shell`, with env prefixes, a cwd and one retry for a startup
+/// flake that is not the command's fault.
+pub fn run_shell(
+    command: &str,
+    shell: &str,
+    envs: &[(String, String)],
+    cwd: &Option<PathBuf>,
+    timeout: Option<Duration>,
+) -> Result<Outcome, String> {
+    for attempt in 0..2 {
+        let mut cmd = build_shell(command, shell)?;
+        apply_envs(&mut cmd, envs);
+        apply_cwd(&mut cmd, cwd);
+        let out = run_captured(cmd, timeout).map_err(|e| format!("failed to start: {e}"))?;
+        if attempt == 0 && msys_startup_flake(&out) {
+            continue;
+        }
+        return Ok(out);
+    }
+    unreachable!("the loop returns on the second attempt")
+}
+
+/// msys bash sometimes cannot create its shared-memory object under a restricted token and
+/// dies with 0xC0000142 before running the command. Startup is ~50 ms, so retry once
+/// instead of handing the model a cryptic NTSTATUS.
+fn msys_startup_flake(o: &Outcome) -> bool {
+    const STATUS_DLL_INIT_FAILED: i32 = -1073741502;
+    o.code == STATUS_DLL_INIT_FAILED && o.stderr.to_ascii_lowercase().contains("msys")
+}
+
 /// Run commands in order and stop at the first failure, like npm's
 /// pre/main/post scripts. Output is concatenated; the code is the last one run.
 pub fn run_chain(cmds: Vec<Command>, timeout: Option<Duration>) -> std::io::Result<Outcome> {
@@ -1128,14 +1327,78 @@ mod tests {
     }
 
     #[test]
-    fn detects_powershell_syntax_only_in_command_position() {
-        assert!(looks_powershell("Get-ChildItem | Select-Object -First 2"));
-        assert!(looks_powershell("echo hi; Get-Date"));
-        assert!(looks_powershell("Write-Output $env:USERNAME"));
-        assert!(!looks_powershell("git commit -m \"Add Get-Thing support\""));
-        assert!(!looks_powershell("cargo build --release"));
-        assert!(!looks_powershell("docker-compose up"));
-        assert!(!looks_powershell("ls | sort"));
+    fn routes_each_shell_only_syntax_to_a_shell_that_parses_it() {
+        // Each PowerShell line below used to run in cmd.exe and die with
+        // "'$x' is not recognized"; `ls | head` used to run in cmd.exe and exit 255.
+        for (line, want) in [
+            ("$x = 1 + 2; $x", "powershell"),
+            ("& $env:ComSpec /c echo hi", "powershell"),
+            ("& \"C:\\Program Files\\nodejs\\node.exe\" x.js", "powershell"),
+            ("[System.IO.Path]::GetFileName(\"C:\\a\\b.txt\")", "powershell"),
+            ("$p = \"abc\"; $p.ToUpper()", "powershell"),
+            ("try { throw \"boom\" } catch { $_.Exception.Message }", "powershell"),
+            ("foreach ($f in $list) { $f }", "powershell"),
+            ("$env:USERPROFILE", "powershell"),
+            ("if ($a -eq 1) { 'y' }", "powershell"),
+            ("Get-CimInstance Win32_Process | Measure-Object", "powershell"),
+            ("Get-Content x.log -Tail 5", "powershell"),
+            ("$js = @'\nconsole.log(1)\n'@; node x.mjs", "powershell"),
+            ("ls src | head -3", "bash"),
+            ("cat Cargo.toml | head -5", "bash"),
+            ("grep -n \"fn main\" src/main.rs | head -3", "bash"),
+            ("git log --oneline | head -3", "bash"),
+            ("find src -name \"*.rs\" | wc -l", "bash"),
+            ("echo $(date)", "bash"),
+            ("rg -n fn src | wc -l", "bash"),
+            ("cargo build --release", "cmd"),
+            ("git status --short", "cmd"),
+            ("echo one && echo two", "cmd"),
+            ("dir /b src | findstr /i main", "cmd"),
+            ("echo hello > out.txt && type out.txt", "cmd"),
+            ("git commit -m \"Add Get-Thing support\"", "cmd"),
+            ("docker-compose up", "cmd"),
+            ("curl -s -w \"%{http_code}\" http://127.0.0.1:9360/", "cmd"),
+            ("echo %USERPROFILE%", "cmd"),
+            ("powershell -NoProfile -Command \"1+1\"", "cmd"),
+            ("node -e \"console.log(1+1)\"", "cmd"),
+            ("python -c \"print(1+1)\"", "cmd"),
+        ] {
+            assert_eq!(pick_shell(line), want, "{line}");
+        }
+    }
+
+    #[test]
+    fn encodes_powershell_scripts_as_utf16le_base64() {
+        // Vectors from [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(x)).
+        assert_eq!(base64_utf16le(""), "");
+        assert_eq!(base64_utf16le("A"), "QQA=");
+        assert_eq!(base64_utf16le("AB"), "QQBCAA==");
+        assert_eq!(base64_utf16le("ABC"), "QQBCAEMA");
+    }
+
+    #[test]
+    fn runs_a_cmdlet_given_as_program_through_powershell() {
+        let c = build_command_at("Get-ChildItem", &["src".into(), "a b".into()], None).unwrap();
+        assert!(c
+            .get_program()
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("powershell"));
+        let args: Vec<String> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args[args.len() - 2], "-EncodedCommand");
+        let script = args.last().unwrap();
+        assert!(script.len() > 40);
+        assert!(script.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)));
+        assert_eq!(ps_quote("-Path"), "-Path");
+        assert_eq!(ps_quote("a b"), "'a b'");
+        assert_eq!(ps_quote("it's"), "'it''s'");
+        // A normal executable is not hijacked by the cmdlet rule.
+        let git = build_command_at("git", &["status".into()], None).unwrap();
+        assert!(!git
+            .get_program()
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("powershell"));
     }
 
     #[test]

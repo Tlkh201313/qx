@@ -101,6 +101,12 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
         d.deny("wsl --unregister deletes the distribution and its disk");
     }
 
+    // No agent can answer a UAC prompt: elevation either hangs or pops a dialog on the
+    // user's desktop. The human can still run the command themselves.
+    if elevates(&name, &joined) {
+        d.deny("requesting elevation (UAC); run it as the current user instead");
+    }
+
     // `env`, `xargs`, `timeout`, `nohup`, `sudo`, `wsl`, `command` are transparent wrappers: judge the
     // payload, not the wrapper.
     if let Some((prog, rest)) = unwrap_wrapper(&name, args) {
@@ -367,6 +373,14 @@ fn uploads_secret(name: &str, args: &[String]) -> bool {
     })
 }
 
+/// Programs and switches that raise a Windows UAC prompt.
+fn elevates(name: &str, joined: &str) -> bool {
+    if matches!(name, "runas" | "gsudo" | "elevate") {
+        return true;
+    }
+    matches!(name, "start-process" | "saps") && joined.to_ascii_lowercase().contains("runas")
+}
+
 pub fn check_shell_mode(m: Mode, command: &str, cwd: Option<&Path>) -> Decision {
     let mut d = Decision::allow();
     if m == Mode::Off {
@@ -376,6 +390,12 @@ pub fn check_shell_mode(m: Mode, command: &str, cwd: Option<&Path>) -> Decision 
     let cwd = cwd.or(cur.as_deref());
 
     check_redirection(command, cwd, &mut d);
+
+    // The elevation switch may sit inside `powershell -Command "…"`, which the segment
+    // parser sees as one opaque argument.
+    if command.to_ascii_lowercase().contains("-verb runas") {
+        d.deny("requesting elevation (UAC); run it as the current user instead");
+    }
 
     let mut segments: Vec<(Vec<String>, bool)> = Vec::new();
     for (s, piped) in split_segments(command) {
@@ -1486,6 +1506,28 @@ mod tests {
             assert!(run(prog, args).allowed(), "{prog} {args}");
         }
         assert!(run("find", ". -name x -delete").level == Level::Warn);
+    }
+
+    #[test]
+    fn elevation_requests_are_blocked() {
+        let v = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        let run = |prog: &str, args: &str| check_mode(Mode::Safe, prog, &v(args), None);
+        for (prog, args) in [
+            ("start-process", "-Verb RunAs -FilePath powershell"),
+            ("Start-Process", "powershell -Verb runas"),
+            ("runas", "/user:Administrator cmd"),
+            ("gsudo", "cmd"),
+        ] {
+            assert!(!run(prog, args).allowed(), "{prog} {args}");
+        }
+        for line in [
+            "powershell -Command \"Start-Process powershell -Verb RunAs\"",
+            "Start-Process -Verb RunAs cmd",
+        ] {
+            assert!(!check_shell_mode(Mode::Safe, line, None).allowed(), "{line}");
+        }
+        // Starting a normal process is not elevation.
+        assert!(run("start-process", "notepad.exe").allowed());
     }
 
     #[cfg(windows)]

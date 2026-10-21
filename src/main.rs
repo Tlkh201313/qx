@@ -629,7 +629,7 @@ fn print_help() {
 
 USAGE
   qx [flags] <program> [args...]     direct exec, shims bypassed
-  qx [flags] -c "<command line>"     shell string (auto: cmd or Git Bash)
+  qx [flags] -c "<command line>"     shell string (auto: powershell, Git Bash, or cmd)
   qx mcp                             MCP stdio server (tools: run, fs)
   qx doctor                          diagnose why commands are slow
   qx deploy [--to PATH] [--dry-run]  install this build as the canonical qx.exe
@@ -649,7 +649,9 @@ FLAGS
   --tail N            lines kept at the end (default 60)
   --timeout SECS      kill after N seconds
   --cwd DIR           working directory
-  --shell cmd|bash|powershell    shell for -c (default auto)
+  --shell cmd|bash|powershell    shell for -c (default auto: cmdlet or $variable
+                                 syntax -> powershell, a POSIX utility in a pipeline
+                                 -> Git Bash, else cmd)
 
 SAFETY GATE
   QX_GUARD=safe|strict|off   default safe (deny catastrophic, warn risky)

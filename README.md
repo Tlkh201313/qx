@@ -88,6 +88,9 @@ the command itself.
    - `.ps1` → `powershell -NoProfile -ExecutionPolicy Bypass -File`
    - `program: powershell` gets `-NoProfile` added (a profile costs 300+ ms and
      can print into the output); `QX_PS_PROFILE=1` keeps it.
+   - a **cmdlet as `program`** (`Get-ChildItem src`) runs through PowerShell with
+     each argument passed as a single-quoted literal, so `$var`, quotes and
+     redirection inside arguments are never re-evaluated.
 4. **Shell-free command strings** — `command: "ls -la"` is tokenized and run
    directly. Only real shell syntax (pipes, redirects, quotes, globs, variables)
    spawns a shell. Leading `NAME=value` words (`CI=1 npm test`,
@@ -270,9 +273,20 @@ qx gain                                 # savings report
 ```
 
 Flags: `--max-lines`, `--head`, `--tail`, `--timeout SECS`, `--cwd DIR`,
-`--shell cmd|bash|powershell`, `--capture`. `auto` picks PowerShell when a command
-starts with a `Verb-Noun` cmdlet or uses `$env:` (no profile, UTF-8 output),
-bash for POSIX syntax, else cmd. PowerShell 5.1 has no `&&`/`||`.
+`--shell cmd|bash|powershell`, `--capture`. `auto` picks the shell that can parse
+the line: PowerShell for `$x = 1`, `[T]::Method()`, `try { }`, `& $exe`, `@'…'@`,
+` -eq `-style comparisons and `Verb-Noun` cmdlets (no profile, UTF-8 output, exit
+code preserved through `-EncodedCommand`); Git Bash when a pipeline or redirect
+runs a POSIX utility (`ls cat head tail wc grep find sed awk sort uniq xargs …`);
+otherwise cmd. A line that neither shell can start fails with a message naming
+the limit — 8 KiB for cmd, 12 KiB of script for PowerShell. PowerShell 5.1 has no
+`&&`/`||`, so those stay on cmd.
+
+Children never prompt: stdin is empty, PowerShell runs `-NonInteractive` (so
+`Read-Host` fails fast instead of hanging), and git gets `GIT_EDITOR=true`,
+`GIT_SEQUENCE_EDITOR=true` and `GIT_TERMINAL_PROMPT=0`. Elevation requests
+(`Start-Process -Verb RunAs`, `runas`, `gsudo`) are blocked — an agent cannot
+answer a UAC prompt.
 
 Exit code and stdout/stderr are passed through unchanged (compaction aside).
 

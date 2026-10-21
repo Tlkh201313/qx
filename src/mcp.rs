@@ -400,7 +400,7 @@ fn run_schema() -> Value {
     let mut schema = json!({
         "name": "run",
         "description": format!(
-            "Run a local command fast. Prefer `program` + `args` (direct exec, no shell). Simple `command` strings are also split without a shell; use pipes/redirects only when needed. In-process built-ins: pwd, echo, ls, cat, head, tail, wc, mkdir, rm, cp, mv, touch, which, realpath, whoami, hostname, seq, sleep. Output is compacted, preserves errors from the middle, and redacts secrets. On failure, fall back to the native {} for sandbox escalation, background jobs, or PTY work.",
+            "Run a local command fast. Prefer `program` + `args` (direct exec, no shell); a PowerShell cmdlet (`Get-ChildItem`) or a `.ps1` path also works as `program`. A single `command` runs without a shell; otherwise `shell` decides: auto = PowerShell for cmdlet/variable syntax, Git Bash when a pipeline runs a POSIX utility (ls, cat, head, grep, find, wc…), else cmd. Children never prompt: stdin is empty, PowerShell runs -NonInteractive, git gets GIT_EDITOR=true and GIT_TERMINAL_PROMPT=0. In-process built-ins: pwd, echo, ls, cat, head, tail, wc, mkdir, rm, cp, mv, touch, which, basename, dirname, realpath, whoami, hostname, seq, sleep. Output is compacted, preserves errors from the middle, and redacts secrets. On failure, fall back to the native {} for sandbox escalation, background jobs, or PTY work.",
             c.native(Native::Shell)
         ),
         "inputSchema": {
@@ -409,7 +409,7 @@ fn run_schema() -> Value {
                 "program": { "type": "string", "description": "Executable name or path, e.g. git, cargo, python, node." },
                 "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments for program." },
                 "command": { "type": "string", "description": "Full shell command line for pipes/redirects/chaining." },
-                "shell": { "type": "string", "enum": ["auto", "cmd", "bash", "powershell"], "default": "auto", "description": "auto picks powershell for cmdlet syntax, bash for POSIX syntax, else cmd. powershell skips the user profile." },
+                "shell": { "type": "string", "enum": ["auto", "cmd", "bash", "powershell"], "default": "auto", "description": "auto picks PowerShell for cmdlet/variable syntax, Git Bash when a pipeline runs a POSIX utility, else cmd. PowerShell runs -NoProfile -NonInteractive." },
                 "cwd": { "type": "string", "description": "Working directory." },
                 "timeout_ms": { "type": "integer", "default": 120000 },
                 "mode": { "type": "string", "enum": ["compact", "full"], "default": "compact" }
@@ -443,7 +443,7 @@ fn fs_schema() -> Value {
     let mut schema = json!({
         "name": "fs",
         "description": format!(
-            "Fast in-process filesystem operations for the workspace. op=read: line-numbered UTF-8 read (path, offset?, limit?). op=write: create or replace (path, content); an existing file needs a prior qx read. op=edit: literal replace (path, old_string, new_string, replace_all?); needs a prior qx read. op=glob: path discovery (pattern; path?). op=grep: literal content search (pattern; path?, include?, ignore_case?); one output line is path:line: text. op=list/stat. Always pass cwd; paths outside cwd are refused. qx skips generated dirs (node_modules, target, dist, build, ...) during recursive walks for speed; pass one as `path` to search it directly, or use the native {glob}/{grep} when the whole ignored tree matters. qx grep is literal, not regex. On any error use the native {read}/{write}/{edit}/{glob}/{grep} tool. Native tools remain authoritative for sandbox escalation, images, and regex. qx mutations are atomic and read-before-write guarded, but do not replace the client's sandbox policy.",
+            "Fast in-process filesystem operations for the workspace. op=read: line-numbered UTF-8 read (path, offset?, limit?). op=write: create or replace (path, content); an existing file needs a prior qx read. op=edit: literal replace (path, old_string, new_string, replace_all?); needs a prior qx read. op=glob: path discovery (pattern; path?). op=grep: literal content search (pattern; path?, include?, ignore_case?); one output line is path:line: text. op=list/stat. Pass cwd to pin the root; it defaults to where the server started. Paths outside cwd are refused. qx skips generated dirs (node_modules, target, dist, build, ...) during recursive walks for speed; pass one as `path` to search it directly, or use the native {glob}/{grep} when the whole ignored tree matters. qx grep is literal, not regex. On any error use the native {read}/{write}/{edit}/{glob}/{grep} tool. Native tools remain authoritative for sandbox escalation, images, and regex. qx mutations are atomic and read-before-write guarded, but do not replace the client's sandbox policy.",
             glob = c.native(Native::Glob),
             grep = c.native(Native::Grep),
             read = c.native(Native::Read),
@@ -454,7 +454,7 @@ fn fs_schema() -> Value {
             "type": "object",
             "properties": {
                 "op": { "type": "string", "enum": ["read", "write", "edit", "glob", "grep", "list", "stat"] },
-                "cwd": { "type": "string", "description": "Session working directory. qx confines every path to this root." },
+                "cwd": { "type": "string", "description": "Session working directory; the root every path is confined to. Defaults to where the server was started." },
                 "path": { "type": "string", "description": "File or directory, absolute or relative to cwd. Defaults to '.' for glob, grep, and list. Alias: file_path." },
                 "file_path": { "type": "string", "description": format!("Alias for path, matching the native {}/{}/{} tools.", c.native(Native::Read), c.native(Native::Write), c.native(Native::Edit)) },
                 "content": { "type": "string", "description": "write: complete new file content." },
@@ -470,7 +470,7 @@ fn fs_schema() -> Value {
                 "max_line_chars": { "type": "integer", "default": 2000, "description": "read/grep: clip each line (cap 8000)." },
                 "ignore_case": { "type": "boolean", "default": false, "description": "ASCII case-insensitive glob/grep." }
             },
-            "required": ["op", "cwd"]
+            "required": ["op"]
         },
         "outputSchema": {
             "type": "object",
@@ -610,18 +610,10 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
             .and_then(|(prog, sargs)| run_direct(&prog, &sargs, &envs, cwd.as_deref(), timeout, "direct").ok());
         match direct {
             Some(x) => x,
-            None => {
-                let mut cmd = match exec::build_shell(c, shell) {
-                    Ok(x) => x,
-                    Err(e) => return tool_text(id, &e, true),
-                };
-                exec::apply_envs(&mut cmd, &envs);
-                exec::apply_cwd(&mut cmd, &cwd);
-                match exec::run_captured(cmd, Some(timeout)) {
-                    Ok(o) => (o, "shell"),
-                    Err(e) => return tool_text(id, &format!("failed to start: {e}"), true),
-                }
-            }
+            None => match exec::run_shell(c, shell, &envs, &cwd, Some(timeout)) {
+                Ok(o) => (o, "shell"),
+                Err(e) => return tool_text(id, &e, true),
+            },
         }
     } else {
         return tool_text(id, "provide `program` + `args`, or `command`", true);
