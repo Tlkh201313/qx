@@ -208,7 +208,11 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
     let (mut cmd, label) = if let Some(sh) = shell_cmd {
         // `CI=1 npm test`: the prefix goes to the child only, never into qx's own environment
         // (that would also reach qx's switches such as QX_REDACT).
-        let (envs, run) = exec::peel_env(&sh);
+        let (mut envs, run) = exec::peel_env(&sh);
+        if !o.compact {
+            // --raw promises the untouched text: built-ins must not sample their own output either.
+            envs.push(("QX_LS_FULL".into(), "1".into()));
+        }
         let run = run.to_string();
         // A quoted command with no shell syntax does not need a shell at all.
         if let Some((prog, sargs)) = exec::split_simple(&run) {
@@ -254,7 +258,8 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
         if let Some(code) = direct_exec(program, rest, &[], &o, &label) {
             return code;
         }
-        if let Some(b) = builtin::try_exec(program, rest, o.cwd.as_deref(), &[]) {
+        let full_env: Vec<(String, String)> = if o.compact { Vec::new() } else { vec![("QX_LS_FULL".into(), "1".into())] };
+        if let Some(b) = builtin::try_exec(program, rest, o.cwd.as_deref(), &full_env) {
             return emit(b.into(), &o, &label);
         }
         match exec::build_command_at(program, rest, o.cwd.as_deref()) {

@@ -643,14 +643,17 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
     guard::record("mcp", guard_cmd, &decision);
 
     let timeout = Duration::from_millis(timeout_ms);
+    // mode "full" promises the untouched text: built-ins must not sample their own output either.
+    let full_env: Vec<(String, String)> = if full { vec![("QX_LS_FULL".into(), "1".into())] } else { Vec::new() };
     let (outcome, source) = if let Some(p) = program {
-        match run_direct(p, &list, &[], cwd.as_deref(), timeout, "program") {
+        match run_direct(p, &list, &full_env, cwd.as_deref(), timeout, "program") {
             Ok(x) => x,
             Err(e) => return tool_text(id, &e, true),
         }
     } else if let Some(c) = cmdline {
         // The guard above judged the whole line; env prefixes only change what runs.
-        let (envs, c) = exec::peel_env(c);
+        let (mut envs, c) = exec::peel_env(c);
+        envs.extend(full_env);
         let direct = exec::split_simple(c)
             .and_then(|(prog, sargs)| run_direct(&prog, &sargs, &envs, cwd.as_deref(), timeout, "direct").ok());
         match direct {
@@ -1004,13 +1007,18 @@ mod tests {
             std::fs::write(d.join(format!("f{i:03}.txt")), "").unwrap();
         }
         let cwd = d.to_string_lossy().to_string();
-        let plain = client::scoped(Client::Dsh, || call(json!({"command":"ls","cwd":cwd,"mode":"full"})));
-        let full = client::scoped(Client::Dsh, || {
+        let plain = client::scoped(Client::Dsh, || call(json!({"command":"ls","cwd":cwd})));
+        let prefixed = client::scoped(Client::Dsh, || {
             call(json!({"command":"QX_LS_FULL=1 ls","cwd":cwd,"mode":"full"}))
         });
+        // README: mode "full" returns the untouched text, so the built-in's sampling stays off too.
+        let full = client::scoped(Client::Dsh, || call(json!({"command":"ls","cwd":cwd,"mode":"full"})));
+        let program = client::scoped(Client::Dsh, || call(json!({"program":"ls","cwd":cwd,"mode":"full"})));
         let text = |r: &Value| r.pointer("/result/structuredContent/stdout").and_then(Value::as_str).unwrap().to_string();
         assert!(text(&plain).contains("more entries") || text(&plain).lines().count() < 230);
-        assert_eq!(text(&full).lines().count(), 230);
+        for r in [&prefixed, &full, &program] {
+            assert_eq!(text(r).lines().count(), 230, "{r}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

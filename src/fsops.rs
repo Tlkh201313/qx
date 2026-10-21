@@ -1547,37 +1547,48 @@ fn stat(root: &Root, args: &Value) -> Result<Reply, FsError> {
 
 /// Visit every file below `root` - the built-in skip list (`node_modules`, `target`, `.git`)
 /// does not apply - until `visit` returns false or the walk cap is hit. Symlinks are not
-/// followed: neither is `grep -r`.
-pub(crate) fn walk_every_file<F: FnMut(&Path) -> bool>(root: &Path, mut visit: F) {
-    fn go<F: FnMut(&Path) -> bool>(dir: &Path, depth: usize, count: &mut usize, visit: &mut F) -> bool {
+/// followed: neither is `grep -r`. Returns whether every file was visited: false when `visit`
+/// stopped it, a cap or the depth limit cut it, or a directory or entry could not be read.
+pub(crate) fn walk_every_file<F: FnMut(&Path) -> bool>(root: &Path, mut visit: F) -> bool {
+    // (keep going, nothing skipped so far)
+    fn go<F: FnMut(&Path) -> bool>(dir: &Path, depth: usize, count: &mut usize, visit: &mut F, whole: &mut bool) -> bool {
         if depth > MAX_WALK_DEPTH {
+            *whole = false;
             return true;
         }
         let Ok(entries) = fs::read_dir(dir) else {
+            *whole = false;
             return true;
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                *whole = false;
+                continue;
+            };
             let Ok(ft) = entry.file_type() else {
+                *whole = false;
                 continue;
             };
             if ft.is_symlink() {
                 continue;
             }
             if ft.is_dir() {
-                if !go(&entry.path(), depth + 1, count, visit) {
+                if !go(&entry.path(), depth + 1, count, visit, whole) {
                     return false;
                 }
             } else if ft.is_file() {
                 *count += 1;
                 if *count > MAX_WALK_FILES || !visit(&entry.path()) {
+                    *whole = false;
                     return false;
                 }
             }
         }
         true
     }
-    let mut count = 0usize;
-    go(root, 0, &mut count, &mut visit);
+    let (mut count, mut whole) = (0usize, true);
+    go(root, 0, &mut count, &mut visit, &mut whole);
+    whole
 }
 
 pub(crate) fn walk_files<F: FnMut(&Path, &fs::DirEntry)>(root: &Path, mut visit: F) {

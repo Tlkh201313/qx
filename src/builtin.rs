@@ -944,11 +944,20 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut invert = false;
     let mut quiet = false;
     let mut count_only = false;
-    let mut before = 0usize;
-    let mut after = 0usize;
-    let mut around = 0usize;
+    // GNU: an explicit -A/-B wins over -C, and any of them (even 0) turns on `--` separators.
+    let mut before: Option<usize> = None;
+    let mut after: Option<usize> = None;
+    let mut around: Option<usize> = None;
     let mut include: Option<String> = None;
     let mut pattern: Option<String> = None;
+    // A second -e or --include adds to the first in GNU grep; this scan holds one of each.
+    fn set_once(slot: &mut Option<String>, v: String) -> Option<()> {
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(v);
+        Some(())
+    }
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -967,19 +976,20 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                     if !simple_include(v) {
                         return None;
                     }
-                    include = Some(v.to_string());
+                    set_once(&mut include, v.to_string())?;
                 }
-                "regexp" => pattern = Some(val?.to_string()),
+                "regexp" => set_once(&mut pattern, val?.to_string())?,
                 "invert-match" => invert = true,
                 "quiet" | "silent" => quiet = true,
                 "fixed-strings" => fixed = true,
                 "count" => count_only = true,
-                "after-context" => after = count_arg(val?)?,
-                "before-context" => before = count_arg(val?)?,
-                "context" => around = count_arg(val?)?,
+                "after-context" => after = Some(count_arg(val?)?),
+                "before-context" => before = Some(count_arg(val?)?),
+                "context" => around = Some(count_arg(val?)?),
                 "line-number" => number = true,
                 "files-with-matches" => list_only = true,
                 "recursive" => recursive = true,
+                "dereference-recursive" => return None,
                 // Colour is never emitted; buffering is not observable in captured output.
                 "color" | "colour" | "line-buffered" => {}
                 _ => return None,
@@ -988,7 +998,7 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             let body = &a[1..];
             if body.chars().all(|c| c.is_ascii_digit()) {
                 // GNU's `-3` is `-C3`.
-                around = count_arg(body)?;
+                around = Some(count_arg(body)?);
                 i += 1;
                 continue;
             }
@@ -998,7 +1008,9 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                     'i' => insensitive = true,
                     'n' => number = true,
                     'l' => list_only = true,
-                    'r' | 'R' => recursive = true,
+                    'r' => recursive = true,
+                    // -R follows symlinks and junctions; the walk never does.
+                    'R' => return None,
                     'F' => fixed = true,
                     'v' => invert = true,
                     'q' => quiet = true,
@@ -1008,12 +1020,13 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                     'e' => {
                         // `-e pat`, `-epat` and `-ne pat` all name the pattern.
                         let rest = &body[pos + ch.len_utf8()..];
-                        pattern = Some(if rest.is_empty() {
+                        let p = if rest.is_empty() {
                             i += 1;
                             args.get(i)?.clone()
                         } else {
                             rest.to_string()
-                        });
+                        };
+                        set_once(&mut pattern, p)?;
                         break;
                     }
                     'A' | 'B' | 'C' => {
@@ -1025,7 +1038,7 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                         } else {
                             rest.to_string()
                         };
-                        let n = count_arg(&n)?;
+                        let n = Some(count_arg(&n)?);
                         match ch {
                             'A' => after = n,
                             'B' => before = n,
@@ -1041,7 +1054,10 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         }
         i += 1;
     }
-    if (around > 0 || before > 0 || after > 0) && (count_only || list_only) {
+    let context = before.is_some() || after.is_some() || around.is_some();
+    let bctx = before.or(around).unwrap_or(0);
+    let actx = after.or(around).unwrap_or(0);
+    if context && (count_only || list_only) {
         // GNU answers these with a "context is ignored" warning; qx words warnings badly.
         return None;
     }
@@ -1063,7 +1079,8 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             // No path means stdin, which qx never gives a child.
             return None;
         }
-        specs.push((".", path_of(cwd, ".")));
+        // `grep -r x` searches `.` but names files without a `./` prefix.
+        specs.push(("", path_of(cwd, ".")));
     } else {
         for raw in &args[i..] {
             if raw == "-" {
@@ -1087,7 +1104,9 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         }
         let base = raw.trim_end_matches(['/', '\\']);
         let mut full = false;
-        crate::fsops::walk_every_file(path, |file| {
+        // A walk that skipped anything (too deep, unreadable, too many files) is not an answer:
+        // "no match" from half a tree misleads.
+        let complete = crate::fsops::walk_every_file(path, |file| {
             if files.len() >= MAX_GREP_FILES {
                 full = true;
                 return false;
@@ -1117,7 +1136,7 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             files.push((disp, file.to_path_buf()));
             true
         });
-        if full {
+        if full || !complete {
             return None;
         }
     }
@@ -1132,18 +1151,15 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     } else {
         pattern.to_string()
     };
-    let (bctx, actx) = if around > 0 {
-        (around, around)
-    } else {
-        (before, after)
-    };
     let mut out = String::new();
     let mut hits = 0usize;
+    let mut printed = false; // anything printed yet, across files: GNU separates groups of different files
     'files: for (disp, path) in &files {
-        let bytes = fs::read(path).ok()?;
-        if bytes.len() as u64 > READ_CAP {
+        // Size first: a multi-gigabyte log must not be read just to be declined.
+        if fs::metadata(path).ok()?.len() > READ_CAP {
             return None;
         }
+        let bytes = fs::read(path).ok()?;
         if bytes[..bytes.len().min(8192)].contains(&0) {
             // GNU prints "Binary file ... matches"; never guess at that.
             return None;
@@ -1168,8 +1184,8 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             }
         }
         if selected.is_empty() {
-            // GNU counts every file it searched, zero included.
-            if count_only {
+            // GNU counts every file it searched, zero included (and -q prints nothing at all).
+            if count_only && !quiet {
                 if multiple {
                     out.push_str(disp);
                     out.push(':');
@@ -1211,9 +1227,14 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             if !show[idx] {
                 continue;
             }
-            if bctx + actx > 0 && matches!(last, Some(p) if p + 1 != idx) {
+            let new_group = match last {
+                Some(p) => p + 1 != idx,
+                None => printed, // first line of this file, after another file's lines
+            };
+            if context && new_group {
                 out.push_str("--\n");
             }
+            printed = true;
             last = Some(idx);
             let sep = if is_sel[idx] { ':' } else { '-' };
             let line = raw.strip_suffix('\n').unwrap_or(raw);
@@ -1480,7 +1501,7 @@ fn cmd_rm(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     for p in paths {
         let path = path_of(cwd, p);
         // Like GNU rm: `.` and `..` are never removed, however they are spelled.
-        let dot = matches!(p.rsplit(['/', '\\']).next(), Some("." | ".."));
+        let dot = matches!(p.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next(), Some("." | ".."));
         if dot || dangerous(&path, cwd) {
             err.push_str(&format!("rm: refusing to remove {}\n", path.display()));
             code = 1;
@@ -2155,12 +2176,63 @@ mod tests {
             format!("{}{sep}.", sub.display()),
             sub.to_string_lossy().into_owned(),
             "..".to_string(),
+            // A trailing separator is still `.`/`..` (a failure here only deletes this temp tree).
+            "../".to_string(),
+            "..\\".to_string(),
+            "./".to_string(),
         ] {
             let out = cmd_rm(&["-rf".into(), operand.clone()], Some(&sub)).unwrap();
             assert_eq!(out.code, 1, "{operand}: {}", out.stderr);
             assert!(root.join("f").exists() && sub.join("g").exists(), "{operand} removed files");
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grep_declines_what_it_cannot_answer_exactly() {
+        let d = scratch("grep-decline");
+        fs::write(d.join("a.txt"), "foo\nbar\n").unwrap();
+        // A second pattern or include used to replace the first.
+        assert!(run("grep", &["-e", "foo", "-e", "bar", "a.txt"], &d).is_none());
+        assert!(run("grep", &["-r", "--include=*.rs", "--include=*.txt", "foo", "."], &d).is_none());
+        // -R follows links, which the walk never does.
+        assert!(run("grep", &["-Rn", "foo", "."], &d).is_none());
+        assert!(run("grep", &["--dereference-recursive", "foo", "."], &d).is_none());
+        // A walk cut short (here: deeper than the walk goes) is not an answer.
+        let mut deep = d.join("deep");
+        for _ in 0..66 {
+            deep = deep.join("d");
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("x.txt"), "needle\n").unwrap();
+        assert!(run("grep", &["-rn", "needle", "deep"], &d).is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn grep_context_groups_and_flags_follow_gnu() {
+        let d = scratch("grep-ctx");
+        fs::write(d.join("a.txt"), "alpha\nbeta\nalpha gamma\n").unwrap();
+        fs::write(d.join("b.rs"), "let alpha = 1;\nlet gamma = 2;\n").unwrap();
+        let out = |args: &[&str]| {
+            let o = run("grep", args, &d).expect("built-in declined");
+            (o.code, o.stdout)
+        };
+        // Any context option, even 0, separates non-adjacent groups, and groups of different files.
+        assert_eq!(out(&["-0", "alpha", "a.txt"]), (0, "alpha\n--\nalpha gamma\n".into()));
+        assert_eq!(
+            out(&["-A1", "alpha", "a.txt", "b.rs"]),
+            (0, "a.txt:alpha\na.txt-beta\na.txt:alpha gamma\n--\nb.rs:let alpha = 1;\nb.rs-let gamma = 2;\n".into())
+        );
+        // An explicit -B/-A wins over -C.
+        assert_eq!(out(&["-C1", "-B0", "gamma", "a.txt"]), (0, "alpha gamma\n".into()));
+        // -q prints nothing, counts included.
+        assert_eq!(out(&["-qc", "nope", "a.txt"]), (1, String::new()));
+        assert_eq!(out(&["-qc", "alpha", "a.txt"]), (0, String::new()));
+        // With no path, -r searches `.` and prints names without a `./` prefix.
+        let (code, text) = out(&["-rn", "gamma"]);
+        assert!(code == 0 && text.starts_with("a.txt:3:") && !text.contains("./"), "{text}");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -2320,7 +2392,7 @@ mod tests {
     #[test]
     fn grep_matches_the_real_tool_or_declines() {
         let Some(grep) = real_grep() else {
-            eprintln!("skipped: no grep.exe next to Git");
+            oracle_missing("no grep.exe next to Git");
             return;
         };
         let d = scratch("grep");
@@ -2357,7 +2429,6 @@ mod tests {
             vec!["-c", "alpha", "a.txt", "b.rs"],
             vec!["-cv", "alpha", "a.txt"],
             vec!["-rcn", "alpha", "."],
-            vec!["-cl", "alpha", "."],
             vec!["-e", "alpha", "a.txt"],
             vec!["-ealpha", "a.txt"],
             vec!["-ne", "gamma", "a.txt"],
@@ -2442,7 +2513,7 @@ mod tests {
     #[test]
     fn sed_prints_the_range_the_real_tool_prints() {
         let Some(sed) = real_sed() else {
-            eprintln!("skipped: no real sed");
+            oracle_missing("no real sed");
             return;
         };
         let d = scratch("sed");
@@ -2492,6 +2563,12 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// CI sets QX_REQUIRE_ORACLE=1: there a missing oracle is a failure, not a silent pass.
+    fn oracle_missing(why: &str) {
+        assert!(std::env::var("QX_REQUIRE_ORACLE").ok().as_deref() != Some("1"), "oracle required: {why}");
+        eprintln!("skipped: {why}");
+    }
+
     fn real_grep() -> Option<&'static str> {
         [
             r"C:\Program Files\Git\usr\bin\grep.exe",
@@ -2533,7 +2610,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1) as u64));
         }
-        eprintln!("skipped: the real tool could not start here ({})", last.2.trim());
+        oracle_missing(&format!("the real tool could not start here ({})", last.2.trim()));
         None
     }
 }
