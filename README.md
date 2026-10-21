@@ -14,8 +14,10 @@ the command itself.
    Anything a built-in does not reproduce exactly goes to the real tool instead:
    unknown flags, wildcards, `/x` arguments (cmd switches like `dir /b`, MSYS paths
    like `/tmp/x`), `tail -n +N`, `basename f .txt`, `echo -e`, `ls -lh`, `seq 1e3`,
-   `sleep` over 10 s (a built-in cannot be killed by the call's timeout), `touch`
-   on a read-only file, and `cp -r` over a tree holding a symlink or junction.
+   a `-c` window that is binary or not valid UTF-8, `sleep` over 10 s (a built-in
+   cannot be killed by the call's timeout), `touch` on a read-only file, and
+   `cp -r` over a tree holding a symlink or junction. `head -c N`/`tail -c N` read
+   one byte window from the file instead of starting a tool.
    `grep` answers `-i -n -l -r -F --include=*.ext` with literal patterns and hands
    every other shape (regex metacharacters, `-c`, `-v`, stdin, binary or over-32 MiB
    files, more than 20k files) to the real `grep`, so the line list is never guessed.

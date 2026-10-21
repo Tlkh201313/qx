@@ -674,6 +674,7 @@ BUILT-INS (no process spawn)
   which where basename dirname realpath
   whoami hostname seq
   grep takes literal patterns, -i -n -l -r --include=*.ext; anything else runs the real grep.
+  head -c N / tail -c N read one byte window when it is text; binary runs the real tool.
   Unknown flags fall back to the real executable.
 
 EXAMPLES

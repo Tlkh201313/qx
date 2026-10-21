@@ -709,44 +709,93 @@ fn count_arg(s: &str) -> Option<usize> {
     }
 }
 
+/// `-n` counts lines, `-c` counts bytes; the last one on the line wins, as in GNU.
+enum Window {
+    Lines(usize),
+    Bytes(usize),
+}
+
 fn cmd_head(args: &[String], cwd: Option<&Path>, tail: bool) -> Option<BuiltinOut> {
-    let mut count = 10usize;
+    let mut window = Window::Lines(10);
     let mut files: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
-        if a == "-n" || a == "--lines" {
+        let spec = if a == "-n" || a == "--lines" {
             i += 1;
-            count = count_arg(args.get(i)?)?;
+            Some((false, args.get(i)?.as_str()))
+        } else if a == "-c" || a == "--bytes" {
             i += 1;
-        } else if let Some(rest) = a.strip_prefix("-n") {
-            count = count_arg(rest)?;
-            i += 1;
+            Some((true, args.get(i)?.as_str()))
         } else if let Some(rest) = a.strip_prefix("--lines=") {
-            count = count_arg(rest)?;
-            i += 1;
-        } else if (a.starts_with('-') && a.len() > 1) || wildcard(a) {
-            return None;
+            Some((false, rest))
+        } else if let Some(rest) = a.strip_prefix("--bytes=") {
+            Some((true, rest))
+        } else if let Some(rest) = a.strip_prefix("-n") {
+            Some((false, rest))
+        } else if let Some(rest) = a.strip_prefix("-c") {
+            Some((true, rest))
         } else {
-            files.push(a);
-            i += 1;
+            None
+        };
+        match spec {
+            Some((bytes, rest)) => {
+                let n = count_arg(rest)?;
+                window = if bytes { Window::Bytes(n) } else { Window::Lines(n) };
+                i += 1;
+            }
+            None if (a.starts_with('-') && a.len() > 1) || wildcard(a) => return None,
+            None => {
+                files.push(a);
+                i += 1;
+            }
         }
     }
     if files.len() != 1 {
         return None;
     }
     let path = path_of(cwd, files[0]);
+    let tool = if tail { "tail" } else { "head" };
+    if let Window::Bytes(n) = window {
+        return match read_bytes_window(&path, n, tail) {
+            Ok(Some(t)) => Some(ok(t)),
+            // Raw bytes cannot survive the reply format: a binary window runs for real.
+            Ok(None) => None,
+            Err(e) => Some(fail(format!("{tool}: {}: {e}", path.display()))),
+        };
+    }
+    let Window::Lines(count) = window else { return None };
     let text = match read_head_tail(&path, count, tail) {
         Ok(t) => t,
         Err(e) => {
-            return Some(fail(format!(
-                "{}: {}: {e}",
-                if tail { "tail" } else { "head" },
-                path.display()
-            )))
+            return Some(fail(format!("{tool}: {}: {e}", path.display())))
         }
     };
     Some(ok(text))
+}
+
+/// `-c`: a byte window, text only. A window that is binary or not valid UTF-8 is left to the
+/// real tool, because mangled bytes would be worse than a spawn.
+fn read_bytes_window(path: &Path, n: usize, tail: bool) -> std::io::Result<Option<String>> {
+    if n == 0 {
+        return Ok(Some(String::new()));
+    }
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    let n = n.min(READ_CAP as usize);
+    let (start, want) = if tail {
+        let start = len.saturating_sub(n as u64);
+        (start, (len - start) as usize)
+    } else {
+        (0, (len as usize).min(n))
+    };
+    let mut buf = vec![0u8; want];
+    f.seek(SeekFrom::Start(start))?;
+    f.read_exact(&mut buf)?;
+    if buf.iter().take(8192).any(|b| *b == 0) {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(buf).ok())
 }
 
 /// Read only what `head`/`tail` needs. Large files are bounded to the first or
@@ -1854,6 +1903,27 @@ mod tests {
         }
         assert_eq!(run("echo", &["/b"], &d).unwrap().stdout, "/b\n");
         assert!(run("echo", &["-e", "a\\nb"], &d).is_none());
+    }
+
+    #[test]
+    fn head_c_reads_a_byte_window_and_declines_what_it_cannot_say() {
+        let d = scratch("bytes");
+        fs::write(d.join("f.txt"), "abcdefghij\n").unwrap();
+        assert_eq!(run("head", &["-c", "4", "f.txt"], &d).unwrap().stdout, "abcd");
+        assert_eq!(run("head", &["-c4", "f.txt"], &d).unwrap().stdout, "abcd");
+        assert_eq!(run("head", &["--bytes=3", "f.txt"], &d).unwrap().stdout, "abc");
+        assert_eq!(run("tail", &["-c", "4", "f.txt"], &d).unwrap().stdout, "hij\n");
+        assert_eq!(run("tail", &["-c", "0", "f.txt"], &d).unwrap().stdout, "");
+        // The last window flag on the line wins, as in GNU.
+        assert_eq!(run("head", &["-n", "2", "-c", "2", "f.txt"], &d).unwrap().stdout, "ab");
+        assert_eq!(run("head", &["-c", "2", "-n", "2", "f.txt"], &d).unwrap().stdout, "abcdefghij\n");
+        // Byte counts qx would have to guess at, and windows it cannot render, run for real.
+        assert!(run("head", &["-c", "4k", "f.txt"], &d).is_none());
+        assert!(run("head", &["-c", "-4", "f.txt"], &d).is_none());
+        fs::write(d.join("bin.dat"), [0u8, 1, 2, 3]).unwrap();
+        assert!(run("head", &["-c", "2", "bin.dat"], &d).is_none());
+        fs::write(d.join("latin1.dat"), [b'h', 0xFF, 0xFE]).unwrap();
+        assert!(run("head", &["-c", "3", "latin1.dat"], &d).is_none());
     }
 
     #[test]
