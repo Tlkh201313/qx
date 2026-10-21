@@ -193,13 +193,18 @@ static INFLIGHT: Mutex<Vec<(String, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
 /// already finished). `Inflight::begin` honours the first kind; the list is capped so the second cannot grow it.
 static EARLY_CANCELS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-struct Inflight(Option<String>);
+struct Inflight(Option<String>, Option<Arc<AtomicBool>>);
 
 impl Inflight {
+    /// Whether the client cancelled this call (or went away) before it started: it must not run at all.
+    fn cancelled(&self) -> bool {
+        self.1.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+
     /// Registers the calling worker thread's command for cancellation until dropped.
     fn begin(id: &Option<Value>) -> Self {
         let Some(key) = id.as_ref().map(Value::to_string) else {
-            return Inflight(None);
+            return Inflight(None, None);
         };
         // Lock order is always INFLIGHT then EARLY_CANCELS, held across check-and-insert, so a cancel
         // lands either in the flag or in the early list this reads, never between the two.
@@ -214,8 +219,8 @@ impl Inflight {
             running.push((key.clone(), flag.clone()));
             flag
         };
-        exec::set_cancel(Some(flag));
-        Inflight(Some(key))
+        exec::set_cancel(Some(flag.clone()));
+        Inflight(Some(key), Some(flag))
     }
 }
 
@@ -534,8 +539,22 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
         return tool_text(id, "unknown tool (expected `run` or `fs`)", true);
     }
 
-    let program = args.get("program").and_then(|v| v.as_str());
-    let cmdline = args.get("command").and_then(|v| v.as_str());
+    // A field of the wrong type is an error: ignoring it would run the command somewhere else
+    // (`cwd`), for another time (`timeout_ms`), or as a different command (`program`).
+    let text_arg = |key: &str| -> Result<Option<&str>, String> {
+        match args.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.as_str())),
+            Some(other) => Err(format!("`{key}` must be a string, got {other}")),
+        }
+    };
+    let (program, cmdline, cwd_text) = match (text_arg("program"), text_arg("command"), text_arg("cwd")) {
+        (Ok(p), Ok(c), Ok(d)) => (p, c, d),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return tool_text(id, &e, true),
+    };
+    if program.is_some_and(|p| !p.is_empty()) && cmdline.is_some_and(|c| !c.trim().is_empty()) {
+        return tool_text(id, "give `program` + `args`, or `command`, not both", true);
+    }
     let shell = args.get("shell").and_then(|v| v.as_str()).unwrap_or("auto");
 
     // A dropped non-string argument would silently run a different command.
@@ -553,19 +572,25 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
         }
         Some(_) => return tool_text(id, "`args` must be an array of strings", true),
     };
-    let cwd = args
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from);
+    let cwd = cwd_text.map(std::path::PathBuf::from);
     // A bad cwd must fail loudly: built-ins would otherwise run against the wrong place.
     if let Some(d) = cwd.as_ref().filter(|d| !d.is_dir()) {
         return tool_text(id, &format!("cwd is not a directory: {}", d.display()), true);
     }
-    let timeout_ms = args
-        .get("timeout_ms")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(120_000)
-        .clamp(1_000, 3_600_000);
+    let timeout_ms: u64 = match args.get("timeout_ms") {
+        None | Some(Value::Null) => 120_000,
+        Some(v) => {
+            // Whole-number floats (`600000.0`) are what JavaScript and Python callers produce.
+            let whole = v.as_u64().or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.fract() == 0.0 && *f < 1e15).map(|f| f as u64));
+            match whole {
+                Some(n) => n,
+                None => {
+                    return tool_text(id, &format!("`timeout_ms` must be a whole number of milliseconds, got {v}"), true)
+                }
+            }
+        }
+    }
+    .clamp(1_000, 3_600_000);
     let full = args.get("mode").and_then(|v| v.as_str()) == Some("full");
     let label = run_label(program, &list, cmdline);
 
@@ -574,7 +599,17 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
         None => cmdline.unwrap_or("").to_string(),
     };
     let guard_cmd = guard_cmd.as_str();
-    let _inflight = Inflight::begin(&id);
+    let inflight = Inflight::begin(&id);
+    // Cancelled while it waited for a worker slot, or the client already left: run nothing.
+    // Built-ins would otherwise finish their file changes and a program would be spawned just to be killed.
+    if inflight.cancelled() {
+        return tool_result(
+            id,
+            "exit_code: 124\ntimed_out: true\n(cancelled before it started; not run)\n",
+            true,
+            json!({"timed_out": true, "exit_code": 124, "source": "cancelled"}),
+        );
+    }
     let decision = if let Some(p) = program {
         guard::check(p, &list, cwd.as_deref())
     } else if let Some(c) = cmdline {
@@ -847,6 +882,7 @@ mod tests {
 
     #[test]
     fn output_policy_follows_the_matrix() {
+        let _server = server_lock(); // a neighbour's EOF must not cancel these calls
         let list = |c: Client| {
             client::scoped(c, || {
                 handle(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}})).unwrap()
@@ -919,7 +955,48 @@ mod tests {
     }
 
     #[test]
+    fn wrong_typed_cwd_timeout_and_program_are_errors_not_defaults() {
+        let _server = server_lock();
+        let err = |args: Value| -> String {
+            let r = call(args);
+            assert_eq!(r.pointer("/result/isError"), Some(&json!(true)), "{r}");
+            r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default().to_string()
+        };
+        // A non-string cwd used to run the command (even a delete) in qx's own directory.
+        assert!(err(json!({"program":"echo","args":["x"],"cwd":123})).contains("cwd"));
+        assert!(err(json!({"program":"echo","args":["x"],"timeout_ms":"500"})).contains("timeout_ms"));
+        assert!(err(json!({"program":"echo","args":["x"],"timeout_ms":-5})).contains("timeout_ms"));
+        assert!(err(json!({"program":7})).contains("program"));
+        assert!(err(json!({"program":"echo","command":"echo y"})).contains("not both"));
+        // A whole-number float is what JavaScript and Python callers produce.
+        let ok = call(json!({"program":"echo","args":["x"],"timeout_ms":5000.0}));
+        assert_ne!(ok.pointer("/result/isError"), Some(&json!(true)), "{ok}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_call_cancelled_before_it_starts_does_not_run() {
+        let _server = server_lock();
+        let d = std::env::temp_dir().join(format!("qx-mcp-cancelfirst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let cwd = d.to_string_lossy().to_string();
+        for (id, args, marker) in [
+            (900u64, json!({"program":"mkdir","args":["made"],"cwd":cwd}), "made"),
+            (901u64, json!({"command":"cmd /c echo x> marker.txt","cwd":cwd}), "marker.txt"),
+        ] {
+            let note = format!(r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{{"requestId":{id}}}}}"#);
+            assert!(respond(&note).is_none());
+            let r = client::scoped(Client::Dsh, || call_id(id, args));
+            assert!(!d.join(marker).exists(), "the cancelled call still ran ({marker}): {r}");
+            assert_eq!(r.pointer("/result/structuredContent/timed_out"), Some(&json!(true)), "{r}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn an_env_prefix_reaches_builtins_and_the_log_keeps_args() {
+        let _server = server_lock();
         let d = std::env::temp_dir().join(format!("qx-mcp-env-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         for i in 0..230 {
@@ -939,6 +1016,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn cancel_stops_the_running_command() {
+        let _server = server_lock();
         let worker = std::thread::spawn(|| {
             client::scoped(Client::Dsh, || {
                 call_id(77, json!({"program":"ping","args":["-n","30","127.0.0.1"],"timeout_ms":60000}))
@@ -955,6 +1033,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_cancel_that_arrives_before_the_call_gets_a_slot_is_not_lost() {
+        let _server = server_lock();
         // The reader answers `notifications/cancelled` while the call still waits for a worker slot.
         assert!(respond(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":78}}"#).is_none());
         let t = std::time::Instant::now();
