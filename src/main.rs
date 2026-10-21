@@ -218,7 +218,7 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
             if let Some(code) = direct_exec(&prog, &sargs, &envs, &o, &sh) {
                 return code;
             }
-            if let Ok(mut c) = exec::build_command_at(&prog, &sargs, o.cwd.as_deref()) {
+            if let Ok(mut c) = exec::build_command_env(&prog, &sargs, o.cwd.as_deref(), &envs) {
                 exec::apply_envs(&mut c, &envs);
                 exec::apply_cwd(&mut c, &o.cwd);
                 return execute(vec![c], &o, &sh);

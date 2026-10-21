@@ -381,7 +381,19 @@ struct RustupSettings {
 /// Returns None whenever rustup would have made a context-dependent choice:
 /// `+toolchain` arguments, a rust-toolchain file, a directory override, or a
 /// missing toolchain. The caller then keeps the proxy, so behavior is unchanged.
-pub fn rustup_direct(program: &str, args: &[String], cwd: Option<&Path>) -> Option<RustupTarget> {
+pub fn rustup_direct(
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    envs: &[(String, String)],
+) -> Option<RustupTarget> {
+    // `RUSTUP_TOOLCHAIN=nightly cargo build`: the proxy honours the variable, the real binary does not.
+    if envs
+        .iter()
+        .any(|(k, _)| ["RUSTUP_TOOLCHAIN", "RUSTUP_HOME", "CARGO_HOME"].iter().any(|n| k.eq_ignore_ascii_case(n)))
+    {
+        return None;
+    }
     let tool = rustup_tool(program)?;
     if args.first().is_some_and(|a| a.starts_with('+')) {
         return None;
@@ -1048,6 +1060,23 @@ default_toolchain = "stable-x86_64-pc-windows-msvc"
             set(logic);
             assert!(generic_shim(&shim).is_none(), "{logic}");
         }
+    }
+
+    #[test]
+    fn the_rustup_shortcut_yields_to_a_toolchain_env_prefix() {
+        // `RUSTUP_TOOLCHAIN=nightly cargo build` must reach the proxy, which honours the variable;
+        // the shortcut would have run the default toolchain's cargo.
+        let none: &[(String, String)] = &[];
+        if rustup_direct("cargo", &[], None, none).is_none() {
+            println!("skip: no rustup default toolchain resolves here");
+            return;
+        }
+        for name in ["RUSTUP_TOOLCHAIN", "rustup_home", "Cargo_Home"] {
+            let envs = [(name.to_string(), "x".to_string())];
+            assert!(rustup_direct("cargo", &[], None, &envs).is_none(), "{name}");
+        }
+        let unrelated = [("RUST_LOG".to_string(), "debug".to_string())];
+        assert!(rustup_direct("cargo", &[], None, &unrelated).is_some());
     }
 
     #[test]

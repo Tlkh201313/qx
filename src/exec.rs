@@ -411,12 +411,23 @@ pub fn build_command_at(
     args: &[String],
     cwd: Option<&std::path::Path>,
 ) -> Result<Command, String> {
+    build_command_env(program, args, cwd, &[])
+}
+
+/// `build_command_at` for a call that will also get `envs` (`NAME=value` prefixes): a toolchain
+/// variable among them must reach rustup's proxy, so the direct-toolchain shortcut stands aside.
+pub fn build_command_env(
+    program: &str,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+    envs: &[(String, String)],
+) -> Result<Command, String> {
     // A cmdlet is not a CreateProcess target; a `.ps1` is handled by `Target::Ps1`.
     if verb_noun(program) {
         return powershell_call(program, args);
     }
     let npmish = npmish(program);
-    if let Some(r) = resolve::rustup_direct(program, args, cwd) {
+    if let Some(r) = resolve::rustup_direct(program, args, cwd, envs) {
         let mut c = Command::new(r.exe);
         c.args(args);
         prepare(&mut c);

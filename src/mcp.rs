@@ -785,7 +785,7 @@ fn run_direct(
     if let Some(b) = builtin::try_exec(program, args, cwd, envs) {
         return Ok((b.into(), "builtin"));
     }
-    let mut cmd = exec::build_command_at(program, args, cwd)?;
+    let mut cmd = exec::build_command_env(program, args, cwd, envs)?;
     exec::apply_envs(&mut cmd, envs);
     if let Some(d) = cwd {
         cmd.current_dir(d);
