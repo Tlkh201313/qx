@@ -61,7 +61,7 @@ pub fn edit_codex(text: Option<&str>, exe: &Path, a: Action) -> Edit {
             Action::Install => Edit::Changed(render(exe, &[], "\n")),
         };
     };
-    if refuses(text) {
+    if refuses(text, a) {
         return Edit::Refuse(refusal(exe));
     }
     let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
@@ -220,7 +220,7 @@ fn strip_comment(line: &str) -> &str {
 }
 
 /// Inline tables and dotted keys hide the entry inside one line: refuse, never guess.
-fn refuses(text: &str) -> bool {
+fn refuses(text: &str, action: Action) -> bool {
     let mut in_mcp_servers = false;
     let mut in_qx_table = false;
     for line in text.lines() {
@@ -234,7 +234,8 @@ fn refuses(text: &str) -> bool {
         let squashed: String = t.chars().filter(|c| !c.is_whitespace()).collect();
         // An env written inline (`env = { .. }`) or dotted (`env.K = ..`) in the qx table would be
         // regenerated away with the table.
-        if in_qx_table && (squashed.starts_with("env=") || squashed.starts_with("env.")) {
+        // Removing the whole table drops nothing the user did not ask to drop.
+        if action == Action::Install && in_qx_table && (squashed.starts_with("env=") || squashed.starts_with("env.")) {
             return true;
         }
         if squashed.starts_with("mcp_servers={") || squashed.starts_with("mcp_servers.qx") {
@@ -389,6 +390,15 @@ model = \"y\"
             Edit::Changed(out) => assert!(out.contains("QX_GUARD"), "the user's env was dropped:\n{out}"),
             Edit::Unchanged => {}
         }
+    }
+
+    #[test]
+    fn codex_remove_works_when_install_would_refuse_an_inline_env() {
+        let src = "[mcp_servers.qx]\ncommand = 'x'\nenv = { QX_GUARD = \"strict\" }\n\n[profiles.fast]\nmodel = \"y\"\n";
+        assert!(matches!(edit_codex(Some(src), Path::new(EXE), Action::Install), Edit::Refuse(_)));
+        let out = changed(edit_codex(Some(src), Path::new(EXE), Action::Remove));
+        assert!(!out.contains("mcp_servers.qx"), "{out}");
+        assert!(out.contains("[profiles.fast]\nmodel = \"y\""), "{out}");
     }
 
     #[test]

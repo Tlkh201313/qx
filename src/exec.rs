@@ -572,11 +572,21 @@ fn cmd_c_line(exe: &Path, args: &[String]) -> Option<String> {
         many => many
             .iter()
             .enumerate()
-            .map(|(n, a)| if n == 0 { a.clone() } else { cmd_quote(a) })
+            .map(|(n, a)| if n == 0 { a.clone() } else { quote_for_cmd_line(a) })
             .collect::<Vec<_>>()
             .join(" "),
     };
     Some(format!("/d /s {mode} \"{text}\""))
+}
+
+/// `cmd_quote` for a word of a `cmd /c` line the caller wrote: quote what needs it, but leave `%VAR%`
+/// alone, since cmd expands it there (the single-argument form already does).
+fn quote_for_cmd_line(s: &str) -> String {
+    if s.is_empty() || s.chars().any(|c| c.is_whitespace() || "&|<>^()\"".contains(c)) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
 }
 
 /// The message for a program that could not be resolved. A built-in that declined its
@@ -1703,6 +1713,16 @@ mod tests {
         let t = std::time::Instant::now();
         assert_eq!(run_stream(&mut c, Some(Duration::from_secs(1))).unwrap(), 124);
         assert!(t.elapsed() < Duration::from_secs(8));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_c_with_separate_arguments_still_expands_variables() {
+        let args = ["/c".to_string(), "echo".to_string(), "%QX_C_ARG%".to_string()];
+        let mut c = build_command("cmd", &args).unwrap();
+        c.env("QX_C_ARG", "expanded");
+        let o = run_captured(c, Some(Duration::from_secs(20))).unwrap();
+        assert_eq!(o.stdout.trim(), "expanded", "stderr: {}", o.stderr);
     }
 
     #[test]

@@ -129,15 +129,16 @@ pub fn redact(input: &str) -> (String, usize) {
     (out, count)
 }
 
-/// Whether a PEM `BEGIN` line without an `END` opens a multi-line key: the header stands on its
-/// own line, or the next line is key material (base64 or a `Proc-Type:` header).
+/// Whether a PEM `BEGIN` line without an `END` opens a multi-line key: the header ends its line
+/// (whatever a dump put before it: `cat -n` numbers, `grep -n` paths, log timestamps), or the next
+/// line carries key material (base64 or a `Proc-Type:` header) after any such prefix.
 fn starts_block(line: &str, next: Option<&str>) -> bool {
-    let t = line.trim();
-    (t.starts_with("-----BEGIN") && t.ends_with("-----"))
+    let base64 = |s: &str| s.len() >= 16 && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='));
+    line.trim_end().ends_with("-----")
         || next.is_some_and(|n| {
             let n = n.trim();
-            n.starts_with("Proc-Type:")
-                || (n.len() >= 16 && n.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')))
+            let last = n.rsplit(|c: char| c.is_whitespace() || c == ':').next().unwrap_or("");
+            n.starts_with("Proc-Type:") || base64(n) || base64(last)
         })
 }
 
@@ -261,7 +262,10 @@ fn mask_key_values(line: &str) -> (Cow<'_, str>, usize) {
             }
             word = (start, j);
         }
-        if j - start >= 4 && !is_code_or_prose(b, key_at, sep, start > p + 1, &b[start..j], &b[j..]) {
+        // The classifier looks at the start of the value only: scanning all of a long run again for
+        // every separator inside it is what made a hostile line quadratic.
+        let judged = &b[start..j.min(start + 256)];
+        if j - start >= 4 && !is_code_or_prose(b, key_at, sep, start > p + 1, judged, &b[j..]) {
             ranges.push((start, j));
             skip_until = j;
         }
@@ -661,6 +665,36 @@ mod tests {
         }
         // no password: nothing to mask
         assert_eq!(redact("ssh://git@github.com:22/org/repo").1, 0);
+    }
+
+    #[test]
+    fn a_private_key_dumped_with_a_per_line_prefix_is_still_hidden() {
+        // `cat -n`, `grep -n` / `rg -n` and `docker logs -t` all put something before every line.
+        let body = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun";
+        for (begin, mid, end) in [
+            ("     1\t-----BEGIN RSA PRIVATE KEY-----", format!("     2\t{body}"), "     3\t-----END RSA PRIVATE KEY-----"),
+            ("k.pem:1:-----BEGIN RSA PRIVATE KEY-----", format!("k.pem:2:{body}"), "k.pem:3:-----END RSA PRIVATE KEY-----"),
+            (
+                "2026-10-21T22:00:00.1Z -----BEGIN PRIVATE KEY-----",
+                format!("2026-10-21T22:00:01.2Z {body}"),
+                "2026-10-21T22:00:02.3Z -----END PRIVATE KEY-----",
+            ),
+        ] {
+            let input = format!("{begin}\n{mid}\n{end}\nafter\n");
+            let (s, n) = redact(&input);
+            assert!(
+                n >= 1 && !s.contains(body) && !s.contains("-----END") && s.contains("after"),
+                "{input:?} -> {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn values_classed_as_code_do_not_make_the_scan_quadratic() {
+        // Each `token:<` is judged "code", so none is masked and none skips the rest of the run.
+        let t = std::time::Instant::now();
+        let _ = redact(&format!("x {}", "token:<".repeat(40_000)));
+        assert!(t.elapsed().as_secs() < 1, "quadratic scan: {:?}", t.elapsed());
     }
 
     #[test]

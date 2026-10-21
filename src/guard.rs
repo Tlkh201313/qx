@@ -83,8 +83,26 @@ pub fn check_shell(command: &str, cwd: Option<&Path>) -> Decision {
 /// refuses: each level recurses, and a hostile line must not be able to overflow the server's stack.
 const MAX_DEPTH: usize = 24;
 
+/// How many line readings one top-level check may spend. Each level is judged under up to three
+/// readings and recurses into its `$(..)` and `-c` payloads, so without a shared budget the work
+/// doubles per nesting level even though the depth stays under `MAX_DEPTH`.
+const MAX_WORK: usize = 2_000;
+
 thread_local! {
     static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_WORK) };
+}
+
+/// Pay for one reading of a line; false once the top-level check has used its budget.
+fn spend() -> bool {
+    BUDGET.with(|b| {
+        if b.get() == 0 {
+            false
+        } else {
+            b.set(b.get() - 1);
+            true
+        }
+    })
 }
 
 /// One level of recursion; `None` when the limit is reached.
@@ -96,6 +114,9 @@ impl Depth {
             if d.get() >= MAX_DEPTH {
                 None
             } else {
+                if d.get() == 0 {
+                    BUDGET.with(|b| b.set(MAX_WORK)); // a new top-level check
+                }
                 d.set(d.get() + 1);
                 Some(Depth)
             }
@@ -442,7 +463,8 @@ pub fn check_shell_mode(m: Mode, command: &str, cwd: Option<&Path>) -> Decision 
     let mut d = judge_line(m, command, cwd, true);
     // cmd.exe has no single quotes: `echo it's & rd /s /q C:\Windows` runs both commands, while a
     // POSIX or PowerShell parse sees one quoted string. Judge the line both ways; deny wins.
-    if command.contains('\'') {
+    // The same reading takes `&>` for a command separator (`echo a &>nul rd ...` runs both).
+    if command.contains('\'') || command.contains("&>") {
         merge(&mut d, judge_line(m, command, cwd, false));
     }
     // ... and the escapes cmd (`r^d`, a trailing `^`) and PowerShell (`` Remo`ve ``, a trailing
@@ -496,6 +518,10 @@ fn strip_escapes(s: &str) -> String {
 /// One pass over a command line with a fixed idea of whether `'` quotes.
 fn judge_line(m: Mode, command: &str, cwd: Option<&Path>, sq: bool) -> Decision {
     let mut d = Decision::allow();
+    if !spend() {
+        d.deny("too complex to judge safely");
+        return d;
+    }
     let cur = if cwd.is_none() { std::env::current_dir().ok() } else { None };
     let cwd = cwd.or(cur.as_deref());
 
@@ -509,21 +535,34 @@ fn judge_line(m: Mode, command: &str, cwd: Option<&Path>, sq: bool) -> Decision 
 
     let mut segments: Vec<(Vec<String>, bool)> = Vec::new();
     for (s, piped) in split_segments(command, sq) {
-        // `try { A } catch { B }`: braces end a command wherever a block starts or stops.
-        for mut w in split_blocks(tokenize_with(&s, sq)) {
+        // `try { A } catch { B }`, `if x (A) else (B)`: braces, and the parentheses of a cmd body,
+        // end a command wherever a block starts or stops.
+        let mut tokens = tokenize_with(&s, sq);
+        if paren_aware(&tokens) {
+            tokens = split_parens(tokens);
+        }
+        for mut w in split_blocks(tokens) {
             let n = w.iter().take_while(|t| is_assignment(t)).count();
             if w.iter().take(n + 1).any(|t| qx_switch(t)) {
                 d.deny("attempt to disable a qx safeguard");
             }
             w.drain(..n); // `FOO=1 git push -f` is judged as `git push -f`
-            if let Some(first) = w.first_mut() {
-                // cmd's `@rd` is `rd`; `@args` splatting is never a command word.
-                if first.len() > 1 && first.starts_with('@') && !first.starts_with("@(") {
-                    first.remove(0);
+            // Redirections, control words and cmd's `@`/`(` in front of the command are not the
+            // command: `>nul rd ..`, `then rd ..`, `do @rd ..`, `(rd ..)`. Peel until nothing changes.
+            loop {
+                let before = (w.len(), w.first().cloned());
+                strip_leading_redirects(&mut w);
+                strip_control(&mut w);
+                strip_sigils(&mut w);
+                if (w.len(), w.first().cloned()) == before {
+                    break;
                 }
             }
-            // `then rm -rf x`, `try {`, `if exist X`, `for %i in (..) do`: the header is not the command.
-            strip_control(&mut w);
+            if let Some(last) = w.last_mut() {
+                if last.len() > 1 && last.ends_with(')') && !last.contains('(') {
+                    last.pop(); // `(rd /s /q C:\x)`
+                }
+            }
             if !w.is_empty() {
                 segments.push((w, piped));
             }
@@ -604,11 +643,12 @@ fn split_blocks(words: Vec<String>) -> Vec<Vec<String>> {
             body = &body[..body.len() - 1];
         }
         let cut = |p: &mut Vec<Vec<String>>| p.push(Vec::new());
-        if open || t == "{" {
+        let (opens, closes) = (matches!(t.as_str(), "{" | "("), matches!(t.as_str(), "}" | ")"));
+        if open || opens {
             cut(&mut pieces);
         }
-        if t == "{" || t == "}" {
-            if t == "}" {
+        if opens || closes {
+            if closes {
                 cut(&mut pieces);
             }
             continue;
@@ -620,6 +660,60 @@ fn split_blocks(words: Vec<String>) -> Vec<Vec<String>> {
     }
     pieces.retain(|p| !p.is_empty());
     pieces
+}
+
+/// Whether a segment's parentheses are cmd/PowerShell grouping rather than an argument's own: it starts
+/// with `(`, `if`, `for`, `else` or `)`. Only then are attached parentheses split off the words.
+fn paren_aware(tokens: &[String]) -> bool {
+    tokens.first().is_some_and(|f| {
+        let f = f.to_ascii_lowercase();
+        f.starts_with('(') || matches!(f.trim_start_matches('@'), "if" | "for" | "else" | ")")
+    })
+}
+
+/// `(rd`, `C:\x)`, `(echo` -> `(` `rd`, `C:\x` `)`, `(` `echo`; a `$(..)` substitution stays whole.
+fn split_parens(tokens: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(tokens.len());
+    for t in tokens {
+        if t.contains("$(") || t.contains("<(") || t.contains(">(") {
+            out.push(t);
+            continue;
+        }
+        let core = t.trim_start_matches('(');
+        let opens = t.len() - core.len();
+        let core = core.trim_end_matches(')');
+        let closes = t.len() - opens - core.len();
+        out.extend(std::iter::repeat_n("(".to_string(), opens));
+        if !core.is_empty() {
+            out.push(core.to_string());
+        }
+        out.extend(std::iter::repeat_n(")".to_string(), closes));
+    }
+    out
+}
+
+/// Leading redirections (`>nul`, `2>nul`, `< in`, `>> log`) are not the command: `>nul rd /s /q C:\x`
+/// runs `rd`. A bare operator takes the next word as its target; `>nul` and `2>&1` carry theirs.
+fn strip_leading_redirects(w: &mut Vec<String>) {
+    while let Some(first) = w.first() {
+        let op = first.trim_start_matches(|c: char| c.is_ascii_digit());
+        if !(op.starts_with('>') || op.starts_with('<')) {
+            return;
+        }
+        let bare = op.chars().all(|c| c == '>' || c == '<');
+        w.drain(..if bare { 2 } else { 1 }.min(w.len()));
+    }
+}
+
+/// cmd's echo-off `@` and a grouping `(` glued to the command word.
+fn strip_sigils(w: &mut [String]) {
+    while let Some(first) = w.first_mut() {
+        let sigil = first.len() > 1 && ((first.starts_with('@') && !first.starts_with("@(")) || first.starts_with('('));
+        if !sigil {
+            return;
+        }
+        first.remove(0);
+    }
 }
 
 /// Drop the control-flow words in front of the command a segment really runs: `then`, `try`,
@@ -669,6 +763,8 @@ fn header_len(keyword: &str, rest: &[String]) -> usize {
                 "exist" | "defined" | "errorlevel" | "cmdextversion" => i + 2,
                 "==" => i + 3,
                 t if t.contains("==") => i + 1,
+                // `if A equ B cmd`: the six word comparisons
+                _ if matches!(lower(i + 1).as_str(), "equ" | "neq" | "lss" | "leq" | "gtr" | "geq") => i + 3,
                 _ => 0,
             }
         }
@@ -1061,7 +1157,15 @@ fn unwrap_wrapper(name: &str, args: &[String]) -> Option<(String, Vec<String>)> 
         // PowerShell: `Start-Process cmd -ArgumentList '/c','..'` runs `cmd /c ..`.
         "start-process" | "saps" => {
             let (mut prog, mut list) = (None::<String>, Vec::<String>::new());
-            let split = |v: &str| v.split(',').map(|s| s.trim().trim_matches(['\'', '"']).to_string()).collect::<Vec<_>>();
+            // `-ArgumentList '/c','rd ..'` is a comma list; `-ArgumentList "/c rd .."` is one string
+            // the program splits itself.
+            let split = |v: &str| {
+                let parts = v.split(',').map(|s| s.trim().trim_matches(['\'', '"']).to_string()).collect::<Vec<_>>();
+                match parts.as_slice() {
+                    [one] if one.contains(char::is_whitespace) => tokenize(one),
+                    _ => parts,
+                }
+            };
             let mut i = 0;
             while i < args.len() {
                 match args[i].to_ascii_lowercase().as_str() {
@@ -1693,7 +1797,8 @@ fn split_segments(s: &str, sq: bool) -> Vec<(String, bool)> {
                 None
             }
             // `2>&1`, `>&2`, `&>file`: the `&` belongs to a redirection, it does not end the command.
-            '&' if cur.ends_with(['>', '<']) || chars.peek() == Some(&'>') => {
+            // (cmd, `sq == false`, has no `&>`: there `&` ends the command.)
+            '&' if cur.ends_with(['>', '<']) || (sq && chars.peek() == Some(&'>')) => {
                 cur.push(c);
                 None
             }
@@ -2189,6 +2294,63 @@ mod tests {
         }
         assert!(!denied("powershell -NoProfile -Command Get-Date"));
         assert!(!denied("powershell -ExecutionPolicy Bypass Get-Date"));
+    }
+
+    #[test]
+    fn alternate_readings_do_not_multiply_the_work_per_nesting_level() {
+        // Each level is judged under up to three readings and recurses into its `$(..)`: without a
+        // shared work budget that is 2^depth (18 levels took seconds, 24 would take hours).
+        let t = std::time::Instant::now();
+        let nested = "echo $(".repeat(18) + "echo 'a'" + &")".repeat(18);
+        let _ = check_shell_mode(Mode::Safe, &nested, None);
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "took {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn cmd_bodies_in_parentheses_and_comparisons_are_judged() {
+        for bad in [
+            r"if exist a (rd /s /q C:\Windows)",
+            r"if 1 equ 1 rd /s /q C:\Windows",
+            r"if %errorlevel% neq 0 rd /s /q C:\Windows",
+            r"for /d %i in (*) do @rd /s /q C:\Windows",
+            r"if exist a ( rd /s /q C:\Windows ) else ( echo no )",
+            r"if exist a (echo no) else (rd /s /q C:\Windows)",
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        for ok in ["if exist a (echo yes) else (echo no)", "if %errorlevel% neq 0 echo failed", "(cd sub && cargo test)"] {
+            assert!(!denied(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn a_command_behind_a_leading_redirection_is_judged() {
+        for bad in [
+            r"> nul rd /s /q C:\Windows",
+            r">nul rd /s /q C:\Windows",
+            r"2>nul rd /s /q C:\Windows",
+            r"<nul rd /s /q C:\Windows",
+            r"echo a & >nul rd /s /q C:\Windows",
+            r"echo a &>nul rd /s /q C:\Windows",
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        for ok in ["2>&1 cargo test", ">out.txt echo hi", "< in.txt sort"] {
+            assert!(!denied(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn start_process_with_a_single_string_argument_list_is_peeled() {
+        for bad in [
+            r#"Start-Process cmd -ArgumentList "/c rd /s /q C:\Windows""#,
+            r#"Start-Process cmd -ArgumentList '/c rd /s /q C:\Windows'"#,
+            r#"saps cmd "/c rd /s /q C:\Windows""#,
+            r#"Start-Process powershell -ArgumentList "-Command Remove-Item -Recurse -Force C:\Windows""#,
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        assert!(!denied(r#"Start-Process notepad -ArgumentList "notes.txt""#));
     }
 
     #[test]
