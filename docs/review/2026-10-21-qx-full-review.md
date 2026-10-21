@@ -16,12 +16,12 @@ Totals: 91 findings - 8 critical, 44 important, 39 minor. Disposition: Tn = patc
 | text-pipeline-1 | critical | src/redact.rs:7 | KEYS list misses camelCase/no-underscore secret names (SecretAccessKey, secretKey, privateKey, accessKey) | T2 |
 | builtin-resolve-1 | important | src/resolve.rs:186 | Bare names with .cmd/.bat (npm.cmd) never found on PATH | T9 |
 | builtin-resolve-2 | important | src/builtin.rs:1146 | cp -r src/. dst nests instead of merging | T8 |
-| builtin-resolve-3 | important | src/resolve.rs:368 | rustup shortcut ignores RUSTUP_TOOLCHAIN= env prefix | T9 |
+| builtin-resolve-3 | important | src/resolve.rs:368 | rustup shortcut ignores RUSTUP_TOOLCHAIN= env prefix | T9 (rustup env prefix finished in the follow-up commit) |
 | builtin-resolve-4 | important | src/builtin.rs:971 | rm dangerous() checks process cwd not call cwd | T8 |
 | builtin-resolve-5 | important | src/resolve.rs:751 | generic_shim drops quoted script arg / prefers node over exe | T9 |
 | builtin-resolve-6 | important | src/resolve.rs:815 | git_bash() only knows Program Files paths | T9 |
 | exec-2 | important | src/exec.rs:923 | qx's own inheritable stdin/stdout pipe handles leak into every child and surviving daemon | deferred - needs Win32 FFI + integration harness; risk > gain now |
-| exec-3 | important | src/exec.rs:1018 | Output decoding is UTF-8-only; OEM/ANSI code-page output (cmd, ipconfig, tree, dir, where) becomes U+FFFD | T4 |
+| exec-3 | important | src/exec.rs:1018 | Output decoding is UTF-8-only; OEM/ANSI code-page output (cmd, ipconfig, tree, dir, where) becomes U+FFFD | deferred - OEM decoding shares decode() with file reads; needs a separate process-output path |
 | exec-4 | important | src/exec.rs:893 | Timeout/cancel path runs taskkill.exe synchronously, unbounded, before the instant Job terminate | deferred - not unit-testable; Job terminate already follows |
 | exec-5 | important | src/exec.rs:687 | Reader threads outlive the call and keep buffering into the Capture after snapshot() emptied it | T4 |
 | exec-6 | important | src/exec.rs:471 | program:"cmd" with /c uses Rust's \" quoting; only build_shell/cmd_exe uses the raw form the README says is required | T4 |
@@ -97,4 +97,53 @@ Totals: 91 findings - 8 critical, 44 important, 39 minor. Disposition: Tn = patc
 | setup-deploy-doctor-12 | minor | src/setup/jsonc.rs:150 | UTF-8 BOM makes every JSON(C) client config unusable ('not an object'); inserts also mix LF into CRLF files | deferred |
 | text-pipeline-11 | minor | src/compact.rs:95 | Lone-CR progress frames form one huge line and the 4000-char head-only cut drops the final status/error | deferred |
 | text-pipeline-12 | minor | src/digest.rs:122 | keep_stderr compacts stderr but discards the cut flag, so truncated stderr is never spooled | deferred |
+
+## Execution record
+
+Branch `review/patches` (worktree `.worktrees/review`), based on `daffb23`. 14 plan tasks plus Task 9b (rustup env prefix) and one final-review fix pass; every fix started with a test that failed (a compile failure counts only where the function did not exist yet). Final state: `cargo test --release` 292 passed, 0 failed; `cargo clippy --release --all-targets` 0 warnings.
+
+### Final independent review (0 Critical, 7 Important, 10 Minor)
+Reproduced by running a probe build, then fixed test-first in one pass (commit `final review fixes`):
+- I1 guard work multiplied per nesting level - alternate_readings_do_not_multiply_the_work_per_nesting_level RED->GREEN (shared per-check budget of 2000 line readings, exhaustion denies), suite green.
+- I2 quadratic redaction on code-classed values - values_classed_as_code_do_not_make_the_scan_quadratic RED->GREEN (classifier sees the first 256 bytes of a value).
+- I3 prefixed private-key dumps leaked - a_private_key_dumped_with_a_per_line_prefix_is_still_hidden RED->GREEN (block opens when the header ends its line, or the next line's last token is key material).
+- I4 toml remove refused for inline env - codex_remove_works_when_install_would_refuse_an_inline_env RED->GREEN (the inline-env refusal applies to Install only).
+- I5 cmd control-flow - cmd_bodies_in_parentheses_and_comparisons_are_judged RED->GREEN (paren-aware splitting, six word comparisons, leading at-sign and paren peeled).
+- I6 leading redirections - a_command_behind_a_leading_redirection_is_judged RED->GREEN (leading redirects peeled; the cmd reading also runs for lines containing an ampersand-greater-than).
+- I7 Start-Process single-string ArgumentList - start_process_with_a_single_string_argument_list_is_peeled RED->GREEN.
+- M5 (re-graded Important) cmd /c with separate arguments keeps variable expansion - cmd_c_with_separate_arguments_still_expands_variables RED->GREEN.
+
+### Deferred minors from the final review
+- M1 kill alias / positional Stop-Process pid; M2 apostrophe cmd-reading warns on quoted remote commands (strict mode denies); M3 write re-applies CRLF/BOM so removing them needs the native tool, LF-file new_string loses deliberate CRs; M4 write refuses a file with one stray invalid byte; M6 jsonc backward comma scan vs // comment; M7 URL userinfo now spans & (fail-closed false positive); M8 program:'' with command passes the not-both check; M9 bridge keeps old child after EPIPE; M10 echo a ^& rd ... literal ampersand denied.
+
+### Rulings made while executing (decisions taken on the owner's behalf)
+- Ruling: user asked for review -> comments -> patch in one instruction and chose inline execution, so the plan is executed without a separate plan-review pause — cost if wrong: patches land on a branch the user can discard.
+- Ruling: baseline has 1 environmental failure (mcp::tests::a_declined_builtin_reaches_git_coreutils, msys NtCreateDirectoryObject 0xC0000022 in the DSH sandbox); green = no other failures — cost if wrong: a real regression in that test would be masked.
+- Ruling: foreign commit b43ee68 (other actor, 00:45) fixed some setup/mcp findings on this branch mid-review; Tasks 6 and 10-13 re-verify each finding test-first against the new code (a test that already passes = finding already fixed, skipped) and every commit stages explicit paths only (untracked .bench/ .probe/ are not mine) - cost if wrong: a stale finding gets a redundant test.
+- Ruling: another session is actively editing src/exec.rs in the main tree (uncommitted, build broken mid-refactor), so this plan now runs in git worktree .worktrees/review on branch review/patches (from a9ba8e2); main tree and its exec.rs are untouched - cost if wrong: Task 4 (exec.rs) must be rebased onto that session's exec.rs changes.
+- Task 1: Ruling: absolutizing lives in npm::start_dir (all three entry points) instead of main.rs/mcp.rs - one place covers every caller - cost if wrong: none.
+- Task 2: Ruling: URL userinfo keeps , ; | as terminators (only & and the first-@ stop were dropped) because dropping them would mask prose like 'url;mail=a@b' - a password containing , ; or | stays unmasked - cost if wrong: leak of such a password.
+- Task 2: Ruling: PEM block mode opens only for a bare header line or when the next line is base64/Proc-Type; the header line itself is still replaced - cost if wrong: a quoted multi-line key whose next line is not base64 leaks its body.
+- Task 3: Ruling: run_label extracted as a free fn so the label rule is unit-testable; plain args still stop at four, flags never do (cap 400 chars) - cost if wrong: a very flag-heavy command line gets a longer label.
+- Ruling: main-tree session has uncommitted edits in exec.rs, guard.rs, fsops.rs, mcp.rs, main.rs (overlapping Tasks 4-7), so Tasks 8,9,10-14 run first and Tasks 4-7 run last, rebased onto whatever that session has committed by then - cost if wrong: Tasks 4-7 may need conflict resolution or re-verification.
+- Task 8: Ruling: mv left unchanged - 'mv src/. dst' has no useful meaning (cannot move the cwd entry), so only cp -r got the contents form - cost if wrong: none.
+- Task 9: Ruling: builtin-resolve-3 (rustup shortcut vs per-call RUSTUP_TOOLCHAIN= prefix) is moved to the final batch with Tasks 4-7 because the fix must reach the build_command_at call sites in exec.rs/mcp.rs/main.rs that another session is editing - cost if wrong: that finding stays open until then.
+- Task 9: Ruling: runnable_bare accepts only .cmd/.bat (plus exe/com) when PATHEXT lists them, not every PATHEXT extension, so .js/.vbs/.msc names do not newly resolve to a Direct target that CreateProcess cannot start - cost if wrong: a name that already carries .ps1 stays unresolved.
+- Task 10: Ruling: remove_member treats an absent or non-object parent as nothing-to-remove (Ok unchanged); a malformed document is still an error - cost if wrong: a config whose parent has an unexpected type is reported unchanged instead of refused.
+- Ruling: mcp::tests::eof_cancels_running_and_queued_calls_promptly joins the known environmental flakes - it needs a live 'ping -n' child and this sandbox prints 'PING: transmit failed. General failure.', so the call can end before the test sees it in INFLIGHT; it passed alone 2 of 3 runs and none of my changes touch that path - cost if wrong: a real EOF-cancel regression would be waved through as a flake.
+- Task 11: Ruling: an inline or dotted env in the qx table is refused with the paste snippet (R13) instead of being parsed and kept - parsing TOML inline tables by hand is the riskier edit - cost if wrong: such users must paste the snippet themselves.
+- Task 12: Ruling: only the doctor false positive from setup-deploy-doctor-11 (doubled quotes in yaml_scalar) is fixed; scanning projects.*.mcpServers.qx for overriding entries and the README tool_search claim stay deferred - larger design and doc questions - cost if wrong: doctor can still miss an overriding per-project entry.
+- Task 13: Ruling: no request timeout was added to the bridge (setup-deploy-doctor-10 suggested one) - the signal-based cancel already exists and a timeout would need a pi-side policy - cost if wrong: a hung qx child blocks a call until pi aborts it.
+- Ruling: the other session committed daffb23 (route every line to the shell that can parse it; touches exec.rs guard.rs fsops.rs main.rs mcp.rs README) on review/full-codebase, so review/patches was rebased onto it cleanly (commit ids in Tasks 1-13 above are pre-rebase) and Tasks 4-7 plus the rustup item now re-verify against that code - cost if wrong: a finding that daffb23 already fixed shows up as a test that passes immediately and is skipped.
+- Task 4: Ruling: exec-3 (OEM-codepage output decoding) is deferred - decode()/decode_owned() are shared with file reads, so an OEM fallback would garble Latin-1 files; it needs a separate process-output path - cost if wrong: cmd built-ins such as 'tree' still print U+FFFD on OEM consoles.
+- Task 4: Ruling: exec-2/exec-4/exec-7 (inheritable pipe handles, taskkill ordering, concurrent spawn handle leaks) stay deferred - Win32 FFI that no unit test can pin deterministically - cost if wrong: a daemon can still pin the stdio pipes until it exits.
+- Task 5: Ruling: cmd-vs-sh quoting is judged both ways whenever the line has an apostrophe (deny wins) instead of asking which shell will run it - the guard runs before the shell is chosen - cost if wrong: a line that is dangerous only under cmd's reading of an apostrophe is denied even when bash runs it.
+- Task 5: Ruling: guard-6 beyond home-variable spellings (a delete target that is still an unresolved variable after expansion) and guard-12 (README says SQL UPDATE without WHERE is denied, code warns) stay deferred - the first would turn many legitimate temp-dir cleanups into warnings and needs a policy call, the second is a doc/behavior decision - cost if wrong: a delete whose target comes from an assigned variable on the same line still passes.
+- Task 5: Ruling: a titled start command cannot tell the title from the program once the tokenizer drops quotes, so it is judged as program 'title' - cost if wrong: that one spelling still hides its payload.
+- Task 6: Ruling: the cancelled-before-start check also fires when SHUTDOWN is set, which is the intended 'no command may start after the client left' rule; five existing tests that call tools now hold server_lock() so a neighbouring EOF test cannot cancel them - cost if wrong: none in production, tests serialize slightly more.
+- Task 6: Ruling: program together with a non-empty command is now an error (the command used to be silently ignored); an empty command string next to a program is still fine - cost if wrong: a client that always sends both non-empty fields now gets an error naming the problem.
+- Task 7: Ruling: write over a file that is not valid UTF-8 is refused with FS_ENCODING (fallback to the native write tool) rather than converted - the model only saw a lossy view - cost if wrong: such files need the native tool to be rewritten whole.
+- Task 7: Ruling: the minor fsops findings (parent dirs created before the .git check, brace include for grep, silent skipped dirs, reserved names, metadata loss, grep on UTF-16, empty-dir list text) stay deferred - none loses data in the common case.
+- Final: Ruling: M5 (cmd /c with several args turns %VAR% into %^VAR%) re-graded Minor -> Important by effect (output silently changes for echo %USERNAME%) and enters the fix pass - cost if wrong: one extra small fix.
+- Final: Ruling: the guard work budget (2000 line readings per top-level check) makes an absurdly complex but harmless line a deny - cost if wrong: a generated script with thousands of command substitutions in one call is refused with 'too complex to judge safely'.
 
