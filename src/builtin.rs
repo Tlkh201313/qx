@@ -56,6 +56,7 @@ pub fn try_exec(program: &str, args: &[String], cwd: Option<&Path>, envs: &[(Str
         "tail" => cmd_head(args, cwd, true),
         "wc" => cmd_wc(args, cwd),
         "grep" => cmd_grep(args, cwd),
+        "sed" => cmd_sed(args, cwd),
         "mkdir" => cmd_mkdir(args, cwd),
         "rm" | "del" | "erase" => cmd_rm(args, cwd),
         "cp" | "copy" => cmd_cp(args, cwd),
@@ -80,14 +81,14 @@ pub fn try_exec(program: &str, args: &[String], cwd: Option<&Path>, envs: &[(Str
 pub const NAMES: &[&str] = &[
     "pwd", "echo", "true", "false", "ls", "dir", "cat", "type", "head", "tail", "wc", "mkdir", "rm",
     "del", "erase", "cp", "copy", "mv", "move", "touch", "which", "basename", "dirname", "realpath",
-    "whoami", "hostname", "seq", "sleep", "clear", "cls", "grep",
+    "whoami", "hostname", "seq", "sleep", "clear", "cls", "grep", "sed",
 ];
 
 /// Names that take file paths. A `/x` argument is a cmd.exe switch (`dir /b`) or an MSYS path
 /// (`/tmp/x`); neither is a Windows path, so the real tool gets it.
 const PATHY: &[&str] = &[
     "ls", "dir", "cat", "type", "head", "tail", "wc", "mkdir", "rm", "del", "erase", "cp", "copy", "mv", "move",
-    "touch", "realpath",
+    "touch", "realpath", "sed",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -1280,6 +1281,86 @@ fn count_file(path: &Path) -> std::io::Result<(usize, usize, usize)> {
     Ok((lines, words, bytes))
 }
 
+/// `sed -n 'A,Bp'` (and `-n Ap`) prints one line range. Every other script, flag, `$`
+/// address or multi-address form returns `None`: a wrong slice costs more than the 60 ms
+/// process it saves, and agents read files with exactly this shape.
+fn cmd_sed(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
+    let mut quiet = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-n" | "--quiet" | "--silent" => quiet = true,
+            "--" => {
+                i += 1;
+                break;
+            }
+            _ if a.starts_with('-') && a.len() > 1 => return None,
+            _ => break,
+        }
+        i += 1;
+    }
+    if !quiet {
+        // `sed '1,5p'` also prints the whole file; that shape is not answered here.
+        return None;
+    }
+    let body = args.get(i)?.trim().strip_suffix('p')?;
+    i += 1;
+    let (from, to) = match body.split_once(',') {
+        Some((a, b)) => (count_arg(a)?, count_arg(b)?),
+        None => {
+            let n = count_arg(body)?;
+            (n, n)
+        }
+    };
+    if from == 0 || to < from {
+        return None;
+    }
+    let mut paths: Vec<&str> = Vec::new();
+    for raw in &args[i..] {
+        if raw == "-" || raw.starts_with('-') || wildcard(raw) {
+            return None;
+        }
+        paths.push(raw.as_str());
+    }
+    if paths.is_empty() {
+        // No file means stdin, which qx never gives a child.
+        return None;
+    }
+    let mut out = String::new();
+    let mut line_no = 0usize;
+    for raw in &paths {
+        let path = path_of(cwd, raw);
+        if !fs::metadata(&path).ok()?.is_file() {
+            return None;
+        }
+        let bytes = fs::read(&path).ok()?;
+        if bytes.len() as u64 > READ_CAP || bytes[..bytes.len().min(8192)].contains(&0) {
+            return None;
+        }
+        let text = crate::exec::decode(&bytes);
+        for line in text.split_inclusive('\n') {
+            line_no += 1;
+            if line_no > to {
+                break;
+            }
+            if line_no < from {
+                continue;
+            }
+            let has_nl = line.ends_with('\n');
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            // qx normalises a CRLF line ending, as head, cat and tail do here.
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            out.push_str(line);
+            if has_nl {
+                // The last line of a file keeps whatever terminator it had.
+                out.push('\n');
+            }
+        }
+    }
+    Some(ok(out))
+}
+
 // ---------------------------------------------------------------- mutation
 
 fn cmd_mkdir(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
@@ -2168,7 +2249,7 @@ mod tests {
         ];
         for case in taken {
             let mine = run("grep", &case, &d).expect("built-in declined a shape it claims");
-            let Some((code, theirs, why)) = real_grep_run(grep, &case, &d) else {
+            let Some((code, theirs, why)) = real_tool_run(grep, &case, &d) else {
                 let _ = fs::remove_dir_all(&d);
                 return;
             };
@@ -2194,7 +2275,7 @@ mod tests {
         ];
         for case in ordered {
             let mine = run("grep", &case, &d).expect("built-in declined a context shape it claims");
-            let Some((code, theirs, why)) = real_grep_run(grep, &case, &d) else {
+            let Some((code, theirs, why)) = real_tool_run(grep, &case, &d) else {
                 let _ = fs::remove_dir_all(&d);
                 return;
             };
@@ -2217,6 +2298,56 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    #[test]
+    fn sed_prints_the_range_the_real_tool_prints() {
+        let Some(sed) = real_sed() else {
+            eprintln!("skipped: no real sed");
+            return;
+        };
+        let d = scratch("sed");
+        fs::write(d.join("five.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        fs::write(d.join("crlf.txt"), "a\r\nb\r\nc\r\n").unwrap();
+        fs::write(d.join("nonl.txt"), "x").unwrap();
+        fs::write(d.join("big.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+        let taken: Vec<Vec<&str>> = vec![
+            vec!["-n", "2,4p", "five.txt"],
+            vec!["-n", "3p", "five.txt"],
+            vec!["-n", "1,99p", "five.txt"],
+            vec!["-n", "5,6p", "five.txt"],
+            vec!["-n", "1,1p", "five.txt"],
+            vec!["-n", "1,2p", "five.txt", "big.txt"],
+            vec!["-n", "2,3p", "crlf.txt"],
+            vec!["-n", "1p", "nonl.txt"],
+            vec!["-n", "9,10p", "big.txt"],
+        ];
+        for case in taken {
+            let mine = run("sed", &case, &d).expect("built-in declined a range it claims");
+            let (code, theirs, why) = real_tool_run(sed, &case, &d).expect("sed unavailable");
+            assert_eq!(mine.stdout, theirs, "stdout differs for {case:?} (sed said {why:?})");
+            assert_eq!(mine.code, code, "exit differs for {case:?} (sed said {why:?})");
+        }
+        // Shapes a line-range reader must never guess at.
+        let declined: Vec<Vec<&str>> = vec![
+            vec!["1,2p", "five.txt"],
+            vec!["-n", "$p", "five.txt"],
+            vec!["-n", "1,2d", "five.txt"],
+            vec!["-E", "-n", "1p", "five.txt"],
+            vec!["-n", "1p"],
+            vec!["-n", "0,2p", "five.txt"],
+            vec!["-n", "3,1p", "five.txt"],
+            vec!["-n", "1,2p", "*.txt"],
+            vec!["-n", "1,2p", "missing.txt"],
+            vec!["-n", "1,2p", "."],
+            vec!["-n", "1,2p", "-"],
+            vec!["-n", "1,2p", "-i"],
+            vec!["-n", "1~2p", "five.txt"],
+        ];
+        for case in declined {
+            assert!(run("sed", &case, &d).is_none(), "built-in took {case:?}");
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
     fn real_grep() -> Option<&'static str> {
         [
             r"C:\Program Files\Git\usr\bin\grep.exe",
@@ -2226,17 +2357,26 @@ mod tests {
         .find(|p| Path::new(p).exists())
     }
 
+    fn real_sed() -> Option<&'static str> {
+        [
+            r"C:\Program Files\Git\usr\bin\sed.exe",
+            r"C:\Program Files\Git\bin\sed.exe",
+        ]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+    }
+
     /// Git's grep is an msys binary, and under four real-time scanners it sometimes fails to
     /// start at all (`NtCreateDirectoryObject ... 0xC0000022`). Retry with a short backoff,
     /// then report the oracle as unavailable rather than blaming the built-in for it.
-    fn real_grep_run(grep: &str, args: &[&str], cwd: &Path) -> Option<(i32, String, String)> {
+    fn real_tool_run(exe: &str, args: &[&str], cwd: &Path) -> Option<(i32, String, String)> {
         let mut last = (0, String::new(), String::new());
         for attempt in 0..3 {
-            let out = std::process::Command::new(grep)
+            let out = std::process::Command::new(exe)
                 .args(args)
                 .current_dir(cwd)
                 .output()
-                .expect("real grep");
+                .expect("real tool");
             let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
             let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
             let flake = stdout.is_empty()
@@ -2249,7 +2389,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1) as u64));
         }
-        eprintln!("skipped: Git grep could not start here ({})", last.2.trim());
+        eprintln!("skipped: the real tool could not start here ({})", last.2.trim());
         None
     }
 }
