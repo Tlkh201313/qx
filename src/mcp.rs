@@ -501,6 +501,27 @@ fn fs_schema() -> Value {
     schema
 }
 
+/// The command line the digest classifies. Plain words stop after four args (long paths and
+/// test names would only confuse the classifier), but every `-flag` counts: `-- --nocapture`
+/// and `-s` ask for the output itself.
+fn run_label(program: Option<&str>, args: &[String], cmdline: Option<&str>) -> String {
+    let Some(p) = program else {
+        return cmdline.unwrap_or("").to_string();
+    };
+    let mut l = p.to_string();
+    for (i, a) in args.iter().enumerate() {
+        if !(a.starts_with('-') || (i < 4 && l.len() <= 80)) {
+            continue;
+        }
+        if l.len() >= 400 {
+            break;
+        }
+        l.push(' ');
+        l.push_str(a);
+    }
+    l
+}
+
 fn call_tool(req: &Value, id: Option<Value>) -> Value {
     let params = req.get("params").cloned().unwrap_or(Value::Null);
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -546,19 +567,7 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
         .unwrap_or(120_000)
         .clamp(1_000, 3_600_000);
     let full = args.get("mode").and_then(|v| v.as_str()) == Some("full");
-    let label = if let Some(p) = program {
-        let mut l = p.to_string();
-        for a in list.iter().take(4) {
-            if l.len() > 80 {
-                break;
-            }
-            l.push(' ');
-            l.push_str(a);
-        }
-        l
-    } else {
-        cmdline.unwrap_or("").to_string()
-    };
+    let label = run_label(program, &list, cmdline);
 
     let guard_cmd = match program {
         Some(p) => std::iter::once(p).chain(list.iter().map(String::as_str)).collect::<Vec<_>>().join(" "),
@@ -969,6 +978,18 @@ mod tests {
             drop(guard);
             assert!(hit, "cancel {i} was lost between the two lists");
         }
+    }
+
+    #[test]
+    fn the_digest_label_keeps_trailing_flags() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let l = run_label(Some("cargo"), &s(&["test", "--workspace", "--all-features", "--", "--nocapture"]), None);
+        assert!(l.ends_with("--nocapture"), "{l}");
+        // the same label makes the digest hand back a passing run's own output
+        assert!(digest::digest(&l, "running 1 test\nhello\ntest a ... ok\ntest result: ok. 1 passed\n", "", 0).is_none());
+        let paths: Vec<String> = (0..50).map(|i| format!("path{i}/file.rs")).collect();
+        assert!(run_label(Some("rg"), &paths, None).len() < 100);
+        assert_eq!(run_label(None, &[], Some("echo hi")), "echo hi");
     }
 
     #[test]

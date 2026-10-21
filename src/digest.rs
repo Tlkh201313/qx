@@ -599,6 +599,7 @@ fn git_status(text: &str) -> Option<(String, usize)> {
             "Changes to be committed:" => Some("staged"),
             "Changes not staged for commit:" => Some("modified"),
             "Untracked files:" => Some("untracked"),
+            "Ignored files:" => Some("ignored"), // `git status --ignored`
             "Unmerged paths:" => Some("conflicted"),
             _ => None,
         };
@@ -633,7 +634,7 @@ fn git_status(text: &str) -> Option<(String, usize)> {
             continue;
         }
         if let Some(i) = cur {
-            if sections[i].0 == "untracked" {
+            if matches!(sections[i].0, "untracked" | "ignored") {
                 sections[i].1.push(t.to_string());
                 continue;
             }
@@ -1045,6 +1046,12 @@ fn split_numbered(line: &str) -> Option<(&str, &str, &str)> {
         if j == start || j >= b.len() || b[j] != b':' {
             continue;
         }
+        // Another colon in the path part means an earlier one was not the separator: the
+        // `12:30:` of a timestamp is not a line number.
+        let drive = matches!(b, [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic());
+        if line[if drive { 2 } else { 0 }..i].contains(':') {
+            continue;
+        }
         let content = &line[j + 1..];
         if content.is_empty() {
             continue;
@@ -1343,6 +1350,24 @@ mod tests {
         // `grep -c` / `-l` / prose are not matches
         assert!(split_match("src/a.rs:12").is_none() && split_match("src/a.rs").is_none());
         assert!(split_match("note: build failed").is_none() && split_match("é:é").is_none());
+    }
+
+    #[test]
+    fn a_timestamp_in_bare_grep_output_is_not_a_line_number() {
+        let (p, n, c) = split_match("a.log:2024-01-01 12:30:45 ERROR x").unwrap();
+        assert_eq!((p, n, c), ("a.log", "", "2024-01-01 12:30:45 ERROR x"));
+        let raw: String = (0..100).map(|i| format!("logs/app.log:2024-01-01 12:{:02}:45 ERROR x\n", i % 60)).collect();
+        let (out, _, _) = grep(&raw).unwrap();
+        assert!(out.contains("logs/app.log (25 of 100)") && !out.contains(".log:2024-01-01 12"), "{out}");
+    }
+
+    #[test]
+    fn git_status_keeps_ignored_files_out_of_untracked() {
+        let raw = "On branch main\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tnew.txt\n\nIgnored files:\n  (use \"git add -f <file>...\" to include in what will be committed)\n\ttarget/\n";
+        let (out, _) = git_status(raw).unwrap();
+        assert!(out.contains("untracked (1):\n  new.txt"), "{out}");
+        assert!(out.contains("ignored (1):\n  target/"), "{out}");
+        assert!(!out.contains("Ignored files:"), "{out}");
     }
 
     #[test]
