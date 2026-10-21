@@ -23,6 +23,14 @@ const KEYS: &[&str] = &[
     "client-secret",
     "private_key",
     "connectionstring",
+    // Joined and hyphenated spellings (`SecretAccessKey`, `privateKey`, `--secret-key`).
+    "secretaccesskey",
+    "secretkey",
+    "secret-key",
+    "privatekey",
+    "private-key",
+    "accesskey",
+    "passphrase",
 ];
 
 const PREFIXES: &[(&str, usize)] = &[
@@ -99,8 +107,9 @@ pub fn redact(input: &str) -> (String, usize) {
             out.push_str("[REDACTED PRIVATE KEY]");
             count += 1;
             // A JSON-encoded key keeps BEGIN and END on one line; a PEM dump
-            // spreads them across lines and must stay suppressed until END.
-            if !has_end {
+            // spreads them across lines and must stay suppressed until END. A header that
+            // is only quoted in source code does not own the lines after it.
+            if !has_end && starts_block(line, lines.peek().copied()) {
                 hidden = Some(0);
             }
             out.push_str(nl);
@@ -120,6 +129,18 @@ pub fn redact(input: &str) -> (String, usize) {
     (out, count)
 }
 
+/// Whether a PEM `BEGIN` line without an `END` opens a multi-line key: the header stands on its
+/// own line, or the next line is key material (base64 or a `Proc-Type:` header).
+fn starts_block(line: &str, next: Option<&str>) -> bool {
+    let t = line.trim();
+    (t.starts_with("-----BEGIN") && t.ends_with("-----"))
+        || next.is_some_and(|n| {
+            let n = n.trim();
+            n.starts_with("Proc-Type:")
+                || (n.len() >= 16 && n.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')))
+        })
+}
+
 /// `postgres://user:password@host` -> `postgres://user:***@host`.
 fn mask_conn_strings(line: &str) -> (Cow<'_, str>, usize) {
     let bytes = line.as_bytes();
@@ -127,22 +148,20 @@ fn mask_conn_strings(line: &str) -> (Cow<'_, str>, usize) {
     let mut search = 0usize;
     while let Some(pos) = line[search..].find("://") {
         let after = search + pos + 3;
-        let mut at = None;
+        let mut at = None; // the LAST `@` of the authority: a password may contain `@` or `&`
         let mut k = after;
         while k < bytes.len() {
             let b = bytes[k];
             if b == b'@' {
                 at = Some(k);
-                break;
-            }
-            // Userinfo ends at the path: `http://localhost:4873/@scope/pkg` has no password.
-            if b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b',' | b';' | b'|' | b'&' | b'/' | b'?' | b'#') {
+            } else if b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b',' | b';' | b'|' | b'/' | b'?' | b'#') {
+                // Userinfo ends at the path: `http://localhost:4873/@scope/pkg` has no password.
                 break;
             }
             k += 1;
         }
         if let Some(a) = at {
-            if let Some(colon) = line[after..a].rfind(':') {
+            if let Some(colon) = line[after..a].find(':') {
                 let start = after + colon + 1;
                 if a > start {
                     ranges.push((start, a));
@@ -171,9 +190,16 @@ fn mask_key_values(line: &str) -> (Cow<'_, str>, usize) {
     let b = line.as_bytes();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let flags = line.contains("--");
+    // Linear time on hostile lines: separators inside an already-masked value belong to it, a
+    // run of spaces is one flag separator, and an unquoted run is scanned once.
+    let mut skip_until = 0usize;
+    let mut word = (0usize, 0usize);
 
     for (p, &sep) in b.iter().enumerate() {
-        let flag = sep == b' ' && flags;
+        if p < skip_until {
+            continue;
+        }
+        let flag = sep == b' ' && flags && !(p > 0 && matches!(b[p - 1], b' ' | b'\t'));
         if sep != b'=' && sep != b':' && !flag {
             continue;
         }
@@ -183,12 +209,15 @@ fn mask_key_values(line: &str) -> (Cow<'_, str>, usize) {
         }
         if e > 0 && matches!(b[e - 1], b'"' | b'\'') {
             e -= 1; // the key's closing quote: `"password": "x"`
+            if e > 0 && b[e - 1] == b'\\' {
+                e -= 1; // ... inside a JSON string: `{\"password\":\"x\"}`
+            }
         }
         let key_at = KEYS.iter().find_map(|k| {
             let kb = k.as_bytes();
             (e >= kb.len()
                 && b[e - kb.len()..e].eq_ignore_ascii_case(kb)
-                && if flag { e >= kb.len() + 2 && &b[e - kb.len() - 2..e - kb.len()] == b"--" } else { key_starts(b, e - kb.len(), e) })
+                && if flag { flag_word_starts(b, e - kb.len()) } else { key_starts(b, e - kb.len(), e) })
             .then_some(e - kb.len())
         });
         let Some(key_at) = key_at else {
@@ -197,6 +226,16 @@ fn mask_key_values(line: &str) -> (Cow<'_, str>, usize) {
         let mut j = p + 1;
         while j < b.len() && matches!(b[j], b' ' | b'\t') {
             j += 1;
+        }
+        if b.get(j) == Some(&b'\\') && b.get(j + 1) == Some(&b'"') {
+            // `{\"password\":\"x\"}`: the value runs to the next escaped quote (or the end: fail closed).
+            let start = j + 2;
+            let end = b[start..].windows(2).position(|w| w == b"\\\"").map_or(b.len(), |i| start + i);
+            if end - start >= 4 {
+                ranges.push((start, end));
+                skip_until = end;
+            }
+            continue;
         }
         if let Some(&q) = b.get(j).filter(|c| matches!(c, b'"' | b'\'')) {
             // A quoted value is one secret, spaces and `;` included; an unclosed quote runs to the end of
@@ -209,19 +248,35 @@ fn mask_key_values(line: &str) -> (Cow<'_, str>, usize) {
             let end = k.min(b.len());
             if end - start >= 4 {
                 ranges.push((start, end));
+                skip_until = end;
             }
             continue;
         }
         let start = j;
-        while j < b.len() && !matches!(b[j], b' ' | b'\t' | b',' | b';' | b'"' | b'\'' | b'\r' | b'\n') {
-            j += 1;
+        if word.0 <= start && start < word.1 {
+            j = word.1; // inside a run an earlier separator already scanned
+        } else {
+            while j < b.len() && !matches!(b[j], b' ' | b'\t' | b',' | b';' | b'"' | b'\'' | b'\r' | b'\n') {
+                j += 1;
+            }
+            word = (start, j);
         }
         if j - start >= 4 && !is_code_or_prose(b, key_at, sep, start > p + 1, &b[start..j], &b[j..]) {
             ranges.push((start, j));
+            skip_until = j;
         }
     }
 
     mask_ranges(line, ranges)
+}
+
+/// `--auth-token x`: the key ends a word that starts with `--` (not `mytoken x` after some flag).
+fn flag_word_starts(b: &[u8], key_at: usize) -> bool {
+    let mut w = key_at;
+    while w > 0 && (b[w - 1].is_ascii_alphanumeric() || matches!(b[w - 1], b'_' | b'-')) {
+        w -= 1;
+    }
+    key_at >= w + 2 && b[w..].starts_with(b"--")
 }
 
 /// An unquoted value that is plainly source or a sentence, not a credential: a path or generic
@@ -551,5 +606,71 @@ mod tests {
         let t = std::time::Instant::now();
         let _ = redact(&long);
         assert!(t.elapsed().as_secs() < 2, "quadratic scan: {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn masks_joined_secret_names() {
+        for (line, secret) in [
+            (r#"{"SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}"#, "wJalrXUtnFEMI"),
+            ("secretKey: 'abcd1234wxyz'", "abcd1234wxyz"),
+            ("privateKey=abcd1234wxyz", "abcd1234wxyz"),
+            ("accessKey=abcd1234wxyz", "abcd1234wxyz"),
+            ("PASSPHRASE=hunter2xyz", "hunter2xyz"),
+        ] {
+            let (s, n) = redact(line);
+            assert!(n >= 1 && !s.contains(secret), "{line} -> {s}");
+        }
+    }
+
+    #[test]
+    fn masks_secrets_inside_escaped_json_strings() {
+        let line = r#"{\"password\":\"hunter2hunter2\",\"user\":\"bob\"}"#;
+        let (s, n) = redact(line);
+        assert!(n >= 1 && !s.contains("hunter2hunter2") && s.contains("bob"), "{s}");
+    }
+
+    #[test]
+    fn masks_flags_whose_name_ends_in_a_secret_word() {
+        for (line, secret) in [
+            ("mytool --auth-token abcd1234wxyz", "abcd1234wxyz"),
+            ("mysql --db-password hunter2xyz --verbose", "hunter2xyz"),
+        ] {
+            let (s, n) = redact(line);
+            assert!(n >= 1 && !s.contains(secret), "{line} -> {s}");
+        }
+        // a word that merely ends in a key name is not a flag
+        assert_eq!(redact("run --x mytoken abcd1234wxyz").1, 0);
+    }
+
+    #[test]
+    fn repeated_keys_and_space_runs_are_linear() {
+        let t = std::time::Instant::now();
+        let _ = redact(&"token=".repeat(40_000));
+        let _ = redact(&format!("--{}x", " ".repeat(100_000)));
+        assert!(t.elapsed().as_secs() < 1, "quadratic scan: {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn masks_url_passwords_that_contain_at_or_ampersand() {
+        for (line, secret) in [
+            ("mongodb://admin:p@ssw0rdSecret@db.example/app", "ssw0rdSecret"),
+            ("postgres://u:pa&ss1234@h/db", "pa&ss1234"),
+        ] {
+            let (s, n) = redact(line);
+            assert!(n >= 1 && !s.contains(secret), "{line} -> {s}");
+        }
+        // no password: nothing to mask
+        assert_eq!(redact("ssh://git@github.com:22/org/repo").1, 0);
+    }
+
+    #[test]
+    fn a_pem_header_in_source_does_not_swallow_the_lines_after_it() {
+        let input = "let hdr = \"-----BEGIN PRIVATE KEY-----\";\nerror[E0308]: mismatched types\n  --> src/a.rs:1:1\n";
+        let (s, _) = redact(input);
+        assert!(s.contains("error[E0308]: mismatched types") && s.contains("--> src/a.rs:1:1"), "{s}");
+        // a real block is still masked whole
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\nafter\n";
+        let (s, n) = redact(pem);
+        assert!(n == 1 && !s.contains("MIIEvQ") && s.contains("after"), "{s}");
     }
 }
