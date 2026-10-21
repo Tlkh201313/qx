@@ -509,7 +509,7 @@ fn fs_schema() -> Value {
 /// The command line the digest classifies. Plain words stop after four args (long paths and
 /// test names would only confuse the classifier), but every `-flag` counts: `-- --nocapture`
 /// and `-s` ask for the output itself.
-fn run_label(program: Option<&str>, args: &[String], cmdline: Option<&str>) -> String {
+pub(crate) fn run_label(program: Option<&str>, args: &[String], cmdline: Option<&str>) -> String {
     let Some(p) = program else {
         return cmdline.unwrap_or("").to_string();
     };
@@ -552,7 +552,10 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
         (Ok(p), Ok(c), Ok(d)) => (p, c, d),
         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return tool_text(id, &e, true),
     };
-    if program.is_some_and(|p| !p.is_empty()) && cmdline.is_some_and(|c| !c.trim().is_empty()) {
+    // An empty `program` or `command` is an absent one.
+    let program = program.filter(|p| !p.trim().is_empty());
+    let cmdline = cmdline.filter(|c| !c.trim().is_empty());
+    if program.is_some() && cmdline.is_some() {
         return tool_text(id, "give `program` + `args`, or `command`, not both", true);
     }
     let shell = args.get("shell").and_then(|v| v.as_str()).unwrap_or("auto");
@@ -572,6 +575,10 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
         }
         Some(_) => return tool_text(id, "`args` must be an array of strings", true),
     };
+    if program.is_none() && !list.is_empty() {
+        // `{"command":"git stash","args":["pop"]}` would otherwise run `git stash`.
+        return tool_text(id, "`args` go with `program`; with `command`, put the arguments in the command line", true);
+    }
     // Absolute from here on: the guard, the built-ins and the child all mean the same directory.
     let cwd = cwd_text.map(|t| std::path::absolute(t).unwrap_or_else(|_| t.into()));
     // A bad cwd must fail loudly: built-ins would otherwise run against the wrong place.
@@ -786,8 +793,28 @@ fn run_direct(
             return exec::run_chain(cmds, Some(timeout)).map(|o| (o, "direct")).map_err(started);
         }
     }
+    // Built-ins run in this thread: the call's deadline lets them stop on time, like a child.
+    struct Deadline;
+    impl Drop for Deadline {
+        fn drop(&mut self) {
+            exec::set_deadline(None);
+        }
+    }
+    let _deadline = Deadline;
+    exec::set_deadline(Some(std::time::Instant::now() + timeout));
+    let stopped = |mut o: exec::Outcome| {
+        o.timed_out = true;
+        o.code = 124;
+        o
+    };
     if let Some(b) = builtin::try_exec(program, args, cwd, envs) {
-        return Ok((b.into(), "builtin"));
+        let o: exec::Outcome = b.into();
+        return Ok((if exec::should_stop() { stopped(o) } else { o }, "builtin"));
+    }
+    // A built-in that declined because it was stopped must not start the real tool instead.
+    if exec::should_stop() {
+        let none = builtin::BuiltinOut { code: 124, stdout: String::new(), stderr: String::new(), elapsed: Duration::ZERO };
+        return Ok((stopped(none.into()), "builtin"));
     }
     let mut cmd = exec::build_command_env(program, args, cwd, envs)?;
     exec::apply_envs(&mut cmd, envs);
@@ -956,6 +983,37 @@ mod tests {
         assert!(r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap().contains("args[1]"));
         let r = call(json!({"program":"echo","args":"a b"}));
         assert_eq!(r.pointer("/result/isError"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn a_builtin_stops_on_timeout_and_on_cancel() {
+        let _server = server_lock();
+        let t = std::time::Instant::now();
+        let r = client::scoped(Client::Dsh, || call_id(80, json!({"program":"sleep","args":["5"],"timeout_ms":1000})));
+        assert!(t.elapsed() < Duration::from_secs(3), "timeout ignored: {:?}", t.elapsed());
+        assert_eq!(r.pointer("/result/structuredContent/timed_out"), Some(&json!(true)), "{r}");
+        let worker = std::thread::spawn(|| {
+            client::scoped(Client::Dsh, || call_id(81, json!({"program":"sleep","args":["5"],"timeout_ms":60000})))
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(respond(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":81}}"#).is_none());
+        let t = std::time::Instant::now();
+        let r = worker.join().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(3), "cancel ignored: {:?}", t.elapsed());
+        assert_eq!(r.pointer("/result/structuredContent/timed_out"), Some(&json!(true)), "{r}");
+    }
+
+    #[test]
+    fn mixed_run_shapes_are_errors_not_other_commands() {
+        let _server = server_lock();
+        // `args` without `program` used to be dropped, running only the command's first words.
+        let r = call(json!({"command":"echo hi","args":["x"]}));
+        assert_eq!(r.pointer("/result/isError"), Some(&json!(true)), "{r}");
+        let text = r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default();
+        assert!(text.contains("args"), "{text}");
+        // An empty `program` beside a `command` is no program at all.
+        let r = call(json!({"program":"","command":"echo hi"}));
+        assert_ne!(r.pointer("/result/isError"), Some(&json!(true)), "{r}");
     }
 
     #[test]

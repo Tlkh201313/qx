@@ -85,6 +85,12 @@ fn dispatch(args: &[String]) -> i32 {
     }
 }
 
+/// Whether output streams live to the terminal: an explicit --stream/--capture decides; otherwise
+/// a terminal streams, unless QX_REDACT=1 asks for redaction, which only captured output can get.
+fn streams(tty: bool, explicit: Option<bool>, redact: Option<&str>) -> bool {
+    explicit.unwrap_or(tty && !matches!(redact, Some("1" | "on")))
+}
+
 fn parse_num(v: Option<&String>, fallback: usize) -> usize {
     v.and_then(|s| s.parse::<usize>().ok()).unwrap_or(fallback)
 }
@@ -93,8 +99,10 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
     let mut o = RunOpts::default();
     // `echo data | qx grep x`: the command reads qx's stdin. At a terminal it already does.
     exec::INHERIT_STDIN.store(!std::io::stdin().is_terminal(), std::sync::atomic::Ordering::Relaxed);
+    let tty = o.stream;
+    let mut explicit_stream: Option<bool> = None;
     if force_raw {
-        o.stream = false;
+        explicit_stream = Some(false);
         o.compact = false;
     }
 
@@ -109,11 +117,11 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
         }
         match a {
             "--stream" => {
-                o.stream = true;
+                explicit_stream = Some(true);
                 i += 1;
             }
             "--capture" => {
-                o.stream = false;
+                explicit_stream = Some(false);
                 i += 1;
             }
             "--raw" | "--full" | "--no-compact" => {
@@ -155,10 +163,10 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
                 i += 1;
             }
             "-c" | "--command" => {
+                // Flags may follow the command line (`qx -c "..." --cwd D`); they still apply.
                 i += 1;
                 shell_cmd = args.get(i).cloned();
                 i += 1;
-                break;
             }
             "-h" | "--help" => {
                 print_help();
@@ -170,6 +178,12 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
             }
             _ => break,
         }
+    }
+
+    o.stream = streams(tty, explicit_stream, std::env::var("QX_REDACT").ok().as_deref());
+    if shell_cmd.is_some() && i < args.len() {
+        eprintln!("qx: unexpected arguments after -c: {} (put them inside the quoted command)", args[i..].join(" "));
+        return 2;
     }
 
     // A bad cwd must fail loudly: built-ins would otherwise run against the wrong place.
@@ -247,14 +261,8 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
             return 2;
         };
         let rest = &args[i + 1..];
-        let mut label = program.clone();
-        for a in rest.iter().take(4) {
-            if label.len() > 80 {
-                break;
-            }
-            label.push(' ');
-            label.push_str(a);
-        }
+        // The same label the MCP server builds: every flag counts (`-- --nocapture` keeps test output).
+        let label = mcp::run_label(Some(program), rest, None);
         if let Some(code) = direct_exec(program, rest, &[], &o, &label) {
             return code;
         }
@@ -663,7 +671,7 @@ FLAGS
 
 SAFETY GATE
   QX_GUARD=safe|strict|off   default safe (deny catastrophic, warn risky)
-  QX_REDACT=on|off           secret redaction (default on for captured output)
+  QX_REDACT=1|off            1: redact at a terminal too (output is captured); off: never
   QX_ALLOW_ROOTS=C:\a;C:\b   extra roots where deletion is normal
   QX_ALLOW_FORCE_PUSH=1      permit git push --force
   QX_AUDIT=1                 log every command, not only warnings/blocks
@@ -694,4 +702,33 @@ EXAMPLES
   qx mcp
 "#
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn flags_after_dash_c_are_honoured_and_strays_refused() {
+        // `--cwd` after `-c` used to be dropped, so the command ran somewhere else.
+        let missing = std::env::temp_dir().join("qx-no-such-dir-for-cli-test");
+        assert_eq!(run_cli(&s(&["--capture", "-c", "exit 3", "--cwd", &missing.to_string_lossy()]), false), 2);
+        assert_eq!(run_cli(&s(&["--capture", "-c", "exit 0", "stray"]), false), 2);
+        assert_eq!(run_cli(&s(&["--capture", "-c", "exit 3"]), false), 3);
+    }
+
+    #[test]
+    fn an_explicit_redact_request_captures_instead_of_streaming() {
+        // At a terminal, QX_REDACT=1 can only be honoured on captured output.
+        assert!(!streams(true, None, Some("1")));
+        assert!(!streams(true, None, Some("on")));
+        assert!(streams(true, None, None));
+        assert!(streams(true, None, Some("off")));
+        assert!(streams(true, Some(true), Some("1")), "an explicit --stream wins");
+        assert!(!streams(false, None, None));
+    }
 }

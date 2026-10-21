@@ -168,8 +168,48 @@ fn cmd_sleep(args: &[String]) -> Option<BuiltinOut> {
     if !(0.0..=10.0).contains(&secs) {
         return None;
     }
-    std::thread::sleep(Duration::from_secs_f64(secs));
-    Some(ok(String::new()))
+    // In slices, so a cancel or the call's timeout ends it like it ends a real `sleep`.
+    let end = std::time::Instant::now() + Duration::from_secs_f64(secs);
+    loop {
+        if crate::exec::should_stop() {
+            return Some(stopped());
+        }
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Some(ok(String::new()));
+        }
+        std::thread::sleep(left.min(Duration::from_millis(50)));
+    }
+}
+
+/// A built-in cut short by a cancel or the call's timeout: exit 124, like a killed child.
+fn stopped() -> BuiltinOut {
+    BuiltinOut {
+        code: 124,
+        stdout: String::new(),
+        stderr: "qx: stopped (cancelled or timed out)\n".to_string(),
+        elapsed: Duration::ZERO,
+    }
+}
+
+/// `remove_dir_all`, one top-level entry at a time so a cancel or timeout stops it between entries.
+/// Each entry still goes through std's own removal, which never follows a link and clears read-only.
+fn remove_tree(path: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        if crate::exec::should_stop() {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stopped (cancelled or timed out)"));
+        }
+        let p = entry?.path();
+        let md = fs::symlink_metadata(&p)?;
+        if md.is_dir() && !md.file_type().is_symlink() {
+            fs::remove_dir_all(&p)?;
+        } else if md.file_type().is_symlink() && fs::metadata(&p).is_ok_and(|m| m.is_dir()) {
+            fs::remove_dir(&p)?; // a directory link: the link only
+        } else {
+            fs::remove_dir_all(&p).or_else(|_| fs::remove_file(&p))?;
+        }
+    }
+    fs::remove_dir(path)
 }
 
 // ---------------------------------------------------------------- listing
@@ -1107,7 +1147,7 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         // A walk that skipped anything (too deep, unreadable, too many files) is not an answer:
         // "no match" from half a tree misleads.
         let complete = crate::fsops::walk_every_file(path, |file| {
-            if files.len() >= MAX_GREP_FILES {
+            if files.len() >= MAX_GREP_FILES || crate::exec::should_stop() {
                 full = true;
                 return false;
             }
@@ -1516,7 +1556,10 @@ fn cmd_rm(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         }
         let res = if path.is_dir() {
             if recursive {
-                fs::remove_dir_all(&path)
+                let link = fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+                // A link to a directory: std removes the link only. A real tree: entry by entry,
+                // so a cancel or timeout can stop it.
+                if link { fs::remove_dir_all(&path) } else { remove_tree(&path) }
             } else {
                 Err(std::io::Error::other(
                     "is a directory (use -r)",
@@ -1526,6 +1569,9 @@ fn cmd_rm(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             fs::remove_file(&path)
         };
         if let Err(e) = res {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                return Some(stopped());
+            }
             err.push_str(&format!("rm: {}: {e}\n", path.display()));
             code = 1;
         }
@@ -1539,6 +1585,9 @@ fn cmd_rm(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
 }
 
 fn copy_rec(src: &Path, dst: &Path, depth: usize) -> std::io::Result<()> {
+    if crate::exec::should_stop() {
+        return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stopped (cancelled or timed out)"));
+    }
     if depth > 64 {
         return Err(std::io::Error::other(
             "directory nesting is too deep (possible junction cycle)",

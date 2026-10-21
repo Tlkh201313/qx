@@ -1052,6 +1052,22 @@ pub fn set_cancel(flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
     CANCEL.with(|c| *c.borrow_mut() = flag);
 }
 
+thread_local! {
+    /// When the running call's `timeout_ms` ends, for work done in-process (built-ins).
+    static DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+pub fn set_deadline(at: Option<Instant>) {
+    DEADLINE.with(|d| d.set(at));
+}
+
+/// The call running on this thread was cancelled or has run out of time: in-process work
+/// (a built-in `rm -r`, `cp -r`, `sleep`, a grep walk) stops at its next step.
+pub fn should_stop() -> bool {
+    CANCEL.with(|c| c.borrow().as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)))
+        || DEADLINE.with(|d| d.get().is_some_and(|t| Instant::now() >= t))
+}
+
 /// `QX_TRACE=1` prints phase timings to stderr: the first thing to ask when a command
 /// feels slow is where its milliseconds went.
 pub fn trace(start: Instant, msg: &str) {
