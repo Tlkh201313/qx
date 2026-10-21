@@ -117,7 +117,27 @@ fn direct_step(f: &Fast, s: &Step) -> Option<Command> {
 /// Everything a script expects from npm, applied the same way to both kinds of command.
 fn decorate(c: &mut Command, f: &Fast, s: &Step) {
     c.current_dir(&f.cwd);
-    c.env("PATH", &f.path);
+    // `command_for` may already have put Git's usr\bin on PATH for a coreutils target; keep it
+    // behind the local bins instead of overwriting it.
+    let own = c
+        .get_envs()
+        .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+        .and_then(|(_, v)| v)
+        .map(|v| std::env::split_paths(v).collect::<Vec<_>>());
+    let path = match own {
+        Some(own) => {
+            let mut dirs = local_bins(&f.cwd);
+            for d in own {
+                let k = d.to_string_lossy().to_ascii_lowercase();
+                if !dirs.iter().any(|x| x.to_string_lossy().to_ascii_lowercase() == k) {
+                    dirs.push(d);
+                }
+            }
+            std::env::join_paths(dirs).unwrap_or_else(|_| f.path.clone())
+        }
+        None => f.path.clone(),
+    };
+    c.env("PATH", path);
     for (k, v) in &f.env {
         c.env(k, v);
     }
@@ -159,12 +179,10 @@ pub fn fast_npx(args: &[String], cwd: Option<&Path>) -> Option<Npx> {
         i += 1;
     }
     let name = args.get(i)?;
-    if name.starts_with('-') || name.contains('@') {
+    if name.starts_with('-') || name.contains('@') || !is_bare_name(name) {
         return None;
     }
-    let start = cwd
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::current_dir().ok())?;
+    let start = start_dir(cwd)?;
     if !start.is_dir() {
         return None;
     }
@@ -179,6 +197,25 @@ pub fn fast_npx(args: &[String], cwd: Option<&Path>) -> Option<Npx> {
         cwd: start.clone(),
         path: bin_path(&start),
     })
+}
+
+/// One plain file name: `Path::join` would let anything else (`C:\x`, `..\x`) leave `.bin`.
+fn is_bare_name(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) && !name.contains(['\\', '/', ':'])
+}
+
+/// The directory scripts run from, made absolute once: a relative `--cwd` would otherwise
+/// leak into PATH, `INIT_CWD` and the child's working directory.
+fn start_dir(cwd: Option<&Path>) -> Option<PathBuf> {
+    let dir = match cwd {
+        Some(c) => c.to_path_buf(),
+        None => std::env::current_dir().ok()?,
+    };
+    std::path::absolute(dir).ok()
 }
 
 fn declared_dependency(start: &Path, bin: &str) -> bool {
@@ -227,9 +264,7 @@ pub fn fast(args: &[String], cwd: Option<&Path>) -> Option<Fast> {
 }
 
 pub fn fast_pnpm(args: &[String], cwd: Option<&Path>) -> Option<Fast> {
-    let start = cwd
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::current_dir().ok())?;
+    let start = start_dir(cwd)?;
     // Without a pinned version pnpm's own resolution decides; keep it.
     let version = pnpm_version(&find_package(&start)?.1)?;
     fast_with(Pm::Pnpm { version }, args, cwd)
@@ -254,9 +289,7 @@ fn fast_with(pm: Pm, args: &[String], cwd: Option<&Path>) -> Option<Fast> {
     }
 
     let (name, extra, kind) = parse(args)?;
-    let start = cwd
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::current_dir().ok())?;
+    let start = start_dir(cwd)?;
     if !start.is_dir() {
         return None;
     }
@@ -771,5 +804,64 @@ mod tests {
         assert_eq!(root, d);
         assert_eq!(pkg["name"], "x");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn npx_rejects_path_like_names() {
+        let d = std::env::temp_dir().join(format!("qx-npxpath-{}", std::process::id()));
+        let sub = d.join("sub");
+        let bin = sub.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("tool.cmd"), "@echo off\n").unwrap();
+        // A file one level above the project that `..\x` would reach by walking out of `.bin`.
+        std::fs::write(d.join("x.cmd"), "@echo off\n").unwrap();
+        let run = |name: &str| fast_npx(&["--no-install".to_string(), name.to_string()], Some(&sub));
+        assert!(run("tool").is_some());
+        for bad in [r"C:\Windows\System32\cmd", r"..\..\x", r"..\..\..\x", "a/b", ".", "..", "", "C:cmd"] {
+            assert!(run(bad).is_none(), "{bad:?} must not run outside node_modules\\.bin");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_relative_cwd_gives_absolute_paths() {
+        let rel = PathBuf::from("target").join(format!("qx-relcwd-{}", std::process::id()));
+        std::fs::create_dir_all(rel.join("node_modules").join(".bin")).unwrap();
+        std::fs::write(rel.join("package.json"), r#"{"scripts":{"x":"echo x"}}"#).unwrap();
+        let f = fast(&["run".into(), "x".into()], Some(&rel)).unwrap();
+        assert!(f.cwd.is_absolute(), "{:?}", f.cwd);
+        let first = std::env::split_paths(&f.path).next().unwrap();
+        assert!(first.is_absolute(), "{first:?}");
+        assert!(f.env.iter().filter(|(k, _)| *k == "INIT_CWD" || *k == "npm_package_json").all(|(_, v)| Path::new(v).is_absolute()));
+        let _ = std::fs::remove_dir_all(&rel);
+    }
+
+    #[test]
+    fn a_script_step_keeps_the_git_prefix_command_for_added() {
+        let root = std::env::temp_dir().join(format!("qx-npmgit-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("package.json"), r#"{"scripts":{"c":"wc -l package.json"}}"#).unwrap();
+        let f = fast(&["run".into(), "c".into()], Some(&root)).unwrap();
+        let cmds = commands(&f).unwrap();
+        let c = &cmds[0];
+        let under_git_usr = Path::new(c.get_program())
+            .parent()
+            .is_some_and(|p| p.ends_with(Path::new("usr").join("bin")));
+        if !under_git_usr {
+            println!("skip: wc does not resolve to Git usr\\bin here");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let path = c
+            .get_envs()
+            .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+            .and_then(|(_, v)| v)
+            .unwrap();
+        let usr = Path::new(c.get_program()).parent().unwrap().to_path_buf();
+        assert!(
+            std::env::split_paths(path).any(|p| p == usr),
+            "PATH lost {usr:?}: {path:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
