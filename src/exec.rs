@@ -744,7 +744,7 @@ fn segments(s: &str) -> Vec<&str> {
 }
 
 fn first_word(seg: &str) -> &str {
-    seg.trim_start().split_whitespace().next().unwrap_or("")
+    seg.split_whitespace().next().unwrap_or("")
 }
 
 /// PowerShell-only syntax. Quoted text never starts a command segment, so

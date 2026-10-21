@@ -125,7 +125,7 @@ impl Client {
                 return c;
             }
         }
-        if env("CLAUDECODE").is_some() {
+        if env("CLAUDECODE").as_deref() == Some("1") {
             return Client::ClaudeCode;
         }
         Client::Generic
@@ -286,6 +286,18 @@ mod tests {
         );
         assert_eq!(Client::from_key("claude-code"), Some(Client::ClaudeCode));
         assert_eq!(Client::from_key("nope"), None);
+    }
+
+    #[test]
+    fn claudecode_must_be_exactly_one() {
+        // A wrapper that clears or disables the variable must not make an unknown client "Claude Code".
+        for value in ["0", "", "false"] {
+            assert_eq!(
+                Client::detect(None, |k| (k == "CLAUDECODE").then(|| value.to_string())),
+                Client::Generic,
+                "CLAUDECODE={value:?}"
+            );
+        }
     }
 
     #[test]

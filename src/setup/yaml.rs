@@ -200,7 +200,7 @@ fn yaml_scalar_path(p: &Path) -> String {
 pub fn dsh_command(text: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     let (start, end) = dsh_item(&lines)?;
-    (start..end).find_map(|i| yaml_scalar(&lines[i], "command"))
+    (start..end).find_map(|i| yaml_scalar(lines[i], "command"))
 }
 
 // --------------------------------------------------------------------- hermes
@@ -270,7 +270,7 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
         (None, Action::Remove) => Edit::Unchanged,
         (None, Action::Install) => {
             let block = hermes_block(exe, &" ".repeat(child_indent), &[]);
-            let last_child = (servers + 1..end).filter(|i| !is_noise(lines[*i].as_str())).next_back();
+            let last_child = (servers + 1..end).rfind(|i| !is_noise(lines[*i].as_str()));
             let insert_at = last_child
                 .map(|i| {
                     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -332,8 +332,7 @@ fn hermes_block(exe: &Path, indent: &str, kept: &[String]) -> String {
 fn kept_env(lines: &[String], start: usize, end: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut env_indent = None;
-    for i in start..end {
-        let line = &lines[i];
+    for line in lines.iter().take(end).skip(start) {
         let t = line.trim();
         if t == "env:" {
             env_indent = Some(indent_of(line.as_str()));

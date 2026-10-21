@@ -165,13 +165,11 @@ fn parse_pyvenv(text: &str) -> Option<(PathBuf, (u32, u32))> {
         match key.trim().to_ascii_lowercase().as_str() {
             "home" => home = Some(PathBuf::from(value)),
             // uv writes `uv`/`version_info`; the stdlib writes `version` too.
-            "version_info" | "version" => {
-                if version.is_none() {
-                    let mut parts = value.split('.');
-                    let major = parts.next()?.parse().ok()?;
-                    let minor = parts.next().and_then(|m| m.parse().ok()).unwrap_or(0);
-                    version = Some((major, minor));
-                }
+            "version_info" | "version" if version.is_none() => {
+                let mut parts = value.split('.');
+                let major = parts.next()?.parse().ok()?;
+                let minor = parts.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+                version = Some((major, minor));
             }
             _ => {}
         }
