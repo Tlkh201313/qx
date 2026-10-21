@@ -193,6 +193,21 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
         d.deny("Invoke-Expression executes arbitrary code");
     }
 
+    // `start "title" prog`: the tokenizer has dropped the quotes, so a title cannot be told from the
+    // program. Judge both readings; deny wins.
+    if name == "start" {
+        let mut i = 0;
+        while args.get(i).is_some_and(|a| a.starts_with('/') && a.len() <= 8) {
+            i += if args[i].eq_ignore_ascii_case("/d") { 2 } else { 1 };
+        }
+        for k in [i, i + 1] {
+            if let Some(p) = args.get(k) {
+                merge(&mut d, check_mode(m, p, &args[k + 1..], cwd));
+            }
+        }
+        return finalize(m, d);
+    }
+
     // `env`, `xargs`, `timeout`, `nohup`, `sudo`, `wsl`, `command` are transparent wrappers: judge the
     // payload, not the wrapper.
     if let Some((prog, rest)) = unwrap_wrapper(&name, args) {
@@ -256,10 +271,15 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
         }
         "psql" | "mysql" | "mariadb" | "sqlite3" | "sqlcmd" => check_sql(&joined, &mut d),
         "powershell" | "pwsh" => {
-            // PowerShell takes -e, -ec and any prefix of -EncodedCommand.
+            // PowerShell takes -e, -ec and any prefix of -EncodedCommand, introduced by `-`, `--`, `/`
+            // or a typographic dash.
             if args.iter().any(|a| {
-                let l = a.to_ascii_lowercase();
-                l == "-ec" || (l.len() >= 2 && "-encodedcommand".starts_with(&l))
+                let l = a.to_lowercase();
+                let core = ["--", "-", "/", "\u{2013}", "\u{2014}", "\u{2015}"]
+                    .iter()
+                    .find_map(|p| l.strip_prefix(p))
+                    .unwrap_or("");
+                core == "ec" || (!core.is_empty() && "encodedcommand".starts_with(core))
             }) {
                 d.deny("encoded PowerShell hides its payload");
             }
@@ -557,8 +577,12 @@ fn judge_line(m: Mode, command: &str, cwd: Option<&Path>, sq: bool) -> Decision 
     let cwd = base.as_deref();
 
     check_redirection(command, cwd, &mut d);
+    check_dotnet_delete(command, cwd, &mut d);
 
     let mut segments: Vec<(Vec<String>, bool)> = Vec::new();
+    // `d=/; rm -rf $d`, `$p = "..."; Remove-Item $p`, `set T=..&& rd %T%`: literal assignments made
+    // earlier on the line, so a later delete is judged by the value it really gets.
+    let mut assigned: Vec<(String, String)> = Vec::new();
     for (s, piped) in split_segments(command, sq) {
         // `try { A } catch { B }`, `if x (A) else (B)`: braces, and the parentheses of a cmd body,
         // end a command wherever a block starts or stops.
@@ -567,6 +591,11 @@ fn judge_line(m: Mode, command: &str, cwd: Option<&Path>, sq: bool) -> Decision 
             tokens = split_parens(tokens);
         }
         for mut w in split_blocks(tokens) {
+            // Recorded, then still judged: `set QX_GUARD=off` is an assignment and an escape attempt.
+            record_assignment(&w, &mut assigned);
+            for t in w.iter_mut() {
+                *t = substitute_assigned(t, &assigned);
+            }
             let n = w.iter().take_while(|t| is_assignment(t)).count();
             if w.iter().take(n + 1).any(|t| qx_switch(t)) {
                 d.deny("attempt to disable a qx safeguard");
@@ -1091,6 +1120,112 @@ fn is_assignment(t: &str) -> bool {
         .is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
+fn var_name_ok(n: &str) -> bool {
+    !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A command that only assigns a variable: `d=/` (POSIX), `$p = 'x'` or `$p='x'` (PowerShell),
+/// `set T=x` (cmd). Records it (name lowercased) and says so; anything else is left alone.
+fn record_assignment(w: &[String], assigned: &mut Vec<(String, String)>) -> bool {
+    let mut put = |k: &str, v: &str| {
+        let k = k.to_ascii_lowercase();
+        assigned.retain(|(n, _)| *n != k);
+        assigned.push((k, v.to_string()));
+    };
+    match w {
+        [one] if is_assignment(one) => {
+            let (k, v) = one.split_once('=').unwrap_or_default();
+            put(k, v);
+            true
+        }
+        [set, kv] if set.eq_ignore_ascii_case("set") && is_assignment(kv) => {
+            let (k, v) = kv.split_once('=').unwrap_or_default();
+            put(k, v);
+            true
+        }
+        [var, eq, v] if eq == "=" && var.strip_prefix('$').is_some_and(var_name_ok) => {
+            put(&var[1..], v);
+            true
+        }
+        [one] if one.starts_with('$') => match one[1..].split_once('=') {
+            Some((k, v)) if var_name_ok(k) => {
+                put(k, v);
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// `$name`, `${name}`, `%name%` and `!name!` replaced by values assigned earlier on the line.
+fn substitute_assigned(word: &str, assigned: &[(String, String)]) -> String {
+    if assigned.is_empty() || !word.contains(['$', '%', '!']) {
+        return word.to_string();
+    }
+    let mut out = word.to_string();
+    for (name, value) in assigned {
+        for form in [format!("${{{name}}}"), format!("%{name}%"), format!("!{name}!")] {
+            out = replace_ci(&out, &form, value);
+        }
+        out = replace_var_ci(&out, name, value);
+    }
+    out
+}
+
+fn replace_ci(s: &str, needle: &str, value: &str) -> String {
+    let low = s.to_ascii_lowercase();
+    let (mut out, mut i) = (String::with_capacity(s.len()), 0usize);
+    while let Some(rel) = low[i..].find(needle) {
+        out.push_str(&s[i..i + rel]);
+        out.push_str(value);
+        i += rel + needle.len();
+    }
+    out.push_str(&s[i..]);
+    out
+}
+
+/// `[IO.Directory]::Delete(x, $true)`, `[System.IO.File]::Delete(x)`, `(Get-Item x).Delete()`:
+/// .NET deletes that no command word announces, judged like `rm` of their target.
+fn check_dotnet_delete(command: &str, cwd: Option<&Path>, d: &mut Decision) {
+    let low = command.to_ascii_lowercase();
+    let mut from = 0;
+    loop {
+        let rel = match (low[from..].find(".delete("), low[from..].find("::delete(")) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => break,
+        };
+        let at = from + rel;
+        from = at + 1;
+        let before = &low[..at];
+        let target = if before.ends_with("directory]") || before.ends_with("file]") {
+            // static call: the first argument
+            let open = at + low[at..].find('(').unwrap_or(0) + 1;
+            command[open..].split([',', ')']).next().unwrap_or("").trim().to_string()
+        } else if before.ends_with(')') {
+            // `(Get-Item x).Delete(...)`: the last plain word of the group before it
+            let Some(open) = before.rfind('(') else { continue };
+            tokenize(&command[open + 1..at - 1]).into_iter().skip(1).filter(|t| !t.starts_with('-')).last().unwrap_or_default()
+        } else {
+            continue;
+        };
+        let target = target.trim_matches(['"', '\'']).to_string();
+        if !target.is_empty() {
+            destructive("rm", std::slice::from_ref(&target), cwd, d);
+        }
+    }
+}
+
+/// A delete target that still names a variable after every expansion: its value is unknown here.
+fn unresolved_var(s: &str) -> bool {
+    let b = s.as_bytes();
+    (0..b.len()).any(|i| {
+        (b[i] == b'$' && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, b'_' | b'{')))
+            || (b[i] == b'%' && s[i + 1..].find('%').is_some_and(|j| var_name_ok(&s[i + 1..i + 1 + j])))
+    })
+}
+
 fn is_network_program(name: &str) -> bool {
     matches!(
         name,
@@ -1289,19 +1424,24 @@ fn check_redirection(command: &str, cwd: Option<&Path>, d: &mut Decision) {
     while i < bytes.len() {
         if bytes[i] == b'>' {
             let mut j = i + 1;
-            if j < bytes.len() && bytes[j] == b'>' {
+            // `>>`, and `>|` (noclobber override) write just like `>`.
+            if j < bytes.len() && (bytes[j] == b'>' || bytes[j] == b'|') {
                 j += 1;
             }
             while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
                 j += 1;
             }
-            if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+            // A quoted target runs to its closing quote: `"...\Start Menu\...\x.bat"` has spaces.
+            let quote = bytes.get(j).copied().filter(|q| matches!(q, b'"' | b'\''));
+            if quote.is_some() {
                 j += 1;
             }
             let start = j;
             while j < bytes.len()
-                && !bytes[j].is_ascii_whitespace()
-                && !matches!(bytes[j], b'"' | b'\'' | b';' | b'&' | b'|')
+                && match quote {
+                    Some(q) => bytes[j] != q,
+                    None => !bytes[j].is_ascii_whitespace() && !matches!(bytes[j], b'"' | b'\'' | b';' | b'&' | b'|'),
+                }
             {
                 j += 1;
             }
@@ -1327,12 +1467,14 @@ fn check_git(args: &[String], d: &mut Decision) {
 
     match sub.as_deref() {
         Some("push") => {
-            // `+main` is a force-push refspec.
-            let force = args.iter().any(|a| a == "--force" || short_flag(a, 'f') || a.starts_with('+'));
+            // `+main` is a force-push refspec; `--mirror` force-updates and deletes every remote ref.
+            let force = args.iter().any(|a| a == "--force" || a == "--mirror" || short_flag(a, 'f') || a.starts_with('+'));
             if force && std::env::var("QX_ALLOW_FORCE_PUSH").ok().as_deref() != Some("1") {
                 d.deny("force push rewrites remote history");
             }
-            if joined.contains("--delete") {
+            // `--delete`, `-d`, and a refspec with an empty source (`:main`) delete remote branches.
+            let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+            if joined.contains("--delete") || args.iter().any(|a| short_flag(a, 'd')) || pos.iter().skip(2).any(|a| a.starts_with(':')) {
                 d.warn("deleting a remote branch");
             }
         }
@@ -1478,6 +1620,10 @@ fn destructive(name: &str, args: &[String], cwd: Option<&Path>, d: &mut Decision
         }
 
         let path = absolutize(raw, cwd);
+        if unresolved_var(&path.to_string_lossy()) {
+            d.warn(format!("delete target names a variable qx cannot resolve: {raw}"));
+            continue;
+        }
 
         if raw.contains('*') || raw.contains('?') {
             let at_root = raw == "/*" || raw == "\\*" || path.parent().is_some_and(|p| is_drive_root(&p.to_string_lossy()));
@@ -1757,25 +1903,33 @@ fn expand_dollar_env(s: &str) -> String {
     out
 }
 
+/// cmd's `%NAME%`, `%NAME:~0,9%` / `%NAME:a=b%` (a substring or replacement of NAME: judged as NAME
+/// itself, a superset that only ever denies more) and delayed `!NAME!` when NAME is set.
 fn expand_env(s: &str) -> String {
+    let name_ok = |n: &str| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '(' || c == ')');
     let mut out = String::new();
     let mut rest = s;
-    while let Some(i) = rest.find('%') {
+    while let Some(i) = rest.find(['%', '!']) {
+        let mark = &rest[i..i + 1];
         let after = &rest[i + 1..];
-        if let Some(j) = after.find('%') {
-            let name = &after[..j];
-            if !name.is_empty()
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '(' || c == ')')
-            {
-                out.push_str(&rest[..i]);
+        if let Some(j) = after.find(mark) {
+            let inner = &after[..j];
+            let name = if mark == "%" { inner.split(':').next().unwrap_or("") } else { inner };
+            if name_ok(name) {
                 match std::env::var(name) {
-                    Ok(v) => out.push_str(&v),
-                    Err(_) => out.push_str(&rest[i..i + j + 2]),
+                    Ok(v) => {
+                        out.push_str(&rest[..i]);
+                        out.push_str(&v);
+                        rest = &after[j + 1..];
+                        continue;
+                    }
+                    Err(_) if mark == "%" => {
+                        out.push_str(&rest[..i + j + 2]);
+                        rest = &after[j + 1..];
+                        continue;
+                    }
+                    Err(_) => {}
                 }
-                rest = &after[j + 1..];
-                continue;
             }
         }
         out.push_str(&rest[..i + 1]);
@@ -2648,6 +2802,81 @@ mod tests {
         assert!(!check_shell_mode(Mode::Safe, &nested, None).allowed());
         // Ordinary depth is fine.
         assert!(!denied("env env ls"));
+    }
+
+    #[test]
+    fn a_variable_assigned_on_the_same_line_is_judged_by_its_value() {
+        for bad in [
+            r#"$p = "$env:USERPROFILE"; Remove-Item -Recurse -Force $p"#,
+            "d=/; rm -rf $d",
+            r"set T=C:\Windows&& rd /s /q %T%",
+            r#"$t = 'C:\Windows'; Remove-Item -Recurse -Force "$t""#,
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        // A variable qx cannot resolve is not silently judged as a file in the workspace.
+        assert_eq!(level("rm -rf $SOMEWHERE_QX_UNSET/x"), Level::Warn);
+        assert_eq!(level("d=build; rm -rf $d"), Level::Allow);
+    }
+
+    #[test]
+    fn cmd_substring_and_delayed_expansion_are_expanded() {
+        for bad in [
+            "rd /s /q %USERPROFILE:~0%",
+            "rd /s /q %windir:x=x%",
+            r#"cmd /v:on /c "rd /s /q !USERPROFILE!""#,
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        assert!(!denied("echo Hello!") && !denied("rd /s /q build"));
+    }
+
+    #[test]
+    fn every_spelling_of_encoded_command_is_refused() {
+        for bad in ["powershell /enc SQBFAFgA", "pwsh --encodedcommand SQBFAFgA", "powershell \u{2013}e SQBFAFgA", "powershell -EncodedCommand SQBFAFgA"] {
+            assert!(denied(bad), "{bad}");
+        }
+        assert!(!denied("powershell -ExecutionPolicy Bypass -File build.ps1"));
+    }
+
+    #[test]
+    fn a_titled_start_cannot_hide_its_payload() {
+        for bad in [r#"start "x" cmd /c rd /s /q C:\Windows"#, r#"cmd /c start "x" rd /s /q %USERPROFILE%"#] {
+            assert!(denied(bad), "{bad}");
+        }
+        assert!(!denied(r#"start "dev server" npm run dev"#));
+    }
+
+    #[test]
+    fn a_quoted_redirection_target_is_read_whole() {
+        for bad in [
+            r#"echo calc > "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\x.bat""#,
+            r#"echo x >| "C:\Windows\System32\drivers\etc\hosts""#,
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        assert!(!denied(r#"echo hi > "build output.txt""#));
+    }
+
+    #[test]
+    fn mirror_pushes_and_refspec_deletes_are_judged() {
+        assert!(denied("git push --mirror origin"));
+        assert_eq!(level("git push origin :main"), Level::Warn);
+        assert_eq!(level("git push -d origin old"), Level::Warn);
+        assert_eq!(level("git push origin main"), Level::Allow);
+    }
+
+    #[test]
+    fn dotnet_file_apis_are_judged_like_deletes() {
+        for bad in [
+            "[IO.Directory]::Delete($HOME, $true)",
+            r#"[System.IO.Directory]::Delete("C:\Windows\System32", $true)"#,
+            r#"(Get-Item C:\Windows).Delete($true)"#,
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        assert!(!denied(r#"[IO.File]::Delete("build\out.txt")"#));
+        assert!(!denied("$list.Delete(3)"));
     }
 
     #[test]
