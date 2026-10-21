@@ -31,6 +31,9 @@ the command itself.
    `wc -l a.txt b.txt` or a POSIX line that reached `cmd` still answers instead of
    failing with "command not found"; only the coreutils Git actually ships are
    eligible, and the error message says when a declined built-in had nowhere to go.
+   Two names need care: System32 ships a `find.exe` and a `sort.exe` that take
+   different switches, so `find src -name x` and `sort -n` pick Git's binaries
+   while a switch-less `sort`/`find` keeps whatever PATH resolves first.
 2. **Direct exec** — `qx git status` calls `git.exe` directly. No `bash`, no login
    profile, no `cmd.exe` in between. Node targets also get a persistent
    `NODE_COMPILE_CACHE` (Node 22+), which cuts repeat CLI startup by ~20%.
@@ -284,12 +287,11 @@ qx gain                                 # savings report
 
 Flags: `--max-lines`, `--head`, `--tail`, `--timeout SECS`, `--cwd DIR`,
 `--shell cmd|bash|powershell`, `--capture`. `auto` picks the shell that can parse
-the line: PowerShell for `$x = 1`, `[T]::Method()`, `try { }`, `& $exe`, `@'…'@`,
-` -eq `-style comparisons and `Verb-Noun` cmdlets (no profile, UTF-8 output, exit
-code preserved through `-EncodedCommand`); Git Bash when a pipeline or redirect
-runs a POSIX utility (`ls cat head tail wc grep find sed awk sort uniq xargs …`);
-otherwise cmd. A line that neither shell can start fails with a message naming
-the limit — 8 KiB for cmd, 12 KiB of script for PowerShell. PowerShell 5.1 has no
+the line: PowerShell for `$x = 1`, `[T]::Method()`, `try { }`, `& $exe`, `@'…'@`
+and `Verb-Noun` cmdlets (no profile, UTF-8 output, exit code preserved); Git Bash
+when a pipeline or redirect runs a POSIX utility (`ls cat head tail wc grep sed awk
+uniq xargs …`; not `find` or `sort`, which Windows has too); otherwise cmd. A cmd
+line over 8 KiB fails with a message naming the limit. PowerShell 5.1 has no
 `&&`/`||`, so those stay on cmd.
 
 Children never prompt: stdin is empty, PowerShell runs `-NonInteractive` (so

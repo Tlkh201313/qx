@@ -439,7 +439,21 @@ pub fn build_command_at(
         apply_child_defaults(&mut c, false);
         return Ok(c);
     }
-    command_for(program, resolve::resolve(program, cwd), args)
+    let mut target = resolve::resolve(program, cwd);
+    // `find src -name x` and `sort -n`: System32 ships unrelated tools under those names
+    // with different switches, so a POSIX `-flag` picks Git's binary instead.
+    if posix_flags(program, args) {
+        if let Some(exe) = resolve::git_coreutil(program) {
+            target = Target::Direct { exe, prefix: Vec::new() };
+        }
+    }
+    command_for(program, target, args)
+}
+
+/// A name Windows also ships, where a `-flag` means the caller wanted the POSIX tool.
+fn posix_flags(program: &str, args: &[String]) -> bool {
+    matches!(program.to_ascii_lowercase().as_str(), "find" | "sort")
+        && args.iter().any(|a| a.len() > 1 && a.starts_with('-'))
 }
 
 fn npmish(program: &str) -> bool {
@@ -561,8 +575,6 @@ fn git_root(cmd: &Command) -> Option<PathBuf> {
 
 /// `cmd.exe` folds a line over ~8 KiB into "The command line is too long."
 const CMD_LINE_CAP: usize = 8_000;
-/// `-EncodedCommand` carries the script in argv as base64 (~2.7 bytes per character).
-const PS_SCRIPT_CAP: usize = 12_000;
 
 pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
     let choice = if shell == "auto" { pick_shell(command) } else { shell };
@@ -596,20 +608,17 @@ pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
             Ok(c)
         }
         "powershell" => {
-            if command.len() > PS_SCRIPT_CAP {
-                return Err(format!(
-                    "script is {} characters; `-EncodedCommand` carries it in one argv \
-                     (limit ~{PS_SCRIPT_CAP}). Split it, or pass `program` + `args`",
-                    command.len()
-                ));
-            }
             let mut c = Command::new("powershell.exe");
             // The user's profile costs 300+ ms and changes output; the prelude keeps
             // piped output UTF-8 and drops progress-bar noise. `-NonInteractive` turns a
-            // prompt into an error instead of a hang, and `-EncodedCommand` deletes the
-            // quoting layer that cmd.exe and `Command` used to mangle.
-            c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]);
-            c.arg(encoded_powershell(command));
+            // prompt into an error instead of a hang. Not `-EncodedCommand`: with captured
+            // output it writes errors as CLIXML.
+            c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
+            // Own line, so parse errors point at the command, not the prelude.
+            // -Command folds every native exit code to 1; hand the real one back.
+            c.arg(format!(
+                "$ProgressPreference='SilentlyContinue';try{{[Console]::OutputEncoding=[Text.Encoding]::UTF8}}catch{{}}\n{command}\n$qxok=$?;if($LASTEXITCODE){{exit $LASTEXITCODE}};if(!$qxok){{exit 1}}"
+            ));
             prepare(&mut c);
             apply_python_fast(&mut c);
             apply_child_defaults(&mut c, false);
@@ -618,41 +627,6 @@ pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
         "none" => Err("shell=none needs program+args".to_string()),
         other => Err(format!("unknown shell: {other}")),
     }
-}
-
-/// The script behind `-EncodedCommand`: the prelude keeps its own line so a parse error
-/// points at the command, and the trailer hands the native exit code back
-/// (`-Command` folds every failing native call to 1).
-fn encoded_powershell(command: &str) -> String {
-    let script = format!(
-        "$ProgressPreference='SilentlyContinue';try{{[Console]::OutputEncoding=[Text.Encoding]::UTF8}}catch{{}}\n{command}\n$qxok=$?;if($LASTEXITCODE){{exit $LASTEXITCODE}};if(!$qxok){{exit 1}}"
-    );
-    base64_utf16le(&script)
-}
-
-/// PowerShell decodes `-EncodedCommand` as base64 over UTF-16LE; one alphabet, no dependency.
-fn base64_utf16le(s: &str) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = u32::from(chunk[0]) << 16
-            | u32::from(*chunk.get(1).unwrap_or(&0)) << 8
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 /// The one way qx starts cmd.exe. The line goes in as raw command-line text: `Command`'s own
@@ -711,12 +685,7 @@ fn powershell_syntax(s: &str) -> bool {
         "@'",
         "@\"",
         "2>$null",
-        " -eq ",
-        " -ne ",
-        " -gt ",
-        " -ge ",
-        " -lt ",
-        " -le ",
+        // Not ` -eq `, ` -lt ` and kin: bash's `test` and `[ ]` use them too.
         " -like ",
         " -match ",
         " -contains ",
@@ -726,19 +695,15 @@ fn powershell_syntax(s: &str) -> bool {
     }
     segments(s).into_iter().any(|seg| {
         let w = first_word(seg);
-        // `$(…)` and `${…}` are bash command substitution, not a PS variable.
-        if w.is_empty() || w.starts_with("$(") || w.starts_with("${") {
+        // A bare `$` is what the split leaves of bash's `$(…)` and `${…}`.
+        if w.is_empty() || w == "$" {
             return false;
         }
         // A cmdlet, a `$variable` in command position (`$x = 1`, `$p.Foo()`), the call
-        // operator (`& $exe`), a script block, or a block keyword.
+        // operator (`& $exe`), or a block keyword.
         verb_noun(w)
             || w.starts_with('$')
             || w == "&"
-            || w.starts_with("%{")
-            || w.starts_with("?{")
-            || w.starts_with("@(")
-            || w.starts_with("@{")
             || matches!(w, "try" | "catch" | "finally" | "foreach" | "trap")
     })
 }
@@ -756,13 +721,13 @@ fn verb_noun(w: &str) -> bool {
         && noun.chars().all(|c: char| c.is_ascii_alphanumeric())
 }
 
-/// Utilities cmd.exe has no built-in for; a pipeline that runs one is a POSIX pipeline.
+/// Utilities Windows has no command for; a pipeline that runs one is a POSIX pipeline.
+/// Not `find`, `sort`, `date` or `mkdir`: cmd has its own (`netstat -ano | find ":3000"`).
 const BASH_ONLY: &[&str] = &[
-    "awk", "basename", "cat", "chmod", "cp", "cut", "date", "df", "diff", "dirname", "du",
-    "env", "find", "grep", "head", "ln", "ls", "md5sum", "mkdir", "mv", "nl", "printf",
-    "pwd", "readlink", "realpath", "rev", "rm", "sed", "seq", "sha256sum", "shasum",
-    "sleep", "sort", "stat", "tac", "tail", "tee", "test", "touch", "tr", "uniq", "uname",
-    "wc", "which", "xargs",
+    "awk", "basename", "cat", "chmod", "cp", "cut", "df", "diff", "dirname", "du", "env",
+    "grep", "head", "ln", "ls", "md5sum", "mv", "nl", "printf", "pwd", "readlink",
+    "realpath", "rev", "rm", "sed", "seq", "sha256sum", "shasum", "sleep", "stat", "tac",
+    "tail", "tee", "test", "touch", "tr", "uniq", "uname", "wc", "which", "xargs",
 ];
 
 fn posix_syntax(s: &str) -> bool {
@@ -787,19 +752,7 @@ fn powershell_call(program: &str, args: &[String]) -> Result<Command, String> {
         script.push(' ');
         script.push_str(&ps_quote(a));
     }
-    if script.len() > PS_SCRIPT_CAP {
-        return Err(format!(
-            "script is {} characters; `-EncodedCommand` carries it in one argv (limit ~{PS_SCRIPT_CAP})",
-            script.len()
-        ));
-    }
-    let mut c = Command::new("powershell.exe");
-    c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]);
-    c.arg(encoded_powershell(&script));
-    prepare(&mut c);
-    apply_python_fast(&mut c);
-    apply_child_defaults(&mut c, false);
-    Ok(c)
+    build_shell(&script, "powershell")
 }
 
 /// Bare words stay bare (`-Path`, `src`); anything else is single-quoted, the one form
@@ -1372,10 +1325,13 @@ mod tests {
             ("find src -name \"*.rs\" | wc -l", "bash"),
             ("echo $(date)", "bash"),
             ("rg -n fn src | wc -l", "bash"),
+            ("test $(git status --porcelain | wc -l) -ge 0 && echo ok", "bash"),
+            ("$(echo git) --version | cat", "bash"),
             ("cargo build --release", "cmd"),
             ("git status --short", "cmd"),
             ("echo one && echo two", "cmd"),
             ("dir /b src | findstr /i main", "cmd"),
+            ("tasklist | find /i \"explorer\"", "cmd"),
             ("echo hello > out.txt && type out.txt", "cmd"),
             ("git commit -m \"Add Get-Thing support\"", "cmd"),
             ("docker-compose up", "cmd"),
@@ -1390,15 +1346,6 @@ mod tests {
     }
 
     #[test]
-    fn encodes_powershell_scripts_as_utf16le_base64() {
-        // Vectors from [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(x)).
-        assert_eq!(base64_utf16le(""), "");
-        assert_eq!(base64_utf16le("A"), "QQA=");
-        assert_eq!(base64_utf16le("AB"), "QQBCAA==");
-        assert_eq!(base64_utf16le("ABC"), "QQBCAEMA");
-    }
-
-    #[test]
     fn runs_a_cmdlet_given_as_program_through_powershell() {
         let c = build_command_at("Get-ChildItem", &["src".into(), "a b".into()], None).unwrap();
         assert!(c
@@ -1407,10 +1354,8 @@ mod tests {
             .to_ascii_lowercase()
             .contains("powershell"));
         let args: Vec<String> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(args[args.len() - 2], "-EncodedCommand");
-        let script = args.last().unwrap();
-        assert!(script.len() > 40);
-        assert!(script.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)));
+        assert_eq!(args[args.len() - 2], "-Command");
+        assert!(args.last().unwrap().contains("\nGet-ChildItem src 'a b'\n"));
         assert_eq!(ps_quote("-Path"), "-Path");
         assert_eq!(ps_quote("a b"), "'a b'");
         assert_eq!(ps_quote("it's"), "'it''s'");
@@ -1463,6 +1408,25 @@ mod tests {
         assert_eq!(a, ["-n", "fn main", "src\\main.rs"]);
         let (p, a) = split_simple("echo \"two  spaces\"").unwrap();
         assert_eq!((p.as_str(), a), ("echo", vec!["two  spaces".to_string()]));
+    }
+
+    /// `find src -name x` and `sort -n` mean the POSIX tools; System32 ships unrelated
+    /// programs under both names, so a `-flag` has to pick Git's binary.
+    #[test]
+    fn posix_switches_pick_git_tools_over_the_windows_twins() {
+        let Some(find) = resolve::git_coreutil("find") else {
+            return;
+        };
+        let args: Vec<String> = ["src", "-name", "*.rs"].iter().map(|s| s.to_string()).collect();
+        let c = build_command_at("find", &args, None).unwrap();
+        assert_eq!(Path::new(c.get_program()), find);
+        let c = build_command_at("sort", &["-n".to_string(), "x.txt".to_string()], None).unwrap();
+        let prog = c.get_program().to_string_lossy().to_lowercase();
+        assert!(prog.contains("usr\\bin\\sort.exe"), "{prog}");
+        // Without a POSIX switch the PATH winner stays the winner.
+        let c = build_command_at("sort", &["x.txt".to_string()], None).unwrap();
+        let prog = c.get_program().to_string_lossy().to_lowercase();
+        assert!(!prog.contains("usr\\bin\\sort.exe"), "{prog}");
     }
 
     #[test]
@@ -1660,6 +1624,7 @@ mod tests {
         for (cmd, want) in [("cmd /c exit 7", 7), ("Get-Item C:\\qx-no-such-zz -ErrorAction Stop", 1), ("Write-Output ok", 0)] {
             let o = run_captured(build_shell(cmd, "powershell").unwrap(), Some(Duration::from_secs(60))).unwrap();
             assert_eq!(o.code, want, "{cmd}");
+            assert!(!o.stderr.contains("CLIXML"), "{cmd}: errors must stay plain text: {}", o.stderr);
         }
     }
 

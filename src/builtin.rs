@@ -1951,13 +1951,16 @@ mod tests {
         ];
         for case in taken {
             let mine = run("grep", &case, &d).expect("built-in declined a shape it claims");
-            let (code, theirs) = real_grep_run(grep, &case, &d);
+            let Some((code, theirs, why)) = real_grep_run(grep, &case, &d) else {
+                let _ = fs::remove_dir_all(&d);
+                return;
+            };
             let mut a: Vec<&str> = mine.stdout.lines().collect();
             let mut b: Vec<&str> = theirs.lines().collect();
             a.sort_unstable();
             b.sort_unstable();
-            assert_eq!(a, b, "stdout differs for {case:?}");
-            assert_eq!(mine.code, code, "exit differs for {case:?}");
+            assert_eq!(a, b, "stdout differs for {case:?} (grep said {why:?})");
+            assert_eq!(mine.code, code, "exit differs for {case:?} (grep said {why:?})");
         }
 
         // Shapes a literal in-process scan must never guess at.
@@ -1986,15 +1989,30 @@ mod tests {
         .find(|p| Path::new(p).exists())
     }
 
-    fn real_grep_run(grep: &str, args: &[&str], cwd: &Path) -> (i32, String) {
-        let out = std::process::Command::new(grep)
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .expect("real grep");
-        (
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-        )
+    /// Git's grep is an msys binary, and under four real-time scanners it sometimes fails to
+    /// start at all (`NtCreateDirectoryObject ... 0xC0000022`). Retry with a short backoff,
+    /// then report the oracle as unavailable rather than blaming the built-in for it.
+    fn real_grep_run(grep: &str, args: &[&str], cwd: &Path) -> Option<(i32, String, String)> {
+        let mut last = (0, String::new(), String::new());
+        for attempt in 0..3 {
+            let out = std::process::Command::new(grep)
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("real grep");
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let flake = stdout.is_empty()
+                && ["fatal error", "ntcreatedirectoryobject", "msys"]
+                    .iter()
+                    .any(|m| stderr.to_ascii_lowercase().contains(m));
+            last = (out.status.code().unwrap_or(-1), stdout, stderr);
+            if !flake {
+                return Some(last);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1) as u64));
+        }
+        eprintln!("skipped: Git grep could not start here ({})", last.2.trim());
+        None
     }
 }
