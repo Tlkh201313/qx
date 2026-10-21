@@ -55,6 +55,7 @@ pub fn try_exec(program: &str, args: &[String], cwd: Option<&Path>, envs: &[(Str
         "head" => cmd_head(args, cwd, false),
         "tail" => cmd_head(args, cwd, true),
         "wc" => cmd_wc(args, cwd),
+        "grep" => cmd_grep(args, cwd),
         "mkdir" => cmd_mkdir(args, cwd),
         "rm" | "del" | "erase" => cmd_rm(args, cwd),
         "cp" | "copy" => cmd_cp(args, cwd),
@@ -79,7 +80,7 @@ pub fn try_exec(program: &str, args: &[String], cwd: Option<&Path>, envs: &[(Str
 pub const NAMES: &[&str] = &[
     "pwd", "echo", "true", "false", "ls", "dir", "cat", "type", "head", "tail", "wc", "mkdir", "rm",
     "del", "erase", "cp", "copy", "mv", "move", "touch", "which", "basename", "dirname", "realpath",
-    "whoami", "hostname", "seq", "sleep", "clear", "cls",
+    "whoami", "hostname", "seq", "sleep", "clear", "cls", "grep",
 ];
 
 /// Names that take file paths. A `/x` argument is a cmd.exe switch (`dir /b`) or an MSYS path
@@ -708,44 +709,93 @@ fn count_arg(s: &str) -> Option<usize> {
     }
 }
 
+/// `-n` counts lines, `-c` counts bytes; the last one on the line wins, as in GNU.
+enum Window {
+    Lines(usize),
+    Bytes(usize),
+}
+
 fn cmd_head(args: &[String], cwd: Option<&Path>, tail: bool) -> Option<BuiltinOut> {
-    let mut count = 10usize;
+    let mut window = Window::Lines(10);
     let mut files: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
-        if a == "-n" || a == "--lines" {
+        let spec = if a == "-n" || a == "--lines" {
             i += 1;
-            count = count_arg(args.get(i)?)?;
+            Some((false, args.get(i)?.as_str()))
+        } else if a == "-c" || a == "--bytes" {
             i += 1;
-        } else if let Some(rest) = a.strip_prefix("-n") {
-            count = count_arg(rest)?;
-            i += 1;
+            Some((true, args.get(i)?.as_str()))
         } else if let Some(rest) = a.strip_prefix("--lines=") {
-            count = count_arg(rest)?;
-            i += 1;
-        } else if (a.starts_with('-') && a.len() > 1) || wildcard(a) {
-            return None;
+            Some((false, rest))
+        } else if let Some(rest) = a.strip_prefix("--bytes=") {
+            Some((true, rest))
+        } else if let Some(rest) = a.strip_prefix("-n") {
+            Some((false, rest))
+        } else if let Some(rest) = a.strip_prefix("-c") {
+            Some((true, rest))
         } else {
-            files.push(a);
-            i += 1;
+            None
+        };
+        match spec {
+            Some((bytes, rest)) => {
+                let n = count_arg(rest)?;
+                window = if bytes { Window::Bytes(n) } else { Window::Lines(n) };
+                i += 1;
+            }
+            None if (a.starts_with('-') && a.len() > 1) || wildcard(a) => return None,
+            None => {
+                files.push(a);
+                i += 1;
+            }
         }
     }
     if files.len() != 1 {
         return None;
     }
     let path = path_of(cwd, files[0]);
+    let tool = if tail { "tail" } else { "head" };
+    if let Window::Bytes(n) = window {
+        return match read_bytes_window(&path, n, tail) {
+            Ok(Some(t)) => Some(ok(t)),
+            // Raw bytes cannot survive the reply format: a binary window runs for real.
+            Ok(None) => None,
+            Err(e) => Some(fail(format!("{tool}: {}: {e}", path.display()))),
+        };
+    }
+    let Window::Lines(count) = window else { return None };
     let text = match read_head_tail(&path, count, tail) {
         Ok(t) => t,
         Err(e) => {
-            return Some(fail(format!(
-                "{}: {}: {e}",
-                if tail { "tail" } else { "head" },
-                path.display()
-            )))
+            return Some(fail(format!("{tool}: {}: {e}", path.display())))
         }
     };
     Some(ok(text))
+}
+
+/// `-c`: a byte window, text only. A window that is binary or not valid UTF-8 is left to the
+/// real tool, because mangled bytes would be worse than a spawn.
+fn read_bytes_window(path: &Path, n: usize, tail: bool) -> std::io::Result<Option<String>> {
+    if n == 0 {
+        return Ok(Some(String::new()));
+    }
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    let n = n.min(READ_CAP as usize);
+    let (start, want) = if tail {
+        let start = len.saturating_sub(n as u64);
+        (start, (len - start) as usize)
+    } else {
+        (0, (len as usize).min(n))
+    };
+    let mut buf = vec![0u8; want];
+    f.seek(SeekFrom::Start(start))?;
+    f.read_exact(&mut buf)?;
+    if buf.iter().take(8192).any(|b| *b == 0) {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(buf).ok())
 }
 
 /// Read only what `head`/`tail` needs. Large files are bounded to the first or
@@ -873,6 +923,334 @@ fn cmd_wc(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     }
     parts.push(files[0].to_string());
     Some(ok(format!("{}\n", parts.join(" "))))
+}
+
+/// More files than this and the real grep is the honest answer.
+const MAX_GREP_FILES: usize = 20_000;
+/// Stop before compaction would have to throw away the tail anyway.
+const GREP_OUT_CAP: usize = 8 * 1024 * 1024;
+
+/// `grep` for the shapes agents type: literal patterns with `-r`, `-n`, `-i`, `-l`, `-v`,
+/// `-q`, `-c`, `-e`, `-A/-B/-C` and `--include=*.ext`. Everything else - a real regex, stdin,
+/// an unreadable path, a binary or >32 MiB file - returns `None` so the real grep
+/// answers: a wrong line list costs more than the 50 ms process it saves.
+fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
+    let mut insensitive = false;
+    let mut number = false;
+    let mut list_only = false;
+    let mut recursive = false;
+    let mut fixed = false;
+    let mut invert = false;
+    let mut quiet = false;
+    let mut count_only = false;
+    let mut before = 0usize;
+    let mut after = 0usize;
+    let mut around = 0usize;
+    let mut include: Option<String> = None;
+    let mut pattern: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if let Some(rest) = a.strip_prefix("--") {
+            let (key, val) = match rest.split_once('=') {
+                Some((k, v)) => (k, Some(v)),
+                None => (rest, None),
+            };
+            match key {
+                "include" => {
+                    let v = val?;
+                    if !simple_include(v) {
+                        return None;
+                    }
+                    include = Some(v.to_string());
+                }
+                "regexp" => pattern = Some(val?.to_string()),
+                "invert-match" => invert = true,
+                "quiet" | "silent" => quiet = true,
+                "fixed-strings" => fixed = true,
+                "count" => count_only = true,
+                "after-context" => after = count_arg(val?)?,
+                "before-context" => before = count_arg(val?)?,
+                "context" => around = count_arg(val?)?,
+                "line-number" => number = true,
+                "files-with-matches" => list_only = true,
+                "recursive" => recursive = true,
+                // Colour is never emitted; buffering is not observable in captured output.
+                "color" | "colour" | "line-buffered" => {}
+                _ => return None,
+            }
+        } else if a.len() > 1 && a.starts_with('-') {
+            let body = &a[1..];
+            if body.chars().all(|c| c.is_ascii_digit()) {
+                // GNU's `-3` is `-C3`.
+                around = count_arg(body)?;
+                i += 1;
+                continue;
+            }
+            let mut chars = body.char_indices();
+            while let Some((pos, ch)) = chars.next() {
+                match ch {
+                    'i' => insensitive = true,
+                    'n' => number = true,
+                    'l' => list_only = true,
+                    'r' | 'R' => recursive = true,
+                    'F' => fixed = true,
+                    'v' => invert = true,
+                    'q' => quiet = true,
+                    'c' => count_only = true,
+                    // qx reports no per-file errors, so silence changes nothing.
+                    's' => {}
+                    'e' => {
+                        // `-e pat`, `-epat` and `-ne pat` all name the pattern.
+                        let rest = &body[pos + ch.len_utf8()..];
+                        pattern = Some(if rest.is_empty() {
+                            i += 1;
+                            args.get(i)?.clone()
+                        } else {
+                            rest.to_string()
+                        });
+                        break;
+                    }
+                    'A' | 'B' | 'C' => {
+                        // `-A2`, `-A 2` and `-nA2` all count the same way.
+                        let rest = &body[pos + ch.len_utf8()..];
+                        let n = if rest.is_empty() {
+                            i += 1;
+                            args.get(i)?.clone()
+                        } else {
+                            rest.to_string()
+                        };
+                        let n = count_arg(&n)?;
+                        match ch {
+                            'A' => after = n,
+                            'B' => before = n,
+                            _ => around = n,
+                        }
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    if (around > 0 || before > 0 || after > 0) && (count_only || list_only) {
+        // GNU answers these with a "context is ignored" warning; qx words warnings badly.
+        return None;
+    }
+    let pattern = match pattern {
+        Some(p) => p,
+        None => {
+            let p = args.get(i)?.clone();
+            i += 1;
+            p
+        }
+    };
+    let pattern = pattern.as_str();
+    if pattern.is_empty() || pattern == "-" || (!fixed && needs_regex(pattern)) {
+        return None;
+    }
+    let mut specs: Vec<(&str, PathBuf)> = Vec::new();
+    if i == args.len() {
+        if !recursive {
+            // No path means stdin, which qx never gives a child.
+            return None;
+        }
+        specs.push((".", path_of(cwd, ".")));
+    } else {
+        for raw in &args[i..] {
+            if raw == "-" {
+                return None;
+            }
+            specs.push((raw.as_str(), path_of(cwd, raw)));
+        }
+    }
+
+    // Expand to files in the spelling grep would print: `grep -r x src` says `src/a.rs`.
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for (raw, path) in &specs {
+        let md = fs::metadata(path).ok()?;
+        if md.is_file() {
+            files.push((raw.to_string(), path.clone()));
+            continue;
+        }
+        if !md.is_dir() || !recursive {
+            // `grep x dir` is an error grep words better than qx can.
+            return None;
+        }
+        let base = raw.trim_end_matches(['/', '\\']);
+        let mut full = false;
+        crate::fsops::walk_every_file(path, |file| {
+            if files.len() >= MAX_GREP_FILES {
+                full = true;
+                return false;
+            }
+            let rel = file
+                .strip_prefix(path)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel.is_empty() {
+                return true;
+            }
+            if let Some(g) = &include {
+                let name = file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if !name.ends_with(&g[1..]) {
+                    return true;
+                }
+            }
+            let disp = if base.is_empty() {
+                rel
+            } else {
+                format!("{base}/{rel}")
+            };
+            files.push((disp, file.to_path_buf()));
+            true
+        });
+        if full {
+            return None;
+        }
+    }
+    if files.len() > MAX_GREP_FILES {
+        return None;
+    }
+
+    // grep prefixes the filename whenever it recurses, even for a single hit file.
+    let multiple = recursive || files.len() > 1;
+    let needle = if insensitive {
+        pattern.to_lowercase()
+    } else {
+        pattern.to_string()
+    };
+    let (bctx, actx) = if around > 0 {
+        (around, around)
+    } else {
+        (before, after)
+    };
+    let mut out = String::new();
+    let mut hits = 0usize;
+    'files: for (disp, path) in &files {
+        let bytes = fs::read(path).ok()?;
+        if bytes.len() as u64 > READ_CAP {
+            return None;
+        }
+        if bytes[..bytes.len().min(8192)].contains(&0) {
+            // GNU prints "Binary file ... matches"; never guess at that.
+            return None;
+        }
+        let text = crate::exec::decode(&bytes);
+        // `split_inclusive` keeps a trailing newline from inventing an empty last line, which
+        // `-v` would otherwise report.
+        let raw_lines: Vec<&str> = text.split_inclusive('\n').collect();
+        let mut is_sel = vec![false; raw_lines.len()];
+        let mut selected = Vec::new();
+        for (idx, raw) in raw_lines.iter().enumerate() {
+            let line = raw.strip_suffix('\n').unwrap_or(raw);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let found = if insensitive {
+                line.to_lowercase().contains(&needle)
+            } else {
+                line.contains(&needle)
+            };
+            if found != invert {
+                is_sel[idx] = true;
+                selected.push(idx);
+            }
+        }
+        if selected.is_empty() {
+            // GNU counts every file it searched, zero included.
+            if count_only {
+                if multiple {
+                    out.push_str(disp);
+                    out.push(':');
+                }
+                out.push_str("0\n");
+            }
+            continue;
+        }
+        hits += selected.len();
+        if quiet {
+            // `grep -q`: the exit code is the whole answer.
+            break 'files;
+        }
+        if list_only {
+            out.push_str(disp);
+            out.push('\n');
+            continue;
+        }
+        if count_only {
+            if multiple {
+                out.push_str(disp);
+                out.push(':');
+            }
+            let _ = writeln!(out, "{}", selected.len());
+            continue;
+        }
+        // `-A`/`-B`/`-C`: matches print with `:` separators, context lines with `-`, and `--`
+        // marks where the printed groups are not adjacent.
+        let mut show = vec![false; raw_lines.len()];
+        for &i in &selected {
+            let from = i.saturating_sub(bctx);
+            let to = (i + actx).min(raw_lines.len() - 1);
+            for s in &mut show[from..=to] {
+                *s = true;
+            }
+        }
+        let mut last: Option<usize> = None;
+        for (idx, raw) in raw_lines.iter().enumerate() {
+            if !show[idx] {
+                continue;
+            }
+            if bctx + actx > 0 && matches!(last, Some(p) if p + 1 != idx) {
+                out.push_str("--\n");
+            }
+            last = Some(idx);
+            let sep = if is_sel[idx] { ':' } else { '-' };
+            let line = raw.strip_suffix('\n').unwrap_or(raw);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if multiple {
+                out.push_str(disp);
+                out.push(sep);
+            }
+            if number {
+                let _ = write!(out, "{}", idx + 1);
+                out.push(sep);
+            }
+            out.push_str(line);
+            out.push('\n');
+            if out.len() >= GREP_OUT_CAP {
+                out.push_str("[qx] grep output truncated at 8 MiB\n");
+                return Some(ok(out));
+            }
+        }
+    }
+    Some(BuiltinOut {
+        code: if hits > 0 { 0 } else { 1 },
+        stdout: out,
+        stderr: String::new(),
+        elapsed: Duration::ZERO,
+    })
+}
+/// Characters that make the pattern a regex. A literal scan must never answer these.
+fn needs_regex(p: &str) -> bool {
+    p.chars().any(|c| ".[]()*+?^${}|\\".contains(c))
+}
+
+/// The one `--include` shape qx can honour exactly: `*.ext`.
+fn simple_include(g: &str) -> bool {
+    match g.strip_prefix("*.") {
+        Some(ext) => !ext.is_empty() && !ext.chars().any(|c| "*?[]\\/".contains(c)),
+        None => false,
+    }
 }
 
 /// Stream the file so `wc` on a multi-gigabyte log stays bounded.
@@ -1703,6 +2081,27 @@ mod tests {
     }
 
     #[test]
+    fn head_c_reads_a_byte_window_and_declines_what_it_cannot_say() {
+        let d = scratch("bytes");
+        fs::write(d.join("f.txt"), "abcdefghij\n").unwrap();
+        assert_eq!(run("head", &["-c", "4", "f.txt"], &d).unwrap().stdout, "abcd");
+        assert_eq!(run("head", &["-c4", "f.txt"], &d).unwrap().stdout, "abcd");
+        assert_eq!(run("head", &["--bytes=3", "f.txt"], &d).unwrap().stdout, "abc");
+        assert_eq!(run("tail", &["-c", "4", "f.txt"], &d).unwrap().stdout, "hij\n");
+        assert_eq!(run("tail", &["-c", "0", "f.txt"], &d).unwrap().stdout, "");
+        // The last window flag on the line wins, as in GNU.
+        assert_eq!(run("head", &["-n", "2", "-c", "2", "f.txt"], &d).unwrap().stdout, "ab");
+        assert_eq!(run("head", &["-c", "2", "-n", "2", "f.txt"], &d).unwrap().stdout, "abcdefghij\n");
+        // Byte counts qx would have to guess at, and windows it cannot render, run for real.
+        assert!(run("head", &["-c", "4k", "f.txt"], &d).is_none());
+        assert!(run("head", &["-c", "-4", "f.txt"], &d).is_none());
+        fs::write(d.join("bin.dat"), [0u8, 1, 2, 3]).unwrap();
+        assert!(run("head", &["-c", "2", "bin.dat"], &d).is_none());
+        fs::write(d.join("latin1.dat"), [b'h', 0xFF, 0xFE]).unwrap();
+        assert!(run("head", &["-c", "3", "latin1.dat"], &d).is_none());
+    }
+
+    #[test]
     fn small_emulation_gaps_fall_back() {
         let d = scratch("gaps");
         fs::write(d.join("f.txt"), "a\nb\n").unwrap();
@@ -1766,5 +2165,140 @@ mod tests {
             assert!(has_dir_link(&d.join("tree"), 0));
             assert!(run("cp", &["-r", "tree", "tree2"], &d).is_none());
         }
+    }
+
+    /// The built-in has to be indistinguishable from the real grep for every shape it accepts,
+    /// so this runs both and compares stdout (sorted: qx emits path order) and the exit code.
+    #[test]
+    fn grep_matches_the_real_tool_or_declines() {
+        let Some(grep) = real_grep() else {
+            eprintln!("skipped: no grep.exe next to Git");
+            return;
+        };
+        let d = scratch("grep");
+        fs::create_dir_all(d.join("sub")).unwrap();
+        fs::write(d.join("a.txt"), "alpha\nbeta\nalpha gamma\n").unwrap();
+        fs::write(d.join("b.rs"), "let alpha = 1;\nlet gamma = 2;\n").unwrap();
+        fs::write(d.join("one.txt"), "x\n").unwrap();
+        fs::write(d.join("sub/c.txt"), "alpha\nALPHA\n").unwrap();
+
+        // No binary file yet: a binary match makes the built-in decline (GNU says
+        // "Binary file ... matches"), which the recursive cases below must not trip over.
+        let taken: Vec<Vec<&str>> = vec![
+            vec!["-n", "alpha", "a.txt"],
+            vec!["-n", "alpha", "a.txt", "b.rs"],
+            vec!["-in", "alpha", "sub/c.txt"],
+            vec!["-rn", "alpha", "."],
+            vec!["-rn", "alpha", "sub"],
+            vec!["-rl", "alpha", "."],
+            vec!["-rln", "gamma", "."],
+            vec!["-n", "nope", "a.txt"],
+            vec!["-rn", "--include=*.rs", "alpha", "."],
+            // `-v` must not report the empty line a trailing newline would invent.
+            vec!["-vn", "alpha", "a.txt"],
+            vec!["-v", "x", "one.txt"],
+            vec!["-v", "gamma", "a.txt"],
+            vec!["-rlv", "alpha", "."],
+            vec!["--invert-match", "alpha", "a.txt"],
+            vec!["-q", "alpha", "a.txt"],
+            vec!["-q", "nope", "a.txt"],
+            vec!["-qv", "alpha", "a.txt"],
+            // `-c` prints a count for every searched file, zero included.
+            vec!["-c", "alpha", "a.txt"],
+            vec!["-c", "nope", "a.txt"],
+            vec!["-c", "alpha", "a.txt", "b.rs"],
+            vec!["-cv", "alpha", "a.txt"],
+            vec!["-rcn", "alpha", "."],
+            vec!["-cl", "alpha", "."],
+            vec!["-e", "alpha", "a.txt"],
+            vec!["-ealpha", "a.txt"],
+            vec!["-ne", "gamma", "a.txt"],
+            vec!["--regexp=beta", "a.txt"],
+        ];
+        for case in taken {
+            let mine = run("grep", &case, &d).expect("built-in declined a shape it claims");
+            let Some((code, theirs, why)) = real_grep_run(grep, &case, &d) else {
+                let _ = fs::remove_dir_all(&d);
+                return;
+            };
+            let mut a: Vec<&str> = mine.stdout.lines().collect();
+            let mut b: Vec<&str> = theirs.lines().collect();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "stdout differs for {case:?} (grep said {why:?})");
+            assert_eq!(mine.code, code, "exit differs for {case:?} (grep said {why:?})");
+        }
+
+        // Context output is ordered and carries `-`/`--` separators, so compare it byte for byte.
+        let ordered: Vec<Vec<&str>> = vec![
+            vec!["-A1", "alpha", "a.txt"],
+            vec!["-B1", "gamma", "a.txt"],
+            vec!["-A1", "-B1", "gamma", "a.txt"],
+            vec!["-1", "alpha", "a.txt"],
+            vec!["-0", "alpha", "a.txt"],
+            vec!["-A2n", "alpha", "a.txt"],
+            vec!["-A1", "alpha", "a.txt", "b.rs"],
+            vec!["-A1", "nope", "a.txt"],
+            vec!["-A1v", "alpha", "a.txt"],
+        ];
+        for case in ordered {
+            let mine = run("grep", &case, &d).expect("built-in declined a context shape it claims");
+            let Some((code, theirs, why)) = real_grep_run(grep, &case, &d) else {
+                let _ = fs::remove_dir_all(&d);
+                return;
+            };
+            assert_eq!(mine.stdout, theirs, "stdout differs for {case:?} (grep said {why:?})");
+            assert_eq!(mine.code, code, "exit differs for {case:?} (grep said {why:?})");
+        }
+
+        // Shapes a literal in-process scan must never guess at.
+        fs::write(d.join("bin.dat"), b"alpha\0binary").unwrap();
+        let declined: Vec<Vec<&str>> = vec![
+            vec!["alpha", "bin.dat"],
+            vec!["a.p", "a.txt"],
+            vec!["alpha"],
+            vec!["-rn", "alpha", "missing"],
+            vec!["-rn", "alpha", "."],
+        ];
+        for case in declined {
+            assert!(run("grep", &case, &d).is_none(), "should decline {case:?}");
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    fn real_grep() -> Option<&'static str> {
+        [
+            r"C:\Program Files\Git\usr\bin\grep.exe",
+            r"C:\Program Files\Git\bin\grep.exe",
+        ]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+    }
+
+    /// Git's grep is an msys binary, and under four real-time scanners it sometimes fails to
+    /// start at all (`NtCreateDirectoryObject ... 0xC0000022`). Retry with a short backoff,
+    /// then report the oracle as unavailable rather than blaming the built-in for it.
+    fn real_grep_run(grep: &str, args: &[&str], cwd: &Path) -> Option<(i32, String, String)> {
+        let mut last = (0, String::new(), String::new());
+        for attempt in 0..3 {
+            let out = std::process::Command::new(grep)
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("real grep");
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let flake = stdout.is_empty()
+                && ["fatal error", "ntcreatedirectoryobject", "msys"]
+                    .iter()
+                    .any(|m| stderr.to_ascii_lowercase().contains(m));
+            last = (out.status.code().unwrap_or(-1), stdout, stderr);
+            if !flake {
+                return Some(last);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1) as u64));
+        }
+        eprintln!("skipped: Git grep could not start here ({})", last.2.trim());
+        None
     }
 }

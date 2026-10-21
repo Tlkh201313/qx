@@ -102,7 +102,7 @@ pub fn run() -> i32 {
     }
 
     println!(
-        "\n[builtins] {} commands run in-process (ls, cat, head, tail, wc, mkdir, rm, cp, mv, touch, realpath, whoami, hostname, seq, ...)",
+        "\n[builtins] {} commands run in-process (ls, cat, head, tail, wc, grep, mkdir, rm, cp, mv, touch, realpath, whoami, hostname, seq, ...)",
         crate::builtin::NAMES.len()
     );
     let guard_mode = match std::env::var("QX_GUARD").ok().as_deref() {

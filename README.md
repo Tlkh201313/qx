@@ -7,28 +7,44 @@ the command itself.
 
 ## What it does
 
-1. **In-process built-ins** — 30 common commands run inside qx with **zero process
-   creation**: `pwd echo true false sleep clear cls ls dir cat type head tail wc
+1. **In-process built-ins** — 31 common commands run inside qx with **zero process
+   creation**: `pwd echo true false sleep clear cls ls dir cat type head tail wc grep
    mkdir rm del cp copy mv move touch which basename dirname realpath whoami
    hostname seq`.
    Anything a built-in does not reproduce exactly goes to the real tool instead:
    unknown flags, wildcards, `/x` arguments (cmd switches like `dir /b`, MSYS paths
    like `/tmp/x`), `tail -n +N`, `basename f .txt`, `echo -e`, `ls -lh`, `seq 1e3`,
-   `sleep` over 10 s (a built-in cannot be killed by the call's timeout), `touch`
-   on a read-only file, and `cp -r` over a tree holding a symlink or junction.
+   a `-c` window that is binary or not valid UTF-8, `sleep` over 10 s (a built-in
+   cannot be killed by the call's timeout), `touch` on a read-only file, and
+   `cp -r` over a tree holding a symlink or junction. `head -c N`/`tail -c N` read
+   one byte window from the file instead of starting a tool.
+   `grep` answers `-i -n -l -r -v -q -c -A/-B/-C -F -e PATTERN --include=*.ext` with
+   literal patterns and hands every other shape (regex metacharacters, stdin, binary
+   or over-32 MiB files, more than 20k files) to the real `grep`, so the line list is
+   never guessed.
+   A recursive scan visits the whole tree the way GNU grep does, `.git` and
+   `node_modules` included; `fs grep` is the call that skips them.
    `dir type del erase copy move` run through `cmd.exe` when no executable of that
    name exists, or when a `/switch` is given. `where` is always the real
    `where.exe`; `which` prints the first PATH hit.
    `rm` refuses drive roots, your home directory, and the current directory.
    When a built-in declines and no `name.exe` is on PATH, qx resolves the name
-   from Git for Windows' `usr\bin` (`wc`, `head`, `cp`, `mkdir`, …), so
-   `wc -l a.txt b.txt` still answers instead of failing with "command not
-   found"; only the coreutils Git actually ships are eligible, and the error
-   message says when a declined built-in had nowhere to go.
+   from Git for Windows' `usr\bin` (`wc`, `grep`, `sed`, `awk`, `find`, `sort`,
+   `cp`, `mkdir`, …), so
+   `wc -l a.txt b.txt` or a POSIX line that reached `cmd` still answers instead of
+   failing with "command not found"; only the coreutils Git actually ships are
+   eligible, and the error message says when a declined built-in had nowhere to go.
+   Two names need care: System32 ships a `find.exe` and a `sort.exe` that take
+   different switches, so `find src -name x` and `sort -n` pick Git's binaries
+   while a switch-less `sort`/`find` keeps whatever PATH resolves first.
 2. **Direct exec** — `qx git status` calls `git.exe` directly. No `bash`, no login
    profile, no `cmd.exe` in between. Node targets also get a persistent
    `NODE_COMPILE_CACHE` (Node 22+), which cuts repeat CLI startup by ~20%.
    `QX_NODE_CACHE=off` disables it.
+   A quoted argument does not force a shell: `qx -c 'grep -n "fn main" src'` is
+   tokenized here (double quotes grouped and stripped, exactly what both cmd and
+   Git Bash do to them) and still runs in-process. Single quotes, `$ % ! ^ * ?`,
+   operators, or an escape keep the shell.
    Python startup is mostly `.pth` hooks. By default qx-launched Python skips
    `pip_system_certs` (which imports all of pip to inject system certs) and
    pynvml's warning-only finder, and keeps system-cert injection through a lazy
@@ -152,7 +168,9 @@ the command itself.
    cancel are answered even when every slot is busy. `args` must be an array of strings (anything else is an error,
    not a different command) and `timeout_ms` is clamped to 1 s-1 h.
 7. **Diagnostics** - `qx doctor` measures process-creation latency and names the
-   antivirus products fighting over every spawn.
+   antivirus products fighting over every spawn. `QX_TRACE=1` prints the phase
+   timings of a run (spawn, wait, kill window, taskkill, reap) to stderr, so
+   "why did that take a second" has an answer instead of a guess.
 8. **Bounded, clean execution** - captured output is capped at 16 MiB per stream,
    timeouts terminate the whole process tree (also for `--timeout` on a live
    stream), a Windows job object kills that tree if qx itself dies, a piped CLI
@@ -274,12 +292,11 @@ qx gain                                 # savings report
 
 Flags: `--max-lines`, `--head`, `--tail`, `--timeout SECS`, `--cwd DIR`,
 `--shell cmd|bash|powershell`, `--capture`. `auto` picks the shell that can parse
-the line: PowerShell for `$x = 1`, `[T]::Method()`, `try { }`, `& $exe`, `@'…'@`,
-` -eq `-style comparisons and `Verb-Noun` cmdlets (no profile, UTF-8 output, exit
-code preserved through `-EncodedCommand`); Git Bash when a pipeline or redirect
-runs a POSIX utility (`ls cat head tail wc grep find sed awk sort uniq xargs …`);
-otherwise cmd. A line that neither shell can start fails with a message naming
-the limit — 8 KiB for cmd, 12 KiB of script for PowerShell. PowerShell 5.1 has no
+the line: PowerShell for `$x = 1`, `[T]::Method()`, `try { }`, `& $exe`, `@'…'@`
+and `Verb-Noun` cmdlets (no profile, UTF-8 output, exit code preserved); Git Bash
+when a pipeline or redirect runs a POSIX utility (`ls cat head tail wc grep sed awk
+uniq xargs …`; not `find` or `sort`, which Windows has too); otherwise cmd. A cmd
+line over 8 KiB fails with a message naming the limit. PowerShell 5.1 has no
 `&&`/`||`, so those stay on cmd.
 
 Children never prompt: stdin is empty, PowerShell runs `-NonInteractive` (so

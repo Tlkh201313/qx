@@ -104,10 +104,18 @@ pub fn find_on_path(name: &str) -> Option<PathBuf> {
 }
 
 /// The coreutils Git for Windows ships in `usr\bin`. A built-in that declines its
-/// arguments (e.g. `wc` with two files) then still has somewhere to go.
+/// arguments (e.g. `wc` with two files) then still has somewhere to go, and a POSIX
+/// line qx routed to cmd (`grep -rn x src`) runs instead of "command not found".
+/// Deliberately absent: names that would surprise from cmd - `kill`, `ln`, `mount`,
+/// `ps`, `ssh`, `bash`, editors.
 const COREUTILS: &[&str] = &[
-    "basename", "cat", "cp", "dirname", "echo", "false", "head", "ls", "mkdir", "mv", "pwd",
-    "realpath", "rm", "seq", "sleep", "tail", "touch", "true", "wc", "which",
+    "awk", "base64", "basename", "cat", "cksum", "cmp", "comm", "cp", "cut", "date", "diff",
+    "dirname", "du", "echo", "env", "expand", "expr", "false", "file", "find", "fmt", "fold",
+    "grep", "gzip", "head", "iconv", "join", "ls", "md5sum", "mkdir", "mktemp", "mv", "nl",
+    "nproc", "numfmt", "od", "paste", "patch", "printf", "pwd", "readlink", "realpath", "rm",
+    "rmdir", "sed", "seq", "sha1sum", "sha256sum", "shuf", "sleep", "sort", "split", "stat",
+    "sum", "tac", "tail", "tar", "tee", "test", "timeout", "touch", "tr", "true", "truncate",
+    "uname", "unexpand", "uniq", "unlink", "unzip", "wc", "which", "xargs", "xxd", "yes",
 ];
 
 /// Like `resolve`, but a fixed list of extra directories is searched first and is never

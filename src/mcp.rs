@@ -1,4 +1,4 @@
-//! MCP (stdio) server exposing `run` (commands) and `fs` (filesystem).
+﻿//! MCP (stdio) server exposing `run` (commands) and `fs` (filesystem).
 //!
 //! Tool names, fallback pointers and output shape come from `client`, so the same
 //! server speaks correctly to dsh, Claude Code, Codex, OpenCode, Hermes and pi.
@@ -405,7 +405,7 @@ fn run_schema() -> Value {
     let mut schema = json!({
         "name": "run",
         "description": format!(
-            "Run a local command fast. Prefer `program` + `args` (direct exec, no shell); a PowerShell cmdlet (`Get-ChildItem`) or a `.ps1` path also works as `program`. A single `command` runs without a shell; otherwise `shell` decides: auto = PowerShell for cmdlet/variable syntax, Git Bash when a pipeline runs a POSIX utility (ls, cat, head, grep, find, wc…), else cmd. Children never prompt: stdin is empty, PowerShell runs -NonInteractive, git gets GIT_EDITOR=true and GIT_TERMINAL_PROMPT=0. In-process built-ins: pwd, echo, ls, cat, head, tail, wc, mkdir, rm, cp, mv, touch, which, basename, dirname, realpath, whoami, hostname, seq, sleep. Output is compacted, preserves errors from the middle, and redacts secrets. On failure, fall back to the native {} for sandbox escalation, background jobs, or PTY work.",
+            "Run a local command fast. Prefer `program` + `args` (direct exec, no shell); a PowerShell cmdlet (`Get-ChildItem`) or a `.ps1` path also works as `program`. A single `command` runs without a shell; otherwise `shell` decides: auto = PowerShell for cmdlet/variable syntax, Git Bash when a pipeline runs a POSIX utility (ls, cat, head, grep, wcâ€¦), else cmd. Children never prompt: stdin is empty, PowerShell runs -NonInteractive, git gets GIT_EDITOR=true and GIT_TERMINAL_PROMPT=0. In-process built-ins: pwd, echo, ls, cat, head, tail, wc, grep, mkdir, rm, cp, mv, touch, which, basename, dirname, realpath, whoami, hostname, seq, sleep. Output is compacted, preserves errors from the middle, and redacts secrets. On failure, fall back to the native {} for sandbox escalation, background jobs, or PTY work.",
             c.native(Native::Shell)
         ),
         "inputSchema": {
@@ -416,7 +416,7 @@ fn run_schema() -> Value {
                 "command": { "type": "string", "description": "Full shell command line for pipes/redirects/chaining." },
                 "shell": { "type": "string", "enum": ["auto", "cmd", "bash", "powershell"], "default": "auto", "description": "auto picks PowerShell for cmdlet/variable syntax, Git Bash when a pipeline runs a POSIX utility, else cmd. PowerShell runs -NoProfile -NonInteractive." },
                 "cwd": { "type": "string", "description": "Working directory." },
-                "timeout_ms": { "type": "integer", "default": 120000 },
+                "timeout_ms": { "type": "integer", "default": 120000, "minimum": 1000, "description": "Kill the tree after this long (clamped to 1000..3600000); the reply carries exit_code 124 and timed_out true." },
                 "mode": { "type": "string", "enum": ["compact", "full"], "default": "compact" }
             }
         },
@@ -1146,32 +1146,41 @@ mod tests {
         }
     }
 
-    /// A line source that answers everything at once and only reports EOF once the call it
-    /// carries has really started, so "running" and "queued" are not a race of thread startup.
-    struct SlowEof(std::io::Cursor<Vec<u8>>, bool);
+    /// A line source that answers everything at once and only reports EOF once a call has really
+    /// taken the worker slot. Which of the two calls wins that slot is a thread-startup race, so
+    /// the winner's id is recorded for the test instead of being assumed.
+    struct SlowEof(std::io::Cursor<Vec<u8>>, Arc<std::sync::Mutex<Option<String>>>);
 
     impl SlowEof {
-        fn new(text: &str) -> Self {
-            SlowEof(std::io::Cursor::new(text.as_bytes().to_vec()), false)
+        fn new(text: &str) -> (Self, Arc<std::sync::Mutex<Option<String>>>) {
+            let slot = Arc::new(std::sync::Mutex::new(None));
+            (SlowEof(std::io::Cursor::new(text.as_bytes().to_vec()), slot.clone()), slot)
         }
         fn wait_for_the_running_call(&mut self) {
-            if self.1 {
+            if self.1.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
                 return;
             }
-            self.1 = true;
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
             while std::time::Instant::now() < deadline {
                 let started = INFLIGHT
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .iter()
-                    .any(|(k, _)| k == "11");
-                if started {
+                    .map(|(k, _)| k.clone())
+                    .find(|k| k == "11" || k == "12");
+                if let Some(k) = started {
+                    *self.1.lock().unwrap_or_else(|e| e.into_inner()) = Some(k);
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
-            panic!("the running call never registered itself for cancellation");
+            let keys: Vec<String> = INFLIGHT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|(k, _)| k.clone())
+                .collect();
+            panic!("no call registered itself for cancellation; inflight={keys:?}");
         }
     }
 
@@ -1320,13 +1329,17 @@ mod tests {
             "\n",
         );
         let sink = Sink::default();
+        let (src, started) = SlowEof::new(input);
         let t = std::time::Instant::now();
-        let code = serve_io(SlowEof::new(input), sink.clone(), limits);
+        let code = serve_io(src, sink.clone(), limits);
         assert!(t.elapsed() < Duration::from_secs(6), "shutdown took {:?}", t.elapsed());
         assert_eq!(code, 0);
-        let running = sink.reply(11).expect("the running call answers");
+        // The call that took the only slot is killed; the one still queued never starts.
+        let running_id = started.lock().unwrap_or_else(|e| e.into_inner()).clone().expect("a call took the slot");
+        let queued_id = if running_id == "11" { 12 } else { 11 };
+        let running = sink.reply(running_id.parse::<u64>().unwrap()).expect("the running call answers");
         assert_eq!(running.pointer("/result/structuredContent/timed_out"), Some(&json!(true)));
-        let queued = sink.reply(12).expect("the queued call answers");
+        let queued = sink.reply(queued_id).expect("the queued call answers");
         assert_eq!(queued.pointer("/result/isError"), Some(&json!(true)));
         let text = queued.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
         assert!(text.contains("qx is shutting down"), "queued call text: {text}");

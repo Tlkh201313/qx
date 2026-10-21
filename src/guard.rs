@@ -163,8 +163,13 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
 
     // No agent can answer a UAC prompt: elevation either hangs or pops a dialog on the
     // user's desktop. The human can still run the command themselves.
-    if elevates(&name, &joined) {
+    if elevates(&name, args) {
         d.deny("requesting elevation (UAC); run it as the current user instead");
+    }
+
+    // Judged per program, not per line: a cmdlet can also arrive as `program` + `args`.
+    if name == "invoke-expression" || name == "iex" || name.starts_with("iex(") {
+        d.deny("Invoke-Expression executes arbitrary code");
     }
 
     // `env`, `xargs`, `timeout`, `nohup`, `sudo`, `wsl`, `command` are transparent wrappers: judge the
@@ -445,12 +450,17 @@ fn uploads_secret(name: &str, args: &[String]) -> bool {
     })
 }
 
-/// Programs and switches that raise a Windows UAC prompt.
-fn elevates(name: &str, joined: &str) -> bool {
+/// Programs and switches that raise a Windows UAC prompt. `-Verb RunAs` as two words counts
+/// anywhere, so a script block (`ForEach-Object { Start-Process x -Verb RunAs }`) is caught
+/// and a quoted mention (`git commit -m "… -Verb RunAs"`) is not.
+fn elevates(name: &str, args: &[String]) -> bool {
     if matches!(name, "runas" | "gsudo" | "elevate") {
         return true;
     }
-    matches!(name, "start-process" | "saps") && joined.to_ascii_lowercase().contains("runas")
+    if matches!(name, "start-process" | "saps") && args.iter().any(|a| a.to_ascii_lowercase().contains("runas")) {
+        return true;
+    }
+    args.windows(2).any(|w| w[0].eq_ignore_ascii_case("-verb") && w[1].eq_ignore_ascii_case("runas"))
 }
 
 pub fn check_shell_mode(m: Mode, command: &str, cwd: Option<&Path>) -> Decision {
@@ -527,12 +537,6 @@ fn judge_line(m: Mode, command: &str, cwd: Option<&Path>, sq: bool) -> Decision 
 
     check_redirection(command, cwd, &mut d);
 
-    // The elevation switch may sit inside `powershell -Command "…"`, which the segment
-    // parser sees as one opaque argument.
-    if command.to_ascii_lowercase().contains("-verb runas") {
-        d.deny("requesting elevation (UAC); run it as the current user instead");
-    }
-
     let mut segments: Vec<(Vec<String>, bool)> = Vec::new();
     for (s, piped) in split_segments(command, sq) {
         // `try { A } catch { B }`, `if x (A) else (B)`: braces, and the parentheses of a cmd body,
@@ -583,9 +587,6 @@ fn judge_line(m: Mode, command: &str, cwd: Option<&Path>, sq: bool) -> Decision 
         let name = base_name(&prog);
         if prog == TOO_DEEP {
             d.deny("launchers nested too deeply to judge safely");
-        }
-        if name == "invoke-expression" || name == "iex" || name.starts_with("iex(") {
-            d.deny("Invoke-Expression executes arbitrary code");
         }
         if download && reads_code(&name) && reads_stdin(&name, &args) {
             d.deny("piping a download into an interpreter");
@@ -1967,11 +1968,19 @@ mod tests {
         for line in [
             "powershell -Command \"Start-Process powershell -Verb RunAs\"",
             "Start-Process -Verb RunAs cmd",
+            "1..3 | ForEach-Object { Start-Process powershell -Verb RunAs }",
         ] {
             assert!(!check_shell_mode(Mode::Safe, line, None).allowed(), "{line}");
         }
-        // Starting a normal process is not elevation.
+        // Starting a normal process is not elevation, and neither is a message about it.
         assert!(run("start-process", "notepad.exe").allowed());
+        assert!(check_shell_mode(Mode::Safe, r#"git commit -m "guard: deny Start-Process -Verb RunAs""#, None).allowed());
+    }
+
+    #[test]
+    fn invoke_expression_is_denied_as_program_too() {
+        let payload = vec!["Remove-Item -Recurse -Force $env:USERPROFILE".to_string()];
+        assert!(!check_mode(Mode::Safe, "Invoke-Expression", &payload, None).allowed());
     }
 
     #[cfg(windows)]
