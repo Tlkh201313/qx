@@ -878,14 +878,27 @@ fn write(root: &Root, args: &Value) -> Result<Reply, FsError> {
     let (path, existed) = root.resolve_for_write(raw).map_err(|e| e.fb("write"))?;
     root.check_mutable(&path).map_err(|e| e.fb("write"))?;
 
+    let mut written = std::borrow::Cow::Borrowed(content);
     if existed {
-        let (_, current) = read_file(&path, "write")?;
+        let (before, current) = read_file(&path, "write")?;
         check_observed(&root.cwd, &path, current, &root.display(&path))
             .map_err(|e| e.fb("write"))?;
-        atomic_replace(&path, content.as_bytes(), current).map_err(|e| e.fb("write"))?;
+        // `read` showed lossy, LF-only text: writing it back must not re-encode or flatten the file.
+        match carry_over_encoding(&before, content) {
+            Ok(text) => written = std::borrow::Cow::Owned(text),
+            Err(()) => {
+                return Err(FsError::new(
+                    "FS_ENCODING",
+                    format!("\"{raw}\" is not valid UTF-8 (UTF-16 or a legacy code page); qx write would corrupt it"),
+                )
+                .fb("write"));
+            }
+        }
+        atomic_replace(&path, written.as_bytes(), current).map_err(|e| e.fb("write"))?;
     } else {
         create_noreplace(&path, content.as_bytes()).map_err(|e| e.fb("write"))?;
     }
+    let content = written.as_ref();
     let version = version_after(&path, content.as_bytes()).map_err(|e| e.fb("write"))?;
     remember(&root.cwd, &path, version);
     let display = root.display(&path);
@@ -988,14 +1001,46 @@ fn edit(root: &Root, args: &Value) -> Result<Reply, FsError> {
     })
 }
 
+/// The model sees LF-only text (`read` strips the CRs), so `old` and `new` arrive with LF. Try `old`
+/// verbatim first (it may sit in the LF part of a mixed file); only when it is absent, spell it in the
+/// file's other ending. `new` then takes the ending of the text it replaces, whether or not `old` itself
+/// held a line break.
 fn match_line_endings(text: &str, old: &str, new: &str) -> (String, String) {
-    if text.contains("\r\n") && old.contains('\n') && !old.contains("\r\n") {
-        (old.replace('\n', "\r\n"), new.replace('\n', "\r\n"))
-    } else if !text.contains("\r\n") && old.contains("\r\n") {
-        (old.replace("\r\n", "\n"), new.replace("\r\n", "\n"))
-    } else {
-        (old.to_string(), new.to_string())
+    let crlf = text.matches("\r\n").count();
+    let lf_only = text.matches('\n').count().saturating_sub(crlf);
+    let mut old = old.to_string();
+    if !text.contains(&old) {
+        if crlf > 0 && old.contains('\n') && !old.contains("\r\n") {
+            old = old.replace('\n', "\r\n");
+        } else if crlf == 0 && old.contains("\r\n") {
+            old = old.replace("\r\n", "\n");
+        }
     }
+    let new = if old.contains("\r\n") || (crlf > lf_only && !old.contains('\n')) {
+        new.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else if crlf == 0 {
+        new.replace("\r\n", "\n")
+    } else {
+        new.to_string()
+    };
+    (old, new)
+}
+
+/// What `write` must keep of the file it replaces: the model read LF-only text without the BOM.
+fn carry_over_encoding(before: &[u8], content: &str) -> Result<String, ()> {
+    let Ok(old) = std::str::from_utf8(before) else {
+        return Err(()); // UTF-16 or a legacy code page: rewriting it as UTF-8 would corrupt it
+    };
+    let crlf = old.matches("\r\n").count();
+    let lf_only = old.matches('\n').count().saturating_sub(crlf);
+    let mut out = content.to_string();
+    if crlf > lf_only && !out.contains('\r') {
+        out = out.replace('\n', "\r\n");
+    }
+    if old.starts_with('\u{feff}') && !out.starts_with('\u{feff}') {
+        out.insert(0, '\u{feff}');
+    }
+    Ok(out)
 }
 
 // --------------------------------------------------------------------- glob
@@ -1706,17 +1751,20 @@ fn glob_general(pattern: &str, text: &str, ignore_case: bool) -> bool {
 }
 
 /// Allocation-free answer for the shapes that cover nearly every real pattern: `LIT`, `*LIT`, `**/LIT` and
-/// `**/*LIT`, where LIT has no glob character. `**/` may start at any offset (so `**/name` also matches
-/// `xname`, as `glob_go` does) and `*` cannot cross '/'. `None` means "use the general matcher".
+/// `**/*LIT`, where LIT has no glob character. `**/LIT` needs LIT to start a path segment, while the `*`
+/// of `**/*LIT` may start inside a name; `*` cannot cross '/'. `None` means "use the general matcher".
 fn glob_fast(pattern: &str, text: &str, ignore_case: bool) -> Option<bool> {
     let plain = |s: &str| !s.contains(['*', '?', '[', '\\']);
-    let (lit, anywhere, star) = if let Some(rest) = pattern.strip_prefix("**/") {
-        let lit = rest.strip_prefix('*').unwrap_or(rest);
-        (lit, true, false)
+    // (literal, `**/` prefix, `*` prefix, literal must start a path segment)
+    let (lit, anywhere, star, segment) = if let Some(rest) = pattern.strip_prefix("**/") {
+        match rest.strip_prefix('*') {
+            Some(lit) => (lit, true, false, false),
+            None => (rest, true, false, true),
+        }
     } else if let Some(lit) = pattern.strip_prefix('*') {
-        (lit, false, true)
+        (lit, false, true, false)
     } else {
-        (pattern, false, false)
+        (pattern, false, false, false)
     };
     if !plain(lit) {
         return None;
@@ -1724,7 +1772,9 @@ fn glob_fast(pattern: &str, text: &str, ignore_case: bool) -> Option<bool> {
     let (t, l) = (text.as_bytes(), lit.as_bytes());
     let eq = |a: &[u8]| if ignore_case { a.eq_ignore_ascii_case(l) } else { a == l };
     Some(if anywhere {
-        t.len() >= l.len() && eq(&t[t.len() - l.len()..])
+        t.len() >= l.len()
+            && eq(&t[t.len() - l.len()..])
+            && (!segment || t.len() == l.len() || t[t.len() - l.len() - 1] == b'/')
     } else if star {
         t.len() >= l.len() && eq(&t[t.len() - l.len()..]) && !t[..t.len() - l.len()].contains(&b'/')
     } else {
@@ -1751,7 +1801,10 @@ fn glob_go(
                 if i + 1 < p.len() && p[i + 1] == '*' {
                     let j = i + 2;
                     if j < p.len() && p[j] == '/' {
-                        glob_go(p, j + 1, t, k, memo) || (k < t.len() && glob_go(p, i, t, k + 1, memo))
+                        // `**/` swallows whole directories: what follows starts a path segment.
+                        let at_segment = k == 0 || t[k - 1] == '/';
+                        (at_segment && glob_go(p, j + 1, t, k, memo))
+                            || (k < t.len() && glob_go(p, i, t, k + 1, memo))
                     } else {
                         glob_go(p, j, t, k, memo) || (k < t.len() && glob_go(p, i, t, k + 1, memo))
                     }
@@ -2040,6 +2093,70 @@ mod tests {
         assert!(!r.is_error, "{}", r.text);
         assert_eq!(r.structured["skipped_binary"], 1);
         assert!(r.text.contains("a.txt:1: needle"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn double_star_slash_starts_at_a_path_segment() {
+        // `**/name` is "name in any directory", not "anything that ends in name".
+        assert!(!glob_match("**/name", "xname", false));
+        assert!(!glob_match("**/index.js", "a/reindex.js", false));
+        assert!(!glob_match("src/**/mod.rs", "src/a/submod.rs", false));
+        assert!(glob_match("**/name", "name", false) && glob_match("**/name", "a/b/name", false));
+        assert!(glob_match("src/**/mod.rs", "src/mod.rs", false) && glob_match("src/**/mod.rs", "src/a/b/mod.rs", false));
+        // a star after the slash may still start inside a name
+        assert!(glob_match("**/*.rs", "xb.rs", false) && glob_match("**/*.rs", "a/xb.rs", false));
+    }
+
+    #[test]
+    fn write_refuses_files_it_would_corrupt_and_keeps_bom_and_line_endings() {
+        let dir = tmp("write-encoding");
+        let latin1: &[u8] = b"caf\xe9\nx\n";
+        let utf16: &[u8] = b"\xff\xfeh\0i\0\n\0x\0\n\0";
+        for (name, bytes) in [("l1.txt", latin1), ("u16.txt", utf16)] {
+            fs::write(dir.join(name), bytes).unwrap();
+            assert!(!invoke(&dir, "read", json!({"path":name})).is_error);
+            let r = invoke(&dir, "write", json!({"path":name,"content":"replacement\n"}));
+            assert!(r.is_error, "{name}: {}", r.text);
+            assert_eq!(r.structured["code"], "FS_ENCODING", "{name}");
+            assert_eq!(fs::read(dir.join(name)).unwrap(), bytes, "{name} was rewritten");
+        }
+        // The model never saw the CRs or the BOM; the file must not lose them.
+        for (name, before, content, after) in [
+            ("crlf.txt", &b"a\r\nb\r\n"[..], "a\nb\nc\n", &b"a\r\nb\r\nc\r\n"[..]),
+            ("bom.txt", &b"\xef\xbb\xbfhello\n"[..], "hi\n", &b"\xef\xbb\xbfhi\n"[..]),
+            ("bomkept.txt", &b"\xef\xbb\xbfhello\n"[..], "\u{feff}hi\n", &b"\xef\xbb\xbfhi\n"[..]),
+            ("lf.txt", &b"a\nb\n"[..], "a\nc\n", &b"a\nc\n"[..]),
+        ] {
+            fs::write(dir.join(name), before).unwrap();
+            assert!(!invoke(&dir, "read", json!({"path":name})).is_error);
+            let r = invoke(&dir, "write", json!({"path":name,"content":content}));
+            assert!(!r.is_error, "{name}: {}", r.text);
+            assert_eq!(fs::read(dir.join(name)).unwrap(), after, "{name}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_keeps_crlf_for_multiline_new_text_and_matches_mixed_files() {
+        let dir = tmp("edit-crlf");
+        fs::write(dir.join("a.txt"), "a\r\nfoo();\r\nb\r\n").unwrap();
+        assert!(!invoke(&dir, "read", json!({"path":"a.txt"})).is_error);
+        let r = invoke(&dir, "edit", json!({"path":"a.txt","old_string":"foo();","new_string":"foo();\nbar();"}));
+        assert!(!r.is_error, "{}", r.text);
+        assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"a\r\nfoo();\r\nbar();\r\nb\r\n");
+        // a multi-line match inside the LF part of a file that also has CRLF
+        fs::write(dir.join("m.txt"), "x\r\ny\nz\nw\n").unwrap();
+        assert!(!invoke(&dir, "read", json!({"path":"m.txt"})).is_error);
+        let r = invoke(&dir, "edit", json!({"path":"m.txt","old_string":"y\nz","new_string":"y\nq"}));
+        assert!(!r.is_error, "{}", r.text);
+        assert_eq!(fs::read(dir.join("m.txt")).unwrap(), b"x\r\ny\nq\nw\n");
+        // the old behaviour stays: an LF old_string finds CRLF text
+        fs::write(dir.join("c.txt"), "p\r\nq\r\n").unwrap();
+        assert!(!invoke(&dir, "read", json!({"path":"c.txt"})).is_error);
+        let r = invoke(&dir, "edit", json!({"path":"c.txt","old_string":"p\nq","new_string":"p\nr"}));
+        assert!(!r.is_error, "{}", r.text);
+        assert_eq!(fs::read(dir.join("c.txt")).unwrap(), b"p\r\nr\r\n");
         let _ = fs::remove_dir_all(&dir);
     }
 
