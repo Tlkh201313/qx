@@ -1,4 +1,4 @@
-﻿//! MCP (stdio) server exposing `run` (commands) and `fs` (filesystem).
+//! MCP (stdio) server exposing `run` (commands) and `fs` (filesystem).
 //!
 //! Tool names, fallback pointers and output shape come from `client`, so the same
 //! server speaks correctly to dsh, Claude Code, Codex, OpenCode, Hermes and pi.
@@ -572,7 +572,8 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
         }
         Some(_) => return tool_text(id, "`args` must be an array of strings", true),
     };
-    let cwd = cwd_text.map(std::path::PathBuf::from);
+    // Absolute from here on: the guard, the built-ins and the child all mean the same directory.
+    let cwd = cwd_text.map(|t| std::path::absolute(t).unwrap_or_else(|_| t.into()));
     // A bad cwd must fail loudly: built-ins would otherwise run against the wrong place.
     if let Some(d) = cwd.as_ref().filter(|d| !d.is_dir()) {
         return tool_text(id, &format!("cwd is not a directory: {}", d.display()), true);
@@ -1266,9 +1267,9 @@ mod tests {
             .pointer("/result/structuredContent/stderr")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        // A sandbox that denies msys its named objects (NtCreateDirectoryObject) cannot run
+        // A sandbox that denies msys its named objects, signal pipe or file mapping cannot run
         // this at all; that is the environment refusing, not the fallback being wrong.
-        if stderr.contains("fatal error") && stderr.contains("NtCreateDirectoryObject") {
+        if stderr.contains("fatal error") && stderr.to_ascii_lowercase().contains("usr\\bin\\wc.exe") {
             println!("skip: this process cannot run msys binaries (named-object access denied)");
             let _ = std::fs::remove_dir_all(&d);
             return;

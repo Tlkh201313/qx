@@ -91,6 +91,25 @@ const MAX_WORK: usize = 2_000;
 thread_local! {
     static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_WORK) };
+    /// The directory the top-level call runs in. A `cd` later in the line moves the shell, not the
+    /// workspace: deleting this directory or a parent of it stays refused wherever the shell went.
+    static ORIGIN: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The call's directory as an absolute, cleaned path. A relative `cwd` (a client sending ".") is
+/// relative to qx's own directory; joined onto nothing, `..\..\Windows` would collapse to `Windows`.
+fn abs_cwd(cwd: Option<&Path>) -> Option<PathBuf> {
+    let here = std::env::current_dir().ok();
+    let c = match cwd {
+        Some(c) if c.is_absolute() => c.to_path_buf(),
+        Some(c) => here?.join(c),
+        None => here?,
+    };
+    Some(clean(&c))
+}
+
+fn origin() -> Option<PathBuf> {
+    ORIGIN.with(|o| o.borrow().clone())
 }
 
 /// Pay for one reading of a line; false once the top-level check has used its budget.
@@ -109,13 +128,15 @@ fn spend() -> bool {
 struct Depth;
 
 impl Depth {
-    fn enter() -> Option<Depth> {
+    fn enter(cwd: Option<&Path>) -> Option<Depth> {
         DEPTH.with(|d| {
             if d.get() >= MAX_DEPTH {
                 None
             } else {
                 if d.get() == 0 {
-                    BUDGET.with(|b| b.set(MAX_WORK)); // a new top-level check
+                    // a new top-level check
+                    BUDGET.with(|b| b.set(MAX_WORK));
+                    ORIGIN.with(|o| *o.borrow_mut() = abs_cwd(cwd));
                 }
                 d.set(d.get() + 1);
                 Some(Depth)
@@ -141,13 +162,13 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
     if m == Mode::Off {
         return d;
     }
-    let Some(_level) = Depth::enter() else {
+    let Some(_level) = Depth::enter(cwd) else {
         return finalize(m, too_deep());
     };
 
     // Without a cwd, `.` and `..` still mean this process's directory.
-    let cur = if cwd.is_none() { std::env::current_dir().ok() } else { None };
-    let cwd = cwd.or(cur.as_deref());
+    let base = abs_cwd(cwd);
+    let cwd = base.as_deref();
 
     let name = base_name(program);
     let joined = args.join(" ");
@@ -467,7 +488,7 @@ pub fn check_shell_mode(m: Mode, command: &str, cwd: Option<&Path>) -> Decision 
     if m == Mode::Off {
         return Decision::allow();
     }
-    let Some(_level) = Depth::enter() else {
+    let Some(_level) = Depth::enter(cwd) else {
         return finalize(m, too_deep());
     };
     let mut d = judge_line(m, command, cwd, true);
@@ -532,8 +553,8 @@ fn judge_line(m: Mode, command: &str, cwd: Option<&Path>, sq: bool) -> Decision 
         d.deny("too complex to judge safely");
         return d;
     }
-    let cur = if cwd.is_none() { std::env::current_dir().ok() } else { None };
-    let cwd = cwd.or(cur.as_deref());
+    let base = abs_cwd(cwd);
+    let cwd = base.as_deref();
 
     check_redirection(command, cwd, &mut d);
 
@@ -1461,8 +1482,12 @@ fn destructive(name: &str, args: &[String], cwd: Option<&Path>, d: &mut Decision
         if raw.contains('*') || raw.contains('?') {
             let at_root = raw == "/*" || raw == "\\*" || path.parent().is_some_and(|p| is_drive_root(&p.to_string_lossy()));
             // `~/*` and `../*` empty a protected directory; `*.log` or `./*` in the cwd is ordinary cleanup.
+            // `cd .. && rm -rf *` empties a parent of the workspace, even though it is "the current directory" by then.
             let empties_protected = path.file_name().is_some_and(|n| n == "*")
-                && path.parent().and_then(|p| protected(p, cwd)).is_some_and(|r| r != "the current directory");
+                && path.parent().is_some_and(|p| {
+                    let p_holds_origin = origin().is_some_and(|o| norm(&o).starts_with(&(norm(p) + "\\")));
+                    p_holds_origin || protected(p, cwd).is_some_and(|r| r != "the current directory")
+                });
             if at_root || empties_protected || protected(&path, cwd).is_some() {
                 d.deny(format!("wildcard deletion in a protected location: {}", path.display()));
             } else {
@@ -1567,12 +1592,25 @@ fn protected(path: &Path, cwd: Option<&Path>) -> Option<&'static str> {
             return Some("a parent of the home directory");
         }
     }
+    let parent_of = |inner: &str| inner.starts_with(&(s.clone() + "\\")) || inner.starts_with(&(s.clone() + "/"));
     if let Some(c) = cwd {
-        let cs = norm(c);
-        if s == cs {
+        if s == norm(c) {
             return Some("the current directory");
         }
-        if cs.starts_with(&(s.clone() + "\\")) || cs.starts_with(&(s.clone() + "/")) {
+    }
+    // After `cd ..` the shell is elsewhere, but the call's own directory is still the workspace.
+    // (A caller that passes no cwd, like `find`'s starting points, opts out of workspace rules.)
+    if let Some(o) = origin().filter(|_| cwd.is_some()) {
+        let os = norm(&o);
+        if s == os {
+            return Some("the call's working directory");
+        }
+        if parent_of(&os) {
+            return Some("a parent of the call's working directory");
+        }
+    }
+    if let Some(c) = cwd {
+        if parent_of(&norm(c)) {
             return Some("a parent of the current directory");
         }
     }
@@ -2610,6 +2648,33 @@ mod tests {
         assert!(!check_shell_mode(Mode::Safe, &nested, None).allowed());
         // Ordinary depth is fine.
         assert!(!denied("env env ls"));
+    }
+
+    #[test]
+    fn a_cd_does_not_move_the_protection_off_the_workspace() {
+        // cwd C:\work\proj: after `cd ..`, deleting the project by name is deleting the workspace.
+        for bad in [
+            "cd .. && rm -rf proj",
+            "cd .. && rm -rf *",
+            "pushd .. & rd /s /q proj",
+            "Set-Location ..; Remove-Item -Recurse -Force proj",
+            r"cd C:\ && rmdir /s /q work",
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        for ok in ["cd sub && rm -rf build", "cd .. && rm -rf proj-old"] {
+            assert!(!denied(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn a_relative_cwd_is_relative_to_qx_not_to_nothing() {
+        // `cwd: "."` from a client must not turn `..\..\..\Windows` into a harmless relative `Windows`.
+        let line = format!(r"rd /s /q {}Windows", r"..\".repeat(16));
+        let with_dot = check_shell_mode(Mode::Safe, &line, Some(Path::new(".")));
+        assert!(!with_dot.allowed(), "{}", with_dot.summary());
+        let rm = check_mode(Mode::Safe, "rm", &c(&["-rf", &format!("{}Windows", "../".repeat(16))]), Some(Path::new(".")));
+        assert!(!rm.allowed(), "{}", rm.summary());
     }
 
     #[test]

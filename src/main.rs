@@ -146,7 +146,7 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
             }
             "--cwd" => {
                 i += 1;
-                o.cwd = args.get(i).map(PathBuf::from);
+                o.cwd = args.get(i).map(|t| std::path::absolute(t).unwrap_or_else(|_| PathBuf::from(t)));
                 i += 1;
             }
             "--shell" => {

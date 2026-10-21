@@ -1644,6 +1644,37 @@ fn cmd_cp(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     })
 }
 
+/// The copy half of a move across volumes (the caller deletes the source afterwards), with GNU mv's
+/// rules: a non-empty target directory is refused, an empty one is replaced, a directory never
+/// replaces a file nor a file a directory. The copy goes to a sibling first and is renamed into place
+/// only once complete, so a failure (a locked file, a full disk) never leaves a half tree behind.
+fn move_across(src: &Path, target: &Path) -> std::io::Result<()> {
+    let refuse = |why: &str| Err(std::io::Error::other(why.to_string()));
+    let src_dir = fs::symlink_metadata(src)?.is_dir();
+    if src_dir && has_dir_link(src, 0) {
+        return refuse("the tree holds a directory link; use the real mv");
+    }
+    if let Ok(md) = fs::symlink_metadata(target) {
+        match (src_dir, md.is_dir()) {
+            (true, true) if fs::read_dir(target)?.next().is_some() => return refuse("target directory is not empty"),
+            (true, true) => fs::remove_dir(target)?,
+            (true, false) => return refuse("cannot overwrite a non-directory with a directory"),
+            (false, true) => return refuse("cannot overwrite a directory with a non-directory"),
+            (false, false) => {}
+        }
+    }
+    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let temp = target.with_file_name(format!(".{name}.qx-mv-{}", std::process::id()));
+    let cleanup = |t: &Path| {
+        let _ = if src_dir { fs::remove_dir_all(t) } else { fs::remove_file(t) };
+    };
+    if let Err(e) = copy_rec(src, &temp, 0) {
+        cleanup(&temp);
+        return Err(e);
+    }
+    fs::rename(&temp, target).inspect_err(|_| cleanup(&temp))
+}
+
 fn cmd_mv(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut paths: Vec<&str> = Vec::new();
     for a in args {
@@ -1690,7 +1721,7 @@ fn cmd_mv(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                 code = 1;
                 continue;
             }
-            if let Err(e2) = copy_rec(&src, &target, 0) {
+            if let Err(e2) = move_across(&src, &target) {
                 err.push_str(&format!(
                     "mv: {} -> {}: {e}; {e2}\n",
                     src.display(),
@@ -2079,6 +2110,36 @@ mod tests {
         // the directory the call runs in, which is not the process cwd
         assert!(dangerous(&d, Some(&d)));
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_move_across_volumes_never_merges_into_or_half_fills_a_target() {
+        let root = tmp("mvacross");
+        let (src, dst) = (root.join("src"), root.join("dst"));
+        fs::create_dir_all(src.join("a")).unwrap();
+        fs::write(src.join("a").join("f.txt"), "new").unwrap();
+        // A non-empty target directory: GNU mv refuses; nothing may be overwritten.
+        fs::create_dir_all(dst.join("a")).unwrap();
+        fs::write(dst.join("a").join("f.txt"), "old").unwrap();
+        fs::write(dst.join("a").join("g.txt"), "keep").unwrap();
+        assert!(move_across(&src.join("a"), &dst.join("a")).is_err());
+        assert_eq!(fs::read_to_string(dst.join("a").join("f.txt")).unwrap(), "old");
+        assert!(fs::read_dir(&dst).unwrap().count() == 1, "no temp left behind");
+        // An empty target directory is replaced, as GNU mv does.
+        fs::remove_dir_all(dst.join("a")).unwrap();
+        fs::create_dir(dst.join("a")).unwrap();
+        move_across(&src.join("a"), &dst.join("a")).unwrap();
+        assert_eq!(fs::read_to_string(dst.join("a").join("f.txt")).unwrap(), "new");
+        // A directory never replaces a file, and a file never replaces a directory.
+        fs::write(dst.join("file"), "x").unwrap();
+        assert!(move_across(&src.join("a"), &dst.join("file")).is_err());
+        assert!(move_across(&src.join("a").join("f.txt"), &dst.join("a")).is_err());
+        // A file replaces a file.
+        fs::write(src.join("one.txt"), "1").unwrap();
+        move_across(&src.join("one.txt"), &dst.join("file")).unwrap();
+        assert_eq!(fs::read_to_string(dst.join("file")).unwrap(), "1");
+        assert!(fs::read_dir(&dst).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains("qx-mv")));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
