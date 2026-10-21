@@ -212,6 +212,9 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
         let run = run.to_string();
         // A quoted command with no shell syntax does not need a shell at all.
         if let Some((prog, sargs)) = exec::split_simple(&run) {
+            if std::env::var_os("QX_TRACE").is_some() {
+                eprintln!("[trace] split: {prog:?} {sargs:?}");
+            }
             if let Some(b) = builtin::try_exec(&prog, &sargs, o.cwd.as_deref(), &envs) {
                 return emit(b.into(), &o, &sh);
             }
@@ -665,7 +668,7 @@ SAFETY GATE
   QX_PS_PROFILE=1            keep the PowerShell profile (qx adds -NoProfile by default)
   QX_MCP_WORKERS=N           parallel MCP tool calls (default 4)
   QX_FS_THREADS=N            fs grep scan threads (default CPUs/2, max 8)
-  QX_TRACE=1                 print phase timings (spawn, wait, kill, reap) to stderr
+  QX_TRACE=1                 print phase timings and the -c split to stderr
 
 BUILT-INS (no process spawn)
   pwd echo true false sleep clear cls
@@ -673,7 +676,7 @@ BUILT-INS (no process spawn)
   mkdir rm del cp copy mv move touch
   which where basename dirname realpath
   whoami hostname seq
-  grep takes literal patterns, -i -n -l -r --include=*.ext; anything else runs the real grep.
+  grep takes literal patterns, -i -n -l -r -v -q -c -A/-B/-C -F -e PAT; else the real grep.
   head -c N / tail -c N read one byte window when it is text; binary runs the real tool.
   Unknown flags fall back to the real executable.
 

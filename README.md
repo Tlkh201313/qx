@@ -18,9 +18,10 @@ the command itself.
    cannot be killed by the call's timeout), `touch` on a read-only file, and
    `cp -r` over a tree holding a symlink or junction. `head -c N`/`tail -c N` read
    one byte window from the file instead of starting a tool.
-   `grep` answers `-i -n -l -r -F --include=*.ext` with literal patterns and hands
-   every other shape (regex metacharacters, `-c`, `-v`, stdin, binary or over-32 MiB
-   files, more than 20k files) to the real `grep`, so the line list is never guessed.
+   `grep` answers `-i -n -l -r -v -q -c -A/-B/-C -F -e PATTERN --include=*.ext` with
+   literal patterns and hands every other shape (regex metacharacters, stdin, binary
+   or over-32 MiB files, more than 20k files) to the real `grep`, so the line list is
+   never guessed.
    A recursive scan visits the whole tree the way GNU grep does, `.git` and
    `node_modules` included; `fs grep` is the call that skips them.
    `dir type del erase copy move` run through `cmd.exe` when no executable of that

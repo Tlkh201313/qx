@@ -930,17 +930,24 @@ const MAX_GREP_FILES: usize = 20_000;
 /// Stop before compaction would have to throw away the tail anyway.
 const GREP_OUT_CAP: usize = 8 * 1024 * 1024;
 
-/// `grep` for the shapes agents type: literal patterns with `-r`, `-n`, `-i`, `-l` and
-/// `--include=*.ext`. Everything else - a real regex, `-c`/`-v`/`-e`, stdin, context flags,
-/// an unreadable path, a binary or >32 MiB file - returns `None` so the real grep answers:
-/// a wrong line list costs more than the 50 ms process it saves.
+/// `grep` for the shapes agents type: literal patterns with `-r`, `-n`, `-i`, `-l`, `-v`,
+/// `-q`, `-c`, `-e`, `-A/-B/-C` and `--include=*.ext`. Everything else - a real regex, stdin,
+/// an unreadable path, a binary or >32 MiB file - returns `None` so the real grep
+/// answers: a wrong line list costs more than the 50 ms process it saves.
 fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut insensitive = false;
     let mut number = false;
     let mut list_only = false;
     let mut recursive = false;
     let mut fixed = false;
+    let mut invert = false;
+    let mut quiet = false;
+    let mut count_only = false;
+    let mut before = 0usize;
+    let mut after = 0usize;
+    let mut around = 0usize;
     let mut include: Option<String> = None;
+    let mut pattern: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -961,20 +968,70 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                     }
                     include = Some(v.to_string());
                 }
+                "regexp" => pattern = Some(val?.to_string()),
+                "invert-match" => invert = true,
+                "quiet" | "silent" => quiet = true,
+                "fixed-strings" => fixed = true,
+                "count" => count_only = true,
+                "after-context" => after = count_arg(val?)?,
+                "before-context" => before = count_arg(val?)?,
+                "context" => around = count_arg(val?)?,
+                "line-number" => number = true,
+                "files-with-matches" => list_only = true,
+                "recursive" => recursive = true,
                 // Colour is never emitted; buffering is not observable in captured output.
                 "color" | "colour" | "line-buffered" => {}
                 _ => return None,
             }
         } else if a.len() > 1 && a.starts_with('-') {
-            for ch in a[1..].chars() {
+            let body = &a[1..];
+            if body.chars().all(|c| c.is_ascii_digit()) {
+                // GNU's `-3` is `-C3`.
+                around = count_arg(body)?;
+                i += 1;
+                continue;
+            }
+            let mut chars = body.char_indices();
+            while let Some((pos, ch)) = chars.next() {
                 match ch {
                     'i' => insensitive = true,
                     'n' => number = true,
                     'l' => list_only = true,
                     'r' | 'R' => recursive = true,
                     'F' => fixed = true,
+                    'v' => invert = true,
+                    'q' => quiet = true,
+                    'c' => count_only = true,
                     // qx reports no per-file errors, so silence changes nothing.
                     's' => {}
+                    'e' => {
+                        // `-e pat`, `-epat` and `-ne pat` all name the pattern.
+                        let rest = &body[pos + ch.len_utf8()..];
+                        pattern = Some(if rest.is_empty() {
+                            i += 1;
+                            args.get(i)?.clone()
+                        } else {
+                            rest.to_string()
+                        });
+                        break;
+                    }
+                    'A' | 'B' | 'C' => {
+                        // `-A2`, `-A 2` and `-nA2` all count the same way.
+                        let rest = &body[pos + ch.len_utf8()..];
+                        let n = if rest.is_empty() {
+                            i += 1;
+                            args.get(i)?.clone()
+                        } else {
+                            rest.to_string()
+                        };
+                        let n = count_arg(&n)?;
+                        match ch {
+                            'A' => after = n,
+                            'B' => before = n,
+                            _ => around = n,
+                        }
+                        break;
+                    }
                     _ => return None,
                 }
             }
@@ -983,8 +1040,19 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         }
         i += 1;
     }
-    let pattern = args.get(i)?.as_str();
-    i += 1;
+    if (around > 0 || before > 0 || after > 0) && (count_only || list_only) {
+        // GNU answers these with a "context is ignored" warning; qx words warnings badly.
+        return None;
+    }
+    let pattern = match pattern {
+        Some(p) => p,
+        None => {
+            let p = args.get(i)?.clone();
+            i += 1;
+            p
+        }
+    };
+    let pattern = pattern.as_str();
     if pattern.is_empty() || pattern == "-" || (!fixed && needs_regex(pattern)) {
         return None;
     }
@@ -1063,9 +1131,14 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     } else {
         pattern.to_string()
     };
+    let (bctx, actx) = if around > 0 {
+        (around, around)
+    } else {
+        (before, after)
+    };
     let mut out = String::new();
     let mut hits = 0usize;
-    for (disp, path) in &files {
+    'files: for (disp, path) in &files {
         let bytes = fs::read(path).ok()?;
         if bytes.len() as u64 > READ_CAP {
             return None;
@@ -1075,28 +1148,82 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             return None;
         }
         let text = crate::exec::decode(&bytes);
-        for (idx, raw_line) in text.split('\n').enumerate() {
-            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-            let hit = if insensitive {
+        // `split_inclusive` keeps a trailing newline from inventing an empty last line, which
+        // `-v` would otherwise report.
+        let raw_lines: Vec<&str> = text.split_inclusive('\n').collect();
+        let mut is_sel = vec![false; raw_lines.len()];
+        let mut selected = Vec::new();
+        for (idx, raw) in raw_lines.iter().enumerate() {
+            let line = raw.strip_suffix('\n').unwrap_or(raw);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let found = if insensitive {
                 line.to_lowercase().contains(&needle)
             } else {
                 line.contains(&needle)
             };
-            if !hit {
-                continue;
+            if found != invert {
+                is_sel[idx] = true;
+                selected.push(idx);
             }
-            hits += 1;
-            if list_only {
-                out.push_str(disp);
-                out.push('\n');
-                break;
+        }
+        if selected.is_empty() {
+            // GNU counts every file it searched, zero included.
+            if count_only {
+                if multiple {
+                    out.push_str(disp);
+                    out.push(':');
+                }
+                out.push_str("0\n");
             }
+            continue;
+        }
+        hits += selected.len();
+        if quiet {
+            // `grep -q`: the exit code is the whole answer.
+            break 'files;
+        }
+        if list_only {
+            out.push_str(disp);
+            out.push('\n');
+            continue;
+        }
+        if count_only {
             if multiple {
                 out.push_str(disp);
                 out.push(':');
             }
+            let _ = writeln!(out, "{}", selected.len());
+            continue;
+        }
+        // `-A`/`-B`/`-C`: matches print with `:` separators, context lines with `-`, and `--`
+        // marks where the printed groups are not adjacent.
+        let mut show = vec![false; raw_lines.len()];
+        for &i in &selected {
+            let from = i.saturating_sub(bctx);
+            let to = (i + actx).min(raw_lines.len() - 1);
+            for s in &mut show[from..=to] {
+                *s = true;
+            }
+        }
+        let mut last: Option<usize> = None;
+        for (idx, raw) in raw_lines.iter().enumerate() {
+            if !show[idx] {
+                continue;
+            }
+            if bctx + actx > 0 && matches!(last, Some(p) if p + 1 != idx) {
+                out.push_str("--\n");
+            }
+            last = Some(idx);
+            let sep = if is_sel[idx] { ':' } else { '-' };
+            let line = raw.strip_suffix('\n').unwrap_or(raw);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if multiple {
+                out.push_str(disp);
+                out.push(sep);
+            }
             if number {
-                let _ = write!(out, "{}:", idx + 1);
+                let _ = write!(out, "{}", idx + 1);
+                out.push(sep);
             }
             out.push_str(line);
             out.push('\n');
@@ -1113,7 +1240,6 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         elapsed: Duration::ZERO,
     })
 }
-
 /// Characters that make the pattern a regex. A literal scan must never answer these.
 fn needs_regex(p: &str) -> bool {
     p.chars().any(|c| ".[]()*+?^${}|\\".contains(c))
@@ -2004,6 +2130,7 @@ mod tests {
         fs::create_dir_all(d.join("sub")).unwrap();
         fs::write(d.join("a.txt"), "alpha\nbeta\nalpha gamma\n").unwrap();
         fs::write(d.join("b.rs"), "let alpha = 1;\nlet gamma = 2;\n").unwrap();
+        fs::write(d.join("one.txt"), "x\n").unwrap();
         fs::write(d.join("sub/c.txt"), "alpha\nALPHA\n").unwrap();
 
         // No binary file yet: a binary match makes the built-in decline (GNU says
@@ -2018,6 +2145,26 @@ mod tests {
             vec!["-rln", "gamma", "."],
             vec!["-n", "nope", "a.txt"],
             vec!["-rn", "--include=*.rs", "alpha", "."],
+            // `-v` must not report the empty line a trailing newline would invent.
+            vec!["-vn", "alpha", "a.txt"],
+            vec!["-v", "x", "one.txt"],
+            vec!["-v", "gamma", "a.txt"],
+            vec!["-rlv", "alpha", "."],
+            vec!["--invert-match", "alpha", "a.txt"],
+            vec!["-q", "alpha", "a.txt"],
+            vec!["-q", "nope", "a.txt"],
+            vec!["-qv", "alpha", "a.txt"],
+            // `-c` prints a count for every searched file, zero included.
+            vec!["-c", "alpha", "a.txt"],
+            vec!["-c", "nope", "a.txt"],
+            vec!["-c", "alpha", "a.txt", "b.rs"],
+            vec!["-cv", "alpha", "a.txt"],
+            vec!["-rcn", "alpha", "."],
+            vec!["-cl", "alpha", "."],
+            vec!["-e", "alpha", "a.txt"],
+            vec!["-ealpha", "a.txt"],
+            vec!["-ne", "gamma", "a.txt"],
+            vec!["--regexp=beta", "a.txt"],
         ];
         for case in taken {
             let mine = run("grep", &case, &d).expect("built-in declined a shape it claims");
@@ -2033,13 +2180,33 @@ mod tests {
             assert_eq!(mine.code, code, "exit differs for {case:?} (grep said {why:?})");
         }
 
+        // Context output is ordered and carries `-`/`--` separators, so compare it byte for byte.
+        let ordered: Vec<Vec<&str>> = vec![
+            vec!["-A1", "alpha", "a.txt"],
+            vec!["-B1", "gamma", "a.txt"],
+            vec!["-A1", "-B1", "gamma", "a.txt"],
+            vec!["-1", "alpha", "a.txt"],
+            vec!["-0", "alpha", "a.txt"],
+            vec!["-A2n", "alpha", "a.txt"],
+            vec!["-A1", "alpha", "a.txt", "b.rs"],
+            vec!["-A1", "nope", "a.txt"],
+            vec!["-A1v", "alpha", "a.txt"],
+        ];
+        for case in ordered {
+            let mine = run("grep", &case, &d).expect("built-in declined a context shape it claims");
+            let Some((code, theirs, why)) = real_grep_run(grep, &case, &d) else {
+                let _ = fs::remove_dir_all(&d);
+                return;
+            };
+            assert_eq!(mine.stdout, theirs, "stdout differs for {case:?} (grep said {why:?})");
+            assert_eq!(mine.code, code, "exit differs for {case:?} (grep said {why:?})");
+        }
+
         // Shapes a literal in-process scan must never guess at.
         fs::write(d.join("bin.dat"), b"alpha\0binary").unwrap();
         let declined: Vec<Vec<&str>> = vec![
-            vec!["-c", "alpha", "a.txt"],
             vec!["alpha", "bin.dat"],
             vec!["a.p", "a.txt"],
-            vec!["-v", "alpha", "a.txt"],
             vec!["alpha"],
             vec!["-rn", "alpha", "missing"],
             vec!["-rn", "alpha", "."],
