@@ -1329,6 +1329,8 @@ fn cmd_sed(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     }
     let mut out = String::new();
     let mut line_no = 0usize;
+    // The last line printed had no newline (end of a file): GNU sed adds it once more output follows.
+    let mut owed_newline = false;
     for raw in &paths {
         let path = path_of(cwd, raw);
         if !fs::metadata(&path).ok()?.is_file() {
@@ -1351,11 +1353,15 @@ fn cmd_sed(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             let line = line.strip_suffix('\n').unwrap_or(line);
             // qx normalises a CRLF line ending, as head, cat and tail do here.
             let line = line.strip_suffix('\r').unwrap_or(line);
-            out.push_str(line);
-            if has_nl {
-                // The last line of a file keeps whatever terminator it had.
+            if owed_newline {
                 out.push('\n');
             }
+            out.push_str(line);
+            if has_nl {
+                out.push('\n');
+            }
+            // The last line of the input keeps whatever terminator it had.
+            owed_newline = !has_nl;
         }
     }
     Some(ok(out))
@@ -2298,6 +2304,31 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// The ranges pinned without an oracle, so they are checked where Git's sed cannot start.
+    #[test]
+    fn sed_prints_line_ranges_without_the_real_tool() {
+        let d = scratch("sed-fixed");
+        fs::write(d.join("five.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        fs::write(d.join("crlf.txt"), "a\r\nb\r\nc\r\n").unwrap();
+        fs::write(d.join("nonl.txt"), "x").unwrap();
+        fs::write(d.join("big.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+        for (case, want) in [
+            (vec!["-n", "2,4p", "five.txt"], "b\nc\nd\n"),
+            (vec!["-n", "1,2p", "five.txt", "big.txt"], "a\nb\n"),
+            (vec!["-n", "9,10p", "big.txt"], "9\n10\n"),
+            // qx normalises CRLF, as its head, cat and tail do (real sed would keep the CRs).
+            (vec!["-n", "2,3p", "crlf.txt"], "b\nc\n"),
+            (vec!["-n", "1p", "nonl.txt"], "x"),
+            // GNU sed adds the newline a file lacks once more output follows it.
+            (vec!["-n", "1,2p", "nonl.txt", "five.txt"], "x\na\n"),
+            (vec!["-n", "1,1p", "nonl.txt", "five.txt"], "x"),
+        ] {
+            let out = run("sed", &case, &d).expect("built-in declined a range it claims");
+            assert_eq!((out.code, out.stdout.as_str()), (0, want), "{case:?}");
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn sed_prints_the_range_the_real_tool_prints() {
         let Some(sed) = real_sed() else {
@@ -2306,7 +2337,6 @@ mod tests {
         };
         let d = scratch("sed");
         fs::write(d.join("five.txt"), "a\nb\nc\nd\ne\n").unwrap();
-        fs::write(d.join("crlf.txt"), "a\r\nb\r\nc\r\n").unwrap();
         fs::write(d.join("nonl.txt"), "x").unwrap();
         fs::write(d.join("big.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
         let taken: Vec<Vec<&str>> = vec![
@@ -2316,13 +2346,17 @@ mod tests {
             vec!["-n", "5,6p", "five.txt"],
             vec!["-n", "1,1p", "five.txt"],
             vec!["-n", "1,2p", "five.txt", "big.txt"],
-            vec!["-n", "2,3p", "crlf.txt"],
             vec!["-n", "1p", "nonl.txt"],
+            vec!["-n", "1,2p", "nonl.txt", "five.txt"],
             vec!["-n", "9,10p", "big.txt"],
         ];
         for case in taken {
             let mine = run("sed", &case, &d).expect("built-in declined a range it claims");
-            let (code, theirs, why) = real_tool_run(sed, &case, &d).expect("sed unavailable");
+            // Git's sed is an msys binary that a restricted token cannot start: skip, like grep's oracle.
+            let Some((code, theirs, why)) = real_tool_run(sed, &case, &d) else {
+                let _ = fs::remove_dir_all(&d);
+                return;
+            };
             assert_eq!(mine.stdout, theirs, "stdout differs for {case:?} (sed said {why:?})");
             assert_eq!(mine.code, code, "exit differs for {case:?} (sed said {why:?})");
         }
