@@ -1500,7 +1500,42 @@ fn stat(root: &Root, args: &Value) -> Result<Reply, FsError> {
 
 // ------------------------------------------------------------------- walking
 
-fn walk_files<F: FnMut(&Path, &fs::DirEntry)>(root: &Path, mut visit: F) {
+/// Visit every file below `root` - the built-in skip list (`node_modules`, `target`, `.git`)
+/// does not apply - until `visit` returns false or the walk cap is hit. Symlinks are not
+/// followed: neither is `grep -r`.
+pub(crate) fn walk_every_file<F: FnMut(&Path) -> bool>(root: &Path, mut visit: F) {
+    fn go<F: FnMut(&Path) -> bool>(dir: &Path, depth: usize, count: &mut usize, visit: &mut F) -> bool {
+        if depth > MAX_WALK_DEPTH {
+            return true;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return true;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                if !go(&entry.path(), depth + 1, count, visit) {
+                    return false;
+                }
+            } else if ft.is_file() {
+                *count += 1;
+                if *count > MAX_WALK_FILES || !visit(&entry.path()) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    let mut count = 0usize;
+    go(root, 0, &mut count, &mut visit);
+}
+
+pub(crate) fn walk_files<F: FnMut(&Path, &fs::DirEntry)>(root: &Path, mut visit: F) {
     let mut files = 0usize;
     walk_dir(root, root, 0, &mut files, &mut visit);
 }

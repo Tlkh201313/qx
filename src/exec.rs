@@ -1275,32 +1275,54 @@ pub fn peel_env(s: &str) -> (Vec<(String, String)>, &str) {
 }
 
 /// Tokenize a command line only when it needs no shell at all.
-/// Returns None for quotes, pipes, redirects, globs, variables, or built-ins
-/// that only a shell can implement (cd).
+/// Double quotes group one word and are stripped by both cmd and Git Bash, so
+/// `grep -n "fn main" src` still reaches the in-process grep. Returns None for
+/// anything one shell would still interpret: single quotes (cmd keeps them),
+/// pipes, redirects, globs, variables, escapes, or built-ins only a shell can do (cd).
 pub fn split_simple(s: &str) -> Option<(String, Vec<String>)> {
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
     const SHELL_ONLY: &[char] = &[
-        '"', '\'', '|', '&', '>', '<', ';', '$', '`', '(', ')', '*', '?', '%', '\n', '\r',
+        '\'', '|', '&', '>', '<', ';', '$', '`', '(', ')', '*', '?', '%', '!', '^', '\n', '\r',
     ];
-    if s.chars().any(|c| SHELL_ONLY.contains(&c)) {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => quoted = !quoted,
+            // `\ `, `\'` and `\"` mean shell quoting rules; a lone `\` (C:\Users\x) is literal.
+            '\\' => match chars.peek() {
+                Some(' ') | Some('\'') | Some('"') | Some('\\') => return None,
+                _ => cur.push('\\'),
+            },
+            c if SHELL_ONLY.contains(&c) => return None,
+            c if c.is_whitespace() && !quoted => {
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if quoted {
         return None;
     }
-    // Escaped whitespace means shell quoting rules; don't guess and split it.
-    if s.contains("\\ ") || s.contains("\\'") || s.contains("\\\"") {
-        return None;
+    if !cur.is_empty() {
+        tokens.push(cur);
     }
-    let mut parts = s.split_whitespace();
-    let prog = parts.next()?.to_string();
+    let mut tokens = tokens.into_iter();
+    let prog = tokens.next()?;
     if prog.contains('=')
         || prog.starts_with('~')
         || prog.eq_ignore_ascii_case("cd")
     {
         return None;
     }
-    let args: Vec<String> = parts.map(|p| p.to_string()).collect();
+    let args: Vec<String> = tokens.collect();
     if args.iter().any(|a| a.starts_with('~')) {
         return None;
     }
@@ -1422,11 +1444,25 @@ mod tests {
     fn rejects_shell_syntax() {
         assert!(split_simple("echo hi && echo bye").is_none());
         assert!(split_simple("cat x | tail -5").is_none());
-        assert!(split_simple("echo \"hi there\"").is_none());
         assert!(split_simple("ls *.rs").is_none());
         assert!(split_simple("cd ..").is_none());
         assert!(split_simple("FOO=1 git status").is_none());
         assert!(split_simple("rm a\\ b").is_none());
+        assert!(split_simple("echo 'single quoted'").is_none());
+        assert!(split_simple("echo \"unclosed").is_none());
+        assert!(split_simple("echo \"a $b\"").is_none());
+        assert!(split_simple("echo \"a %b%\"").is_none());
+    }
+
+    /// A double-quoted word is not shell syntax: both cmd and Git Bash strip the quotes,
+    /// so the line can still run without a shell (and reach an in-process built-in).
+    #[test]
+    fn double_quotes_group_one_word_without_a_shell() {
+        let (p, a) = split_simple("grep -n \"fn main\" src\\main.rs").unwrap();
+        assert_eq!(p, "grep");
+        assert_eq!(a, ["-n", "fn main", "src\\main.rs"]);
+        let (p, a) = split_simple("echo \"two  spaces\"").unwrap();
+        assert_eq!((p.as_str(), a), ("echo", vec!["two  spaces".to_string()]));
     }
 
     #[test]

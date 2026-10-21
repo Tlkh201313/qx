@@ -7,8 +7,8 @@ the command itself.
 
 ## What it does
 
-1. **In-process built-ins** — 30 common commands run inside qx with **zero process
-   creation**: `pwd echo true false sleep clear cls ls dir cat type head tail wc
+1. **In-process built-ins** — 31 common commands run inside qx with **zero process
+   creation**: `pwd echo true false sleep clear cls ls dir cat type head tail wc grep
    mkdir rm del cp copy mv move touch which basename dirname realpath whoami
    hostname seq`.
    Anything a built-in does not reproduce exactly goes to the real tool instead:
@@ -16,19 +16,29 @@ the command itself.
    like `/tmp/x`), `tail -n +N`, `basename f .txt`, `echo -e`, `ls -lh`, `seq 1e3`,
    `sleep` over 10 s (a built-in cannot be killed by the call's timeout), `touch`
    on a read-only file, and `cp -r` over a tree holding a symlink or junction.
+   `grep` answers `-i -n -l -r -F --include=*.ext` with literal patterns and hands
+   every other shape (regex metacharacters, `-c`, `-v`, stdin, binary or over-32 MiB
+   files, more than 20k files) to the real `grep`, so the line list is never guessed.
+   A recursive scan visits the whole tree the way GNU grep does, `.git` and
+   `node_modules` included; `fs grep` is the call that skips them.
    `dir type del erase copy move` run through `cmd.exe` when no executable of that
    name exists, or when a `/switch` is given. `where` is always the real
    `where.exe`; `which` prints the first PATH hit.
    `rm` refuses drive roots, your home directory, and the current directory.
    When a built-in declines and no `name.exe` is on PATH, qx resolves the name
-   from Git for Windows' `usr\bin` (`wc`, `head`, `cp`, `mkdir`, …), so
-   `wc -l a.txt b.txt` still answers instead of failing with "command not
-   found"; only the coreutils Git actually ships are eligible, and the error
-   message says when a declined built-in had nowhere to go.
+   from Git for Windows' `usr\bin` (`wc`, `grep`, `sed`, `awk`, `find`, `sort`,
+   `cp`, `mkdir`, …), so
+   `wc -l a.txt b.txt` or a POSIX line that reached `cmd` still answers instead of
+   failing with "command not found"; only the coreutils Git actually ships are
+   eligible, and the error message says when a declined built-in had nowhere to go.
 2. **Direct exec** — `qx git status` calls `git.exe` directly. No `bash`, no login
    profile, no `cmd.exe` in between. Node targets also get a persistent
    `NODE_COMPILE_CACHE` (Node 22+), which cuts repeat CLI startup by ~20%.
    `QX_NODE_CACHE=off` disables it.
+   A quoted argument does not force a shell: `qx -c 'grep -n "fn main" src'` is
+   tokenized here (double quotes grouped and stripped, exactly what both cmd and
+   Git Bash do to them) and still runs in-process. Single quotes, `$ % ! ^ * ?`,
+   operators, or an escape keep the shell.
    Python startup is mostly `.pth` hooks. By default qx-launched Python skips
    `pip_system_certs` (which imports all of pip to inject system certs) and
    pynvml's warning-only finder, and keeps system-cert injection through a lazy

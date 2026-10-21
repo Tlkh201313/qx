@@ -55,6 +55,7 @@ pub fn try_exec(program: &str, args: &[String], cwd: Option<&Path>, envs: &[(Str
         "head" => cmd_head(args, cwd, false),
         "tail" => cmd_head(args, cwd, true),
         "wc" => cmd_wc(args, cwd),
+        "grep" => cmd_grep(args, cwd),
         "mkdir" => cmd_mkdir(args, cwd),
         "rm" | "del" | "erase" => cmd_rm(args, cwd),
         "cp" | "copy" => cmd_cp(args, cwd),
@@ -79,7 +80,7 @@ pub fn try_exec(program: &str, args: &[String], cwd: Option<&Path>, envs: &[(Str
 pub const NAMES: &[&str] = &[
     "pwd", "echo", "true", "false", "ls", "dir", "cat", "type", "head", "tail", "wc", "mkdir", "rm",
     "del", "erase", "cp", "copy", "mv", "move", "touch", "which", "basename", "dirname", "realpath",
-    "whoami", "hostname", "seq", "sleep", "clear", "cls",
+    "whoami", "hostname", "seq", "sleep", "clear", "cls", "grep",
 ];
 
 /// Names that take file paths. A `/x` argument is a cmd.exe switch (`dir /b`) or an MSYS path
@@ -873,6 +874,208 @@ fn cmd_wc(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     }
     parts.push(files[0].to_string());
     Some(ok(format!("{}\n", parts.join(" "))))
+}
+
+/// More files than this and the real grep is the honest answer.
+const MAX_GREP_FILES: usize = 20_000;
+/// Stop before compaction would have to throw away the tail anyway.
+const GREP_OUT_CAP: usize = 8 * 1024 * 1024;
+
+/// `grep` for the shapes agents type: literal patterns with `-r`, `-n`, `-i`, `-l` and
+/// `--include=*.ext`. Everything else - a real regex, `-c`/`-v`/`-e`, stdin, context flags,
+/// an unreadable path, a binary or >32 MiB file - returns `None` so the real grep answers:
+/// a wrong line list costs more than the 50 ms process it saves.
+fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
+    let mut insensitive = false;
+    let mut number = false;
+    let mut list_only = false;
+    let mut recursive = false;
+    let mut fixed = false;
+    let mut include: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if let Some(rest) = a.strip_prefix("--") {
+            let (key, val) = match rest.split_once('=') {
+                Some((k, v)) => (k, Some(v)),
+                None => (rest, None),
+            };
+            match key {
+                "include" => {
+                    let v = val?;
+                    if !simple_include(v) {
+                        return None;
+                    }
+                    include = Some(v.to_string());
+                }
+                // Colour is never emitted; buffering is not observable in captured output.
+                "color" | "colour" | "line-buffered" => {}
+                _ => return None,
+            }
+        } else if a.len() > 1 && a.starts_with('-') {
+            for ch in a[1..].chars() {
+                match ch {
+                    'i' => insensitive = true,
+                    'n' => number = true,
+                    'l' => list_only = true,
+                    'r' | 'R' => recursive = true,
+                    'F' => fixed = true,
+                    // qx reports no per-file errors, so silence changes nothing.
+                    's' => {}
+                    _ => return None,
+                }
+            }
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    let pattern = args.get(i)?.as_str();
+    i += 1;
+    if pattern.is_empty() || pattern == "-" || (!fixed && needs_regex(pattern)) {
+        return None;
+    }
+    let mut specs: Vec<(&str, PathBuf)> = Vec::new();
+    if i == args.len() {
+        if !recursive {
+            // No path means stdin, which qx never gives a child.
+            return None;
+        }
+        specs.push((".", path_of(cwd, ".")));
+    } else {
+        for raw in &args[i..] {
+            if raw == "-" {
+                return None;
+            }
+            specs.push((raw.as_str(), path_of(cwd, raw)));
+        }
+    }
+
+    // Expand to files in the spelling grep would print: `grep -r x src` says `src/a.rs`.
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for (raw, path) in &specs {
+        let md = fs::metadata(path).ok()?;
+        if md.is_file() {
+            files.push((raw.to_string(), path.clone()));
+            continue;
+        }
+        if !md.is_dir() || !recursive {
+            // `grep x dir` is an error grep words better than qx can.
+            return None;
+        }
+        let base = raw.trim_end_matches(['/', '\\']);
+        let mut full = false;
+        crate::fsops::walk_every_file(path, |file| {
+            if files.len() >= MAX_GREP_FILES {
+                full = true;
+                return false;
+            }
+            let rel = file
+                .strip_prefix(path)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel.is_empty() {
+                return true;
+            }
+            if let Some(g) = &include {
+                let name = file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if !name.ends_with(&g[1..]) {
+                    return true;
+                }
+            }
+            let disp = if base.is_empty() {
+                rel
+            } else {
+                format!("{base}/{rel}")
+            };
+            files.push((disp, file.to_path_buf()));
+            true
+        });
+        if full {
+            return None;
+        }
+    }
+    if files.len() > MAX_GREP_FILES {
+        return None;
+    }
+
+    // grep prefixes the filename whenever it recurses, even for a single hit file.
+    let multiple = recursive || files.len() > 1;
+    let needle = if insensitive {
+        pattern.to_lowercase()
+    } else {
+        pattern.to_string()
+    };
+    let mut out = String::new();
+    let mut hits = 0usize;
+    for (disp, path) in &files {
+        let bytes = fs::read(path).ok()?;
+        if bytes.len() as u64 > READ_CAP {
+            return None;
+        }
+        if bytes[..bytes.len().min(8192)].contains(&0) {
+            // GNU prints "Binary file ... matches"; never guess at that.
+            return None;
+        }
+        let text = crate::exec::decode(&bytes);
+        for (idx, raw_line) in text.split('\n').enumerate() {
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            let hit = if insensitive {
+                line.to_lowercase().contains(&needle)
+            } else {
+                line.contains(&needle)
+            };
+            if !hit {
+                continue;
+            }
+            hits += 1;
+            if list_only {
+                out.push_str(disp);
+                out.push('\n');
+                break;
+            }
+            if multiple {
+                out.push_str(disp);
+                out.push(':');
+            }
+            if number {
+                let _ = write!(out, "{}:", idx + 1);
+            }
+            out.push_str(line);
+            out.push('\n');
+            if out.len() >= GREP_OUT_CAP {
+                out.push_str("[qx] grep output truncated at 8 MiB\n");
+                return Some(ok(out));
+            }
+        }
+    }
+    Some(BuiltinOut {
+        code: if hits > 0 { 0 } else { 1 },
+        stdout: out,
+        stderr: String::new(),
+        elapsed: Duration::ZERO,
+    })
+}
+
+/// Characters that make the pattern a regex. A literal scan must never answer these.
+fn needs_regex(p: &str) -> bool {
+    p.chars().any(|c| ".[]()*+?^${}|\\".contains(c))
+}
+
+/// The one `--include` shape qx can honour exactly: `*.ext`.
+fn simple_include(g: &str) -> bool {
+    match g.strip_prefix("*.") {
+        Some(ext) => !ext.is_empty() && !ext.chars().any(|c| "*?[]\\/".contains(c)),
+        None => false,
+    }
 }
 
 /// Stream the file so `wc` on a multi-gigabyte log stays bounded.
@@ -1717,5 +1920,81 @@ mod tests {
             assert!(has_dir_link(&d.join("tree"), 0));
             assert!(run("cp", &["-r", "tree", "tree2"], &d).is_none());
         }
+    }
+
+    /// The built-in has to be indistinguishable from the real grep for every shape it accepts,
+    /// so this runs both and compares stdout (sorted: qx emits path order) and the exit code.
+    #[test]
+    fn grep_matches_the_real_tool_or_declines() {
+        let Some(grep) = real_grep() else {
+            eprintln!("skipped: no grep.exe next to Git");
+            return;
+        };
+        let d = scratch("grep");
+        fs::create_dir_all(d.join("sub")).unwrap();
+        fs::write(d.join("a.txt"), "alpha\nbeta\nalpha gamma\n").unwrap();
+        fs::write(d.join("b.rs"), "let alpha = 1;\nlet gamma = 2;\n").unwrap();
+        fs::write(d.join("sub/c.txt"), "alpha\nALPHA\n").unwrap();
+
+        // No binary file yet: a binary match makes the built-in decline (GNU says
+        // "Binary file ... matches"), which the recursive cases below must not trip over.
+        let taken: Vec<Vec<&str>> = vec![
+            vec!["-n", "alpha", "a.txt"],
+            vec!["-n", "alpha", "a.txt", "b.rs"],
+            vec!["-in", "alpha", "sub/c.txt"],
+            vec!["-rn", "alpha", "."],
+            vec!["-rn", "alpha", "sub"],
+            vec!["-rl", "alpha", "."],
+            vec!["-rln", "gamma", "."],
+            vec!["-n", "nope", "a.txt"],
+            vec!["-rn", "--include=*.rs", "alpha", "."],
+        ];
+        for case in taken {
+            let mine = run("grep", &case, &d).expect("built-in declined a shape it claims");
+            let (code, theirs) = real_grep_run(grep, &case, &d);
+            let mut a: Vec<&str> = mine.stdout.lines().collect();
+            let mut b: Vec<&str> = theirs.lines().collect();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "stdout differs for {case:?}");
+            assert_eq!(mine.code, code, "exit differs for {case:?}");
+        }
+
+        // Shapes a literal in-process scan must never guess at.
+        fs::write(d.join("bin.dat"), b"alpha\0binary").unwrap();
+        let declined: Vec<Vec<&str>> = vec![
+            vec!["-c", "alpha", "a.txt"],
+            vec!["alpha", "bin.dat"],
+            vec!["a.p", "a.txt"],
+            vec!["-v", "alpha", "a.txt"],
+            vec!["alpha"],
+            vec!["-rn", "alpha", "missing"],
+            vec!["-rn", "alpha", "."],
+        ];
+        for case in declined {
+            assert!(run("grep", &case, &d).is_none(), "should decline {case:?}");
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    fn real_grep() -> Option<&'static str> {
+        [
+            r"C:\Program Files\Git\usr\bin\grep.exe",
+            r"C:\Program Files\Git\bin\grep.exe",
+        ]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+    }
+
+    fn real_grep_run(grep: &str, args: &[&str], cwd: &Path) -> (i32, String) {
+        let out = std::process::Command::new(grep)
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("real grep");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
     }
 }

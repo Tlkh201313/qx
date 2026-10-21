@@ -668,9 +668,11 @@ SAFETY GATE
 
 BUILT-INS (no process spawn)
   pwd echo true false sleep clear cls
-  ls dir cat type head tail wc
+  ls dir cat type head tail wc grep
   mkdir rm del cp copy mv move touch
-  which where basename dirname
+  which where basename dirname realpath
+  whoami hostname seq
+  grep takes literal patterns, -i -n -l -r --include=*.ext; anything else runs the real grep.
   Unknown flags fall back to the real executable.
 
 EXAMPLES
