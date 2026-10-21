@@ -17,15 +17,28 @@ fn is_noise(line: &str) -> bool {
     t.is_empty() || t.starts_with('#')
 }
 
-/// First later non-blank, non-comment line indented no deeper than `indent`.
+/// First later non-blank, non-comment line indented no deeper than `indent`, backed up over the
+/// blank and comment lines just before it: those introduce what follows, they are not the block's.
 fn block_end(lines: &[&str], start: usize, indent: usize) -> usize {
-    lines
+    let mut end = lines
         .iter()
         .enumerate()
         .skip(start + 1)
         .find(|(_, line)| !is_noise(line) && indent_of(line) <= indent)
         .map(|(i, _)| i)
-        .unwrap_or(lines.len())
+        .unwrap_or(lines.len());
+    while end > start + 1 && is_noise(lines[end - 1]) {
+        end -= 1;
+    }
+    end
+}
+
+fn eol_of(text: Option<&str>) -> &'static str {
+    if text.is_some_and(|t| t.contains("\r\n")) {
+        "\r\n"
+    } else {
+        "\n"
+    }
 }
 
 fn has_tab_indent(text: &str) -> bool {
@@ -57,6 +70,7 @@ fn dsh_env(lines: &[&str], start: usize, end: usize) -> Option<(usize, usize)> {
 pub fn edit_dsh(text: Option<&str>, exe: &Path, a: Action) -> Edit {
     let mut lines: Vec<String> = text.unwrap_or("").lines().map(str::to_string).collect();
     let had_newline = text.is_some_and(|t| t.ends_with('\n') || t.is_empty());
+    let eol = eol_of(text);
     let block = {
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         dsh_item(&refs)
@@ -76,12 +90,18 @@ pub fn edit_dsh(text: Option<&str>, exe: &Path, a: Action) -> Edit {
                 lines.push(String::new());
             }
             lines.extend(dsh_new_item(exe).lines().map(str::to_string));
-            verdict(finish(lines, had_newline), text)
+            verdict(finish(lines, had_newline, eol), text)
         }
         (Some((start, end)), action) => {
             match action {
                 Action::Remove => {
-                    // Take the `- insert:` line with the item when it wraps exactly it.
+                    // Take the `- insert:` line with the item when it wraps exactly it: no
+                    // sibling item may follow, or the wrapper is theirs too.
+                    let item_indent = indent_of(lines[start].as_str());
+                    let sibling_after = lines[end..]
+                        .iter()
+                        .find(|l| !is_noise(l))
+                        .is_some_and(|l| indent_of(l) >= item_indent);
                     let mut from = start;
                     let mut i = start;
                     while i > 0 {
@@ -89,13 +109,13 @@ pub fn edit_dsh(text: Option<&str>, exe: &Path, a: Action) -> Edit {
                         if is_noise(lines[i].as_str()) {
                             continue;
                         }
-                        if lines[i].trim() == "- insert:" {
+                        if lines[i].trim() == "- insert:" && !sibling_after {
                             from = i;
                         }
                         break;
                     }
                     lines.drain(from..end);
-                    verdict(finish(lines, had_newline), text)
+                    verdict(finish(lines, had_newline, eol), text)
                 }
                 Action::Install => {
                     let (command, env, env_indent) = {
@@ -139,7 +159,7 @@ pub fn edit_dsh(text: Option<&str>, exe: &Path, a: Action) -> Edit {
                             lines.insert(env + 1, format!("{}QX_CLIENT: dsh", " ".repeat(ci)));
                         }
                     }
-                    verdict(finish(lines, had_newline), text)
+                    verdict(finish(lines, had_newline, eol), text)
                 }
             }
         }
@@ -208,6 +228,7 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
         return Edit::Refuse(refusal_hermes(exe, "config.yaml uses tab indentation"));
     }
     let had_newline = text.is_some_and(|t| t.ends_with('\n') || t.is_empty());
+    let eol = eol_of(text);
     let mut lines: Vec<String> = source.lines().map(str::to_string).collect();
 
     let servers = {
@@ -223,7 +244,7 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
                 }
                 lines.push("mcp_servers:".to_string());
                 lines.push(hermes_block(exe, "  ", &[]));
-                verdict(finish(expand(lines), had_newline), text)
+                verdict(finish(expand(lines), had_newline, eol), text)
             }
         };
     };
@@ -257,7 +278,7 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
                 })
                 .unwrap_or(servers + 1);
             lines.insert(insert_at, block);
-            verdict(finish(expand(lines), had_newline), text)
+            verdict(finish(expand(lines), had_newline, eol), text)
         }
         (Some(start), action) => {
             let qend = {
@@ -267,7 +288,7 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
             match action {
                 Action::Remove => {
                     lines.drain(start..qend);
-                    verdict(finish(lines, had_newline), text)
+                    verdict(finish(lines, had_newline, eol), text)
                 }
                 Action::Install => {
                     // `qx: {…}` keeps the user's keys on one line; rewriting it would drop them.
@@ -278,7 +299,7 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
                     let kept = kept_env(&lines, start, qend);
                     let block = hermes_block(exe, &" ".repeat(child_indent), &kept);
                     lines.splice(start..qend, std::iter::once(block));
-                    verdict(finish(expand(lines), had_newline), text)
+                    verdict(finish(expand(lines), had_newline, eol), text)
                 }
             }
         }
@@ -345,15 +366,17 @@ pub fn hermes_command(text: &str) -> Option<String> {
 fn yaml_scalar(line: &str, key: &str) -> Option<String> {
     let t = line.trim();
     let rest = t.strip_prefix(&format!("{key}:"))?.trim();
+    let quoted = rest.starts_with('\'');
     let rest = rest.strip_prefix('\'').unwrap_or(rest);
     let rest = rest.strip_suffix('\'').unwrap_or(rest);
-    (!rest.is_empty()).then(|| rest.to_string())
+    // Inside a single-quoted scalar a doubled quote is one quote.
+    (!rest.is_empty()).then(|| if quoted { rest.replace("''", "'") } else { rest.to_string() })
 }
 
-fn finish(lines: Vec<String>, trailing_newline: bool) -> String {
-    let mut out = lines.join("\n");
+fn finish(lines: Vec<String>, trailing_newline: bool, eol: &str) -> String {
+    let mut out = lines.join(eol);
     if trailing_newline && !out.is_empty() {
-        out.push('\n');
+        out.push_str(eol);
     }
     out
 }
@@ -558,6 +581,54 @@ mod tests {
         let out = changed(edit_hermes(Some(hermes), exe, Action::Remove));
         assert!(!out.contains("qx:"), "{out}");
         assert!(out.contains("  other:\n    command: o\n"), "{out}");
+    }
+
+    #[test]
+    fn dsh_remove_keeps_the_shared_insert_wrapper() {
+        let exe = Path::new(r"C:\q\qx.exe");
+        let first = "- insert:\n    - id: mcp-qx\n      name: a\n      config:\n        command: 'c'\n        env:\n          K: v\n    - id: mcp-other\n      name: b\n";
+        assert_eq!(
+            changed(edit_dsh(Some(first), exe, Action::Remove)),
+            "- insert:\n    - id: mcp-other\n      name: b\n"
+        );
+        let last = "- insert:\n    - id: mcp-other\n      name: b\n    - id: mcp-qx\n      name: a\n      config:\n        command: 'c'\n";
+        assert_eq!(
+            changed(edit_dsh(Some(last), exe, Action::Remove)),
+            "- insert:\n    - id: mcp-other\n      name: b\n"
+        );
+    }
+
+    #[test]
+    fn yaml_editors_keep_crlf() {
+        let exe = Path::new(r"C:\q\qx.exe");
+        let hermes = "model: x\r\nmcp_servers:\r\n  a:\r\n    command: c\r\n";
+        let out = changed(edit_hermes(Some(hermes), exe, Action::Install));
+        assert!(out.starts_with(hermes), "{out:?}");
+        assert!(!out.replace("\r\n", "").contains('\n'), "bare LF in {out:?}");
+        let dsh = DSH.replace('\n', "\r\n");
+        let out = changed(edit_dsh(Some(&dsh), exe, Action::Install));
+        assert!(!out.replace("\r\n", "").contains('\n'), "bare LF in {out:?}");
+        let out = changed(edit_dsh(Some(&dsh), exe, Action::Remove));
+        assert!(!out.replace("\r\n", "").contains('\n'), "bare LF in {out:?}");
+    }
+
+    #[test]
+    fn hermes_remove_keeps_the_next_servers_comment() {
+        let exe = Path::new(r"C:\q\qx.exe");
+        let src = "mcp_servers:\n  qx:\n    command: 'c'\n  # docs server\n  docs:\n    command: d\n";
+        assert_eq!(
+            changed(edit_hermes(Some(src), exe, Action::Remove)),
+            "mcp_servers:\n  # docs server\n  docs:\n    command: d\n"
+        );
+    }
+
+    #[test]
+    fn yaml_scalars_unescape_doubled_quotes() {
+        let exe = Path::new(r"C:\Users\O'Brien\.cargo\bin\qx.exe");
+        let hermes = changed(edit_hermes(None, exe, Action::Install));
+        assert_eq!(hermes_command(&hermes).as_deref(), Some(r"C:\Users\O'Brien\.cargo\bin\qx.exe"));
+        let dsh = changed(edit_dsh(Some(DSH), exe, Action::Install));
+        assert_eq!(dsh_command(&dsh).as_deref(), Some("C:/Users/O'Brien/.cargo/bin/qx.exe"));
     }
 
     #[test]
