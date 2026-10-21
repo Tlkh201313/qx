@@ -476,7 +476,17 @@ pub fn command_for(program: &str, target: Target, args: &[String]) -> Result<Com
                 // A profile adds 300+ ms and can print into the output.
                 c.arg("-NoProfile");
             }
-            c.args(args);
+            match cmd_c_line(&exe, args) {
+                // The text after `/c` is a command line: raw, as `cmd_exe` passes it.
+                #[cfg(windows)]
+                Some(raw) => {
+                    use std::os::windows::process::CommandExt;
+                    c.raw_arg(raw);
+                }
+                _ => {
+                    c.args(args);
+                }
+            }
             prepare(&mut c);
             if let Some(v) = &venv {
                 // After `prepare`, which clears the inherited environment: this is what makes
@@ -527,6 +537,35 @@ pub fn command_for(program: &str, target: Target, args: &[String]) -> Result<Com
         }
         Target::Missing => Err(not_found(program)),
     }
+}
+
+/// `cmd [/d] [/s] [/q] /c|/k <text>`: the raw argument string cmd.exe needs. Rust's own quoting turns
+/// every inner quote into `\"`, which cmd prints literally. A single text argument is the command line
+/// as written; several are joined, with all but the first quoted when they need it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn cmd_c_line(exe: &Path, args: &[String]) -> Option<String> {
+    if !exe.file_stem().is_some_and(|s| s.eq_ignore_ascii_case("cmd")) {
+        return None;
+    }
+    let mut i = 0;
+    while args.get(i).is_some_and(|a| ["/d", "/s", "/q"].iter().any(|f| a.eq_ignore_ascii_case(f))) {
+        i += 1;
+    }
+    let mode = args.get(i).filter(|a| a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("/k"))?;
+    let rest = &args[i + 1..];
+    if rest.is_empty() || rest.iter().any(|a| a.contains(['\n', '\r', '\0'])) {
+        return None;
+    }
+    let text = match rest {
+        [one] => one.clone(),
+        many => many
+            .iter()
+            .enumerate()
+            .map(|(n, a)| if n == 0 { a.clone() } else { cmd_quote(a) })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    Some(format!("/d /s {mode} \"{text}\""))
 }
 
 /// The message for a program that could not be resolved. A built-in that declined its
@@ -819,8 +858,9 @@ fn cmd_quote(s: &str) -> String {
     if s.is_empty() {
         return "\"\"".to_string();
     }
+    // A bare `"` must be quoted too: left alone it flips cmd's quote state and a later `&` runs.
     if s.chars()
-        .any(|c| c.is_whitespace() || "&|<>^()".contains(c))
+        .any(|c| c.is_whitespace() || "&|<>^()\"".contains(c))
     {
         // shortcut: a `%VAR%` inside a quoted arg is still expanded by cmd.exe; no escape exists there.
         format!("\"{}\"", s.replace('"', "\"\""))
@@ -835,6 +875,9 @@ pub(crate) const CAPTURE_CAP: usize = 16 * 1024 * 1024;
 pub(crate) struct Capture {
     data: std::sync::Mutex<Vec<u8>>,
     truncated: std::sync::atomic::AtomicBool,
+    /// Set by `snapshot`: a daemon still writing to the pipe is drained and discarded, so it
+    /// cannot grow a hidden buffer after the call has returned.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 fn capture_from_cap<R: Read + Send + 'static>(
@@ -844,6 +887,7 @@ fn capture_from_cap<R: Read + Send + 'static>(
     let sink = std::sync::Arc::new(Capture {
         data: std::sync::Mutex::new(Vec::new()),
         truncated: std::sync::atomic::AtomicBool::new(false),
+        closed: std::sync::atomic::AtomicBool::new(false),
     });
     let shared = sink.clone();
     let (tx, rx) = mpsc::channel();
@@ -857,6 +901,9 @@ fn capture_from_cap<R: Read + Send + 'static>(
                         Ok(d) => d,
                         Err(_) => break,
                     };
+                    if shared.closed.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue; // keep draining so the writer never blocks, but keep nothing
+                    }
                     if data.len() < cap {
                         let take = n.min(cap - data.len());
                         data.extend_from_slice(&chunk[..take]);
@@ -877,7 +924,10 @@ fn capture_from_cap<R: Read + Send + 'static>(
 
 fn snapshot(c: &Capture) -> (Vec<u8>, bool) {
     let data = match c.data.lock() {
-        Ok(mut d) => std::mem::take(&mut *d),
+        Ok(mut d) => {
+            c.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+            std::mem::take(&mut *d)
+        }
         Err(_) => Vec::new(),
     };
     (
@@ -1642,6 +1692,65 @@ mod tests {
         let t = std::time::Instant::now();
         assert_eq!(run_stream(&mut c, Some(Duration::from_secs(1))).unwrap(), 124);
         assert!(t.elapsed() < Duration::from_secs(8));
+    }
+
+    #[test]
+    fn cmd_quote_neutralises_a_bare_quote() {
+        // An odd `"` flips cmd's quote state, and the `&` after it runs as a second command.
+        assert_eq!(cmd_quote("a\"b"), "\"a\"\"b\"");
+        assert_eq!(cmd_quote("plain"), "plain");
+        assert_eq!(cmd_quote("a b"), "\"a b\"");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_bare_quote_in_an_argument_cannot_start_a_second_command() {
+        let args = ["/b".to_string(), "a\"b".to_string(), "c&echo PWNED".to_string()];
+        let o = run_captured(build_command("dir", &args).unwrap(), Some(Duration::from_secs(20))).unwrap();
+        assert!(
+            !o.stdout.contains("PWNED") && !o.stderr.contains("PWNED"),
+            "the second command ran: stdout={:?} stderr={:?}",
+            o.stdout,
+            o.stderr
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_c_receives_its_text_unmangled() {
+        let args = ["/c".to_string(), "echo \"a b\"".to_string()];
+        let o = run_captured(build_command("cmd", &args).unwrap(), Some(Duration::from_secs(20))).unwrap();
+        assert_eq!(o.stdout.trim(), "\"a b\"", "stderr: {}", o.stderr);
+    }
+
+    #[test]
+    fn a_snapshot_closes_the_capture_to_later_bytes() {
+        struct Fed(mpsc::Receiver<Vec<u8>>);
+        impl Read for Fed {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.recv() {
+                    Ok(chunk) => {
+                        buf[..chunk.len()].copy_from_slice(&chunk);
+                        Ok(chunk.len())
+                    }
+                    Err(_) => Ok(0),
+                }
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let (sink, done) = capture_from_cap(Fed(rx), 1024);
+        tx.send(b"early".to_vec()).unwrap();
+        let t = Instant::now();
+        while sink.data.lock().unwrap().len() < 5 && t.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (data, _) = snapshot(&sink);
+        assert_eq!(data, b"early");
+        // a daemon that keeps writing after the call returned must not grow a hidden buffer
+        tx.send(b"late".to_vec()).unwrap();
+        drop(tx);
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(sink.data.lock().unwrap().is_empty(), "bytes after the snapshot were buffered");
     }
 
     #[test]
