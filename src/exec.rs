@@ -981,6 +981,30 @@ pub fn set_cancel(flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
     CANCEL.with(|c| *c.borrow_mut() = flag);
 }
 
+/// `QX_TRACE=1` prints phase timings to stderr: the first thing to ask when a command
+/// feels slow is where its milliseconds went.
+pub fn trace(start: Instant, msg: &str) {
+    if std::env::var_os("QX_TRACE").is_some() {
+        eprintln!("[trace] {:>6}ms {msg}", start.elapsed().as_millis());
+    }
+}
+
+/// Wait up to `within` for the child to be reaped; false means it is still running.
+fn reap(child: &mut std::process::Child, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
 /// Wait for the child; past `timeout` (or once cancelled) kill its whole tree. Returns (exit code, timed out).
 fn wait_or_kill(child: &mut std::process::Child, timeout: Option<Duration>) -> std::io::Result<(i32, bool)> {
     let start = Instant::now();
@@ -998,6 +1022,19 @@ fn wait_or_kill(child: &mut std::process::Child, timeout: Option<Duration>) -> s
         let cancel = CANCEL.with(|c| c.borrow().clone());
         let cancelled = cancel.as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed));
         if cancelled || remaining.is_some_and(|r| r.is_zero()) {
+            trace(start, "kill window reached");
+            // TerminateJobObject kills the whole tree in one call (~2 ms). taskkill has to be
+            // spawned, which costs 0.3-0.5 s with real-time scanners watching - so it is the
+            // fallback for when no job object could be assigned, not the first move.
+            #[cfg(windows)]
+            if let Some(j) = &job {
+                j.terminate(124);
+                let _ = child.kill();
+                if reap(child, Duration::from_millis(250)) {
+                    trace(start, "tree dead");
+                    return Ok((124, true));
+                }
+            }
             let pid = child.id();
             // Enumerate the tree while the root is still alive:
             // after the root exits, taskkill can no longer find
@@ -1013,6 +1050,7 @@ fn wait_or_kill(child: &mut std::process::Child, timeout: Option<Duration>) -> s
                 .stderr(Stdio::null());
             prepare(&mut tk);
             let _ = tk.status();
+            trace(start, "taskkill done");
             #[cfg(windows)]
             if let Some(j) = &job {
                 // Catches anything that was created after
@@ -1022,13 +1060,8 @@ fn wait_or_kill(child: &mut std::process::Child, timeout: Option<Duration>) -> s
             let _ = child.kill();
             // Bounded wait: if a grandchild still holds handles,
             // do not hang the whole qx process.
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < deadline {
-                match child.try_wait() {
-                    Ok(Some(_)) | Err(_) => break,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                }
-            }
+            reap(child, Duration::from_secs(2));
+            trace(start, "tree dead");
             return Ok((124, true));
         }
         // A cancel cannot wake the wait, so a cancellable command is polled.
@@ -1048,6 +1081,7 @@ pub fn run_captured(mut cmd: Command, timeout: Option<Duration>) -> std::io::Res
     let (err_sink, err_done) = capture_from_cap(child.stderr.take().expect("stderr piped"), CAPTURE_CAP);
 
     let (code, timed_out) = wait_or_kill(&mut child, timeout)?;
+    trace(start, "child reaped");
 
     // Grandchildren can hold the pipe open; don't block forever, but keep any
     // partial output the readers already captured.
@@ -1424,9 +1458,9 @@ mod tests {
         let prog = c.get_program().to_string_lossy().to_lowercase();
         assert!(prog.contains("usr\\bin\\sort.exe"), "{prog}");
         // Without a POSIX switch the PATH winner stays the winner.
+        // Under Git Bash, Git's `usr\bin` is itself ahead of System32 on PATH.
         let c = build_command_at("sort", &["x.txt".to_string()], None).unwrap();
-        let prog = c.get_program().to_string_lossy().to_lowercase();
-        assert!(!prog.contains("usr\\bin\\sort.exe"), "{prog}");
+        assert_eq!(Some(Path::new(c.get_program())), resolve::find_on_path("sort").as_deref());
     }
 
     #[test]

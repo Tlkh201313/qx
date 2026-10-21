@@ -665,6 +665,7 @@ SAFETY GATE
   QX_PS_PROFILE=1            keep the PowerShell profile (qx adds -NoProfile by default)
   QX_MCP_WORKERS=N           parallel MCP tool calls (default 4)
   QX_FS_THREADS=N            fs grep scan threads (default CPUs/2, max 8)
+  QX_TRACE=1                 print phase timings (spawn, wait, kill, reap) to stderr
 
 BUILT-INS (no process spawn)
   pwd echo true false sleep clear cls

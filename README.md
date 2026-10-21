@@ -165,7 +165,9 @@ the command itself.
    cancel are answered even when every slot is busy. `args` must be an array of strings (anything else is an error,
    not a different command) and `timeout_ms` is clamped to 1 s-1 h.
 7. **Diagnostics** - `qx doctor` measures process-creation latency and names the
-   antivirus products fighting over every spawn.
+   antivirus products fighting over every spawn. `QX_TRACE=1` prints the phase
+   timings of a run (spawn, wait, kill window, taskkill, reap) to stderr, so
+   "why did that take a second" has an answer instead of a guess.
 8. **Bounded, clean execution** - captured output is capped at 16 MiB per stream,
    timeouts terminate the whole process tree (also for `--timeout` on a live
    stream), a Windows job object kills that tree if qx itself dies, a piped CLI
