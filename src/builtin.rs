@@ -2473,6 +2473,8 @@ mod tests {
         // Shapes a literal in-process scan must never guess at.
         fs::write(d.join("bin.dat"), b"alpha\0binary").unwrap();
         let declined: Vec<Vec<&str>> = vec![
+            // A directory without -r is an error GNU words better.
+            vec!["-cl", "alpha", "."],
             vec!["alpha", "bin.dat"],
             vec!["a.p", "a.txt"],
             vec!["alpha"],
