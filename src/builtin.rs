@@ -958,9 +958,14 @@ fn norm_path(path: &Path) -> String {
     s.trim_end_matches(['\\', '/']).to_string()
 }
 
-fn dangerous(path: &Path) -> bool {
+/// Paths `rm` never removes: a drive root, the user profile, and the directory the command
+/// runs in (the call's `cwd` as well as the process's own).
+fn dangerous(path: &Path, call_cwd: Option<&Path>) -> bool {
     let s = norm_path(path);
     if s.is_empty() || (s.len() == 2 && s.ends_with(':')) {
+        return true;
+    }
+    if call_cwd.is_some_and(|c| s == norm_path(c)) {
         return true;
     }
     if let Some(home) = std::env::var_os("USERPROFILE") {
@@ -1009,7 +1014,9 @@ fn cmd_rm(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut code = 0;
     for p in paths {
         let path = path_of(cwd, p);
-        if dangerous(&path) {
+        // Like GNU rm: `.` and `..` are never removed, however they are spelled.
+        let dot = matches!(p.rsplit(['/', '\\']).next(), Some("." | ".."));
+        if dot || dangerous(&path, cwd) {
             err.push_str(&format!("rm: refusing to remove {}\n", path.display()));
             code = 1;
             continue;
@@ -1143,7 +1150,9 @@ fn cmd_cp(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             code = 1;
             continue;
         }
-        let target = if dst.is_dir() {
+        // `cp -r src/. dst` copies what is inside `src`; `file_name()` would drop the `.` and nest it.
+        let contents = *s == "." || s.ends_with("/.") || s.ends_with("\\.");
+        let target = if dst.is_dir() && !contents {
             dst.join(src.file_name().unwrap_or_default())
         } else {
             dst.clone()
@@ -1599,9 +1608,49 @@ mod tests {
     #[test]
     fn rm_refuses_dangerous_paths() {
         let d = tmp("danger");
-        assert!(dangerous(Path::new("C:\\")));
-        assert!(dangerous(Path::new(".")));
-        assert!(!dangerous(&d));
+        assert!(dangerous(Path::new("C:\\"), None));
+        assert!(dangerous(Path::new("."), None));
+        assert!(!dangerous(&d, None));
+        // the directory the call runs in, which is not the process cwd
+        assert!(dangerous(&d, Some(&d)));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn rm_refuses_the_call_cwd_and_dot_operands() {
+        let root = tmp("rmcwd");
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(root.join("f"), "x").unwrap();
+        fs::write(sub.join("g"), "x").unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+        for operand in [
+            ".".to_string(),
+            format!("{}{sep}.", sub.display()),
+            sub.to_string_lossy().into_owned(),
+            "..".to_string(),
+        ] {
+            let out = cmd_rm(&["-rf".into(), operand.clone()], Some(&sub)).unwrap();
+            assert_eq!(out.code, 1, "{operand}: {}", out.stderr);
+            assert!(root.join("f").exists() && sub.join("g").exists(), "{operand} removed files");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cp_r_dot_merges_the_contents_into_an_existing_dir() {
+        let d = scratch("cpdot");
+        fs::create_dir_all(d.join("src")).unwrap();
+        fs::create_dir_all(d.join("dst")).unwrap();
+        fs::write(d.join("src").join("a.txt"), "a").unwrap();
+        let out = run("cp", &["-r", "src/.", "dst"], &d).unwrap();
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(d.join("dst").join("a.txt").exists(), "contents not merged");
+        assert!(!d.join("dst").join("src").exists(), "nested one level too deep");
+        // a plain directory operand still nests under the destination
+        let out = run("cp", &["-r", "src", "dst"], &d).unwrap();
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(d.join("dst").join("src").join("a.txt").exists());
         let _ = fs::remove_dir_all(&d);
     }
 
