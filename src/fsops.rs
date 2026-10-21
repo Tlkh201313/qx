@@ -298,6 +298,14 @@ impl Root {
     /// may be created, but every existing ancestor is canonicalized and checked
     /// first, so a symlink or junction cannot walk the write outside the root.
     fn resolve_for_write(&self, raw: &str) -> Result<(PathBuf, bool), FsError> {
+        // Relative paths are joined onto a verbatim `\\?\` cwd, which skips Win32 name rules: `nul`
+        // or `name.` would become real, undeletable files and `a.txt:x` an alternate data stream.
+        if let Some(bad) = Path::new(raw).components().find_map(|c| match c {
+            Component::Normal(s) => win_name_problem(&s.to_string_lossy()),
+            _ => None,
+        }) {
+            return Err(FsError::arg(format!("\"{raw}\": {bad}")).fb("write"));
+        }
         let candidate = self.candidate(raw);
         let name = candidate
             .file_name()
@@ -367,11 +375,11 @@ impl Root {
     }
 
     fn check_mutable(&self, path: &Path) -> Result<(), FsError> {
-        let rel = path.strip_prefix(&self.cwd).unwrap_or(path);
-        for c in rel.components() {
+        // The whole path, not just the part below cwd: a caller may pick cwd = `.git/hooks`.
+        for c in path.components() {
             if let Component::Normal(s) = c {
                 let s = s.to_string_lossy();
-                if matches!(s.as_ref(), ".git" | ".hg" | ".svn") {
+                if [".git", ".hg", ".svn"].iter().any(|v| s.eq_ignore_ascii_case(v)) {
                     return Err(FsError::new(
                         "FS_PROTECTED",
                         format!("refusing to modify VCS metadata: {}", path.display()),
@@ -381,6 +389,20 @@ impl Root {
         }
         Ok(())
     }
+}
+
+/// Why Windows cannot hold a file or directory with this name, if it cannot.
+fn win_name_problem(name: &str) -> Option<&'static str> {
+    if name.contains(':') {
+        return Some("a ':' in a name makes an alternate data stream, not a file");
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Some("Windows strips a trailing '.' or ' ', so the file could not be opened again");
+    }
+    let stem = name.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.as_bytes()[3].is_ascii_digit() && stem.as_bytes()[3] != b'0');
+    reserved.then_some("a reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9)")
 }
 
 fn nearest_existing(path: &Path) -> Option<PathBuf> {
@@ -1173,11 +1195,22 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     let needle = req_str(args, "pattern")?;
     let raw_path = path_arg(args).unwrap_or(".");
     let root_path = root.resolve_existing(raw_path).map_err(|e| e.fb("grep"))?;
+    if needle.contains(['\n', '\r']) {
+        return Err(FsError::new(
+            "FS_UNSUPPORTED",
+            format!(
+                "qx grep matches single lines; a pattern with a line break never matches (use the native {} tool)",
+                native(Native::Grep)
+            ),
+        )
+        .fb("grep"));
+    }
     let include = opt_str(args, "include");
     if let Some(inc) = include {
-        if inc.contains(',') {
+        // A comma inside braces (`*.{ts,tsx}`) is one glob; only a top-level comma is a list.
+        if split_top_level(inc).len() > 1 {
             return Err(FsError::arg(format!(
-                "include takes one glob; comma-separated lists are not supported (use the native {} tool)",
+                "include takes one glob; comma-separated lists are not supported (use *.{{a,b}} or the native {} tool)",
                 native(Native::Grep)
             ))
             .fb("grep"));
@@ -1296,6 +1329,13 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     }
     if total == 0 {
         out.push_str("No matches found.\n");
+        // `TODO|FIXME`, `fn\s+main`: a model often means a regex; say this search was literal.
+        if needle.contains(['|', '\\', '*', '[', '(', '^', '$', '+']) {
+            out.push_str(&format!(
+                "[qx] the pattern was searched as literal text; for a regex use the native {} tool\n",
+                native(Native::Grep)
+            ));
+        }
     } else if total > shown {
         out.push_str(&format!(
             "\n[qx] showing {shown} of {total} matches; narrow the search or use the native {} tool.\n",
@@ -2062,6 +2102,98 @@ mod tests {
         let r = invoke(&cwd, "read", json!({"path": base.join("secret.txt")}));
         assert!(r.is_error);
         assert_eq!(r.structured["code"], "FS_OUTSIDE_WORKSPACE");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn vcs_metadata_is_protected_whatever_the_cwd() {
+        let base = tmp("vcs-cwd");
+        let hooks = base.join("repo").join(".git").join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        // A cwd chosen inside .git must not turn its contents into ordinary workspace files.
+        let r = invoke(&hooks, "write", json!({"path":"pre-commit","content":"#!/bin/sh\necho hi\n"}));
+        assert!(r.is_error, "{}", r.text);
+        assert_eq!(r.structured["code"], "FS_PROTECTED");
+        assert!(!hooks.join("pre-commit").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn write_refuses_names_windows_cannot_handle() {
+        let dir = tmp("win-names");
+        for bad in ["nul", "log-12:30.txt", "notes.md.", "x.txt ", "sub/aux.rs", "COM1.log"] {
+            let r = invoke(&dir, "write", json!({"path":bad,"content":"x"}));
+            assert!(r.is_error, "{bad:?} was written");
+            assert_eq!(r.structured["code"], "FS_BAD_ARG", "{bad:?}");
+        }
+        // `a:b/...` is drive-relative on Windows (drive A:): refused, whatever the code.
+        assert!(invoke(&dir, "write", json!({"path":"a:b/c.txt","content":"x"})).is_error);
+        assert!(!dir.join("log-12").exists() && !dir.join("sub").exists() && !dir.join("a").exists());
+        // (`NUL.txt` is NUL too, per Windows naming rules, but `null` and `con-notes` are not.)
+        for ok in ["con-notes.md", "console.log", "null/x.txt.bak"] {
+            let r = invoke(&dir, "write", json!({"path":ok,"content":"x"}));
+            assert!(!r.is_error, "{ok:?}: {}", r.text);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_explains_patterns_that_cannot_match_literally() {
+        let dir = tmp("grep-literal");
+        fs::write(dir.join("a.txt"), "TODO: x\na\nb\n").unwrap();
+        let r = invoke(&dir, "grep", json!({"pattern":"TODO|FIXME"}));
+        assert!(!r.is_error && r.text.contains("No matches found") && r.text.contains("literal"), "{}", r.text);
+        let r = invoke(&dir, "grep", json!({"pattern":"a\nb"}));
+        assert!(r.is_error, "{}", r.text);
+        assert_eq!(r.structured["code"], "FS_UNSUPPORTED");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_include_takes_a_brace_glob() {
+        let dir = tmp("grep-brace");
+        for f in ["a.ts", "b.tsx", "c.rs"] {
+            fs::write(dir.join(f), "needle\n").unwrap();
+        }
+        let r = invoke(&dir, "grep", json!({"pattern":"needle","include":"*.{ts,tsx}"}));
+        assert!(!r.is_error, "{}", r.text);
+        assert!(r.text.contains("a.ts") && r.text.contains("b.tsx") && !r.text.contains("c.rs"), "{}", r.text);
+        let r = invoke(&dir, "grep", json!({"pattern":"needle","include":"*.ts,*.tsx"}));
+        assert_eq!(r.structured["code"], "FS_BAD_ARG", "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confinement_holds_against_dotdot_and_junctions() {
+        let base = tmp("confine");
+        let (work, outside) = (base.join("work"), base.join("outside"));
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "secret\n").unwrap();
+        let r = invoke(&work, "write", json!({"path":"../escape.txt","content":"x"}));
+        assert_eq!(r.structured["code"], "FS_OUTSIDE_WORKSPACE", "{}", r.text);
+        assert!(!base.join("escape.txt").exists());
+        let link = work.join("out");
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !made {
+            println!("skip: cannot create a junction here");
+            let _ = fs::remove_dir_all(&base);
+            return;
+        }
+        let r = invoke(&work, "read", json!({"path":"out/secret.txt"}));
+        assert_eq!(r.structured["code"], "FS_OUTSIDE_WORKSPACE", "{}", r.text);
+        let r = invoke(&work, "write", json!({"path":"out/new.txt","content":"x"}));
+        assert!(r.is_error && !outside.join("new.txt").exists(), "{}", r.text);
+        let r = invoke(&work, "grep", json!({"pattern":"secret"}));
+        assert!(!r.text.contains("secret.txt"), "{}", r.text);
+        let r = invoke(&work, "glob", json!({"pattern":"**/*.txt"}));
+        assert!(!r.text.contains("secret.txt"), "{}", r.text);
+        let _ = fs::remove_dir(&link);
         let _ = fs::remove_dir_all(&base);
     }
 
