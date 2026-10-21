@@ -639,4 +639,13 @@ mod tests {
         assert!(matches!(again[0].edit, Edit::Unchanged));
         let _ = std::fs::remove_dir_all(&p.home);
     }
+
+    #[test]
+    fn remove_on_a_config_without_the_parent_key_is_unchanged_not_refused() {
+        let p = paths("remove-noparent");
+        std::fs::write(claude_file(&p), "{\"a\": 1}\n").unwrap();
+        let changes = plan(Client::ClaudeCode, &p, Path::new(r"C:\q\qx.exe"), Action::Remove).unwrap();
+        assert!(matches!(changes[0].edit, Edit::Unchanged), "a missing parent must not refuse the removal");
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
 }
