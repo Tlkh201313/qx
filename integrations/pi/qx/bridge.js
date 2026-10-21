@@ -28,12 +28,20 @@ export class QxBridge {
       windowsHide: true,
     });
     this.child = child;
+    this.buffer = "";
     child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => this.onData(chunk));
+    // Events are scoped to their own child: a dying old process must not fail its replacement.
+    child.stdout.on("data", (chunk) => {
+      if (this.child === child) this.onData(chunk);
+    });
     // qx writes nothing to stderr on the happy path; never let a full pipe block it.
     child.stderr.on("data", () => {});
-    child.on("error", (error) => this.fail(error));
-    child.on("exit", () => this.fail(new Error("qx exited")));
+    child.stdout.on("error", () => {});
+    child.stderr.on("error", () => {});
+    // A write to a dead child (EPIPE) is an 'error' event; unhandled it would crash pi.
+    child.stdin.on("error", (error) => this.failFrom(child, error));
+    child.on("error", (error) => this.failFrom(child, error));
+    child.on("exit", () => this.failFrom(child, new Error("qx exited")));
     this.ready = this.request("initialize", {
       protocolVersion: PROTOCOL,
       capabilities: {},
@@ -74,11 +82,17 @@ export class QxBridge {
     }
   }
 
+  failFrom(child, error) {
+    if (this.child === child) this.fail(error);
+  }
+
   fail(error) {
     for (const entry of this.pending.values()) entry.reject(error);
     this.pending.clear();
     this.child = null;
     this.ready = null;
+    // Half a line from the dead child would be glued to the next child's first reply.
+    this.buffer = "";
   }
 
   send(payload) {
