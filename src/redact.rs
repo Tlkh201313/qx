@@ -31,6 +31,9 @@ const KEYS: &[&str] = &[
     "private-key",
     "accesskey",
     "passphrase",
+    // Rails and Laravel application keys.
+    "secret_key_base",
+    "app_key",
 ];
 
 const PREFIXES: &[(&str, usize)] = &[
@@ -61,6 +64,11 @@ const PREFIXES: &[(&str, usize)] = &[
     ("sntrys_", 20),
     ("SG.", 30),
     ("eyJ", 40),
+    // base64 of `-----BEGIN`: kubeconfig `client-key-data`, CI variables (also hides certificates: fail closed).
+    ("LS0tLS1CRUdJTi", 40),
+    ("pypi-", 20),
+    ("whsec_", 20),
+    ("dckr_pat_", 20),
 ];
 
 use std::borrow::Cow;
@@ -104,8 +112,13 @@ pub fn redact(input: &str) -> (String, usize) {
         }
 
         if has_begin {
+            // What precedes the header (a diff `+`, a `cat -n` number, a JSON key) stays, masked
+            // like any other text; everything from the header on goes.
+            let at = line.to_ascii_lowercase().find("-----begin").unwrap_or(0);
+            let (prefix, n) = mask_line(&line[..at]);
+            out.push_str(&prefix);
             out.push_str("[REDACTED PRIVATE KEY]");
-            count += 1;
+            count += 1 + n;
             // A JSON-encoded key keeps BEGIN and END on one line; a PEM dump
             // spreads them across lines and must stay suppressed until END. A header that
             // is only quoted in source code does not own the lines after it.
@@ -117,7 +130,7 @@ pub fn redact(input: &str) -> (String, usize) {
         }
 
         // Bearer first: masking the word "Bearer" as a key value would hide the
-        // anchor and leave the actual token exposed.
+        // anchor and leave the actual token exposed. (Inline: a clean line allocates nothing.)
         let (masked, n1) = mask_auth(line);
         let (masked, n2) = mask_conn_strings(&masked);
         let (masked, n3) = mask_key_values(&masked);
@@ -127,6 +140,15 @@ pub fn redact(input: &str) -> (String, usize) {
         out.push_str(nl);
     }
     (out, count)
+}
+
+/// The same rules as the main loop, for the text before a private-key header.
+fn mask_line(line: &str) -> (String, usize) {
+    let (masked, n1) = mask_auth(line);
+    let (masked, n2) = mask_conn_strings(&masked);
+    let (masked, n3) = mask_key_values(&masked);
+    let (masked, n4) = mask_tokens(&masked);
+    (masked.into_owned(), n1 + n2 + n3 + n4)
 }
 
 /// Whether a PEM `BEGIN` line without an `END` opens a multi-line key: the header ends its line
@@ -208,19 +230,24 @@ fn mask_key_values(line: &str) -> (Cow<'_, str>, usize) {
         while e > 0 && matches!(b[e - 1], b' ' | b'\t') {
             e -= 1;
         }
+        let mut quoted = false;
         if e > 0 && matches!(b[e - 1], b'"' | b'\'') {
             e -= 1; // the key's closing quote: `"password": "x"`
+            quoted = true;
             if e > 0 && b[e - 1] == b'\\' {
                 e -= 1; // ... inside a JSON string: `{\"password\":\"x\"}`
             }
         }
+        let ends_with = |w: &[u8]| e >= w.len() && b[e - w.len()..e].eq_ignore_ascii_case(w);
         let key_at = KEYS.iter().find_map(|k| {
             let kb = k.as_bytes();
-            (e >= kb.len()
-                && b[e - kb.len()..e].eq_ignore_ascii_case(kb)
-                && if flag { flag_word_starts(b, e - kb.len()) } else { key_starts(b, e - kb.len(), e) })
-            .then_some(e - kb.len())
-        });
+            (ends_with(kb) && if flag { flag_word_starts(b, e - kb.len()) } else { key_starts(b, e - kb.len(), e) })
+                .then_some(e - kb.len())
+        })
+        // Docker's `"auth": "<base64>"` (a JSON key only: `git auth: done` is prose) and a SAS URL's
+        // `&sig=` / `?sig=` (only as a query parameter: `--sig` and `signature=` are not).
+        .or_else(|| (quoted && sep == b':' && ends_with(b"\"auth")).then(|| e - 4))
+        .or_else(|| (sep == b'=' && e >= 4 && ends_with(b"sig") && matches!(b[e - 4], b'?' | b'&')).then(|| e - 3));
         let Some(key_at) = key_at else {
             continue;
         };
@@ -257,7 +284,7 @@ fn mask_key_values(line: &str) -> (Cow<'_, str>, usize) {
         if word.0 <= start && start < word.1 {
             j = word.1; // inside a run an earlier separator already scanned
         } else {
-            while j < b.len() && !matches!(b[j], b' ' | b'\t' | b',' | b';' | b'"' | b'\'' | b'\r' | b'\n') {
+            while j < b.len() && !matches!(b[j], b' ' | b'\t' | b',' | b';' | b'"' | b'\'' | b'\r' | b'\n' | b'\x0b' | b'\x0c') {
                 j += 1;
             }
             word = (start, j);
@@ -306,7 +333,8 @@ fn is_code_or_prose(b: &[u8], key_at: usize, sep: u8, spaced: bool, value: &[u8]
     let camel = value[0].is_ascii_uppercase()
         && value.iter().all(u8::is_ascii_alphabetic)
         && value.iter().any(u8::is_ascii_lowercase);
-    let sentence = rest.trim_ascii_start().first().is_some_and(u8::is_ascii_alphanumeric);
+    // A bounded look-ahead: trimming a long whitespace run once per separator was quadratic.
+    let sentence = rest.iter().take(256).find(|c| !c.is_ascii_whitespace()).is_some_and(u8::is_ascii_alphanumeric);
     after_word && (camel || sentence)
 }
 
@@ -341,7 +369,7 @@ fn mask_ranges(line: &str, mut ranges: Vec<(usize, usize)>) -> (Cow<'_, str>, us
 /// First byte of every entry in `PREFIXES` (a test keeps the two in sync), so
 /// most bytes skip the prefix table entirely.
 fn is_prefix_start(b: u8) -> bool {
-    matches!(b, b's' | b'p' | b'r' | b'g' | b'A' | b'x' | b'y' | b'h' | b'n' | b'd' | b'S' | b'e')
+    matches!(b, b's' | b'p' | b'r' | b'g' | b'A' | b'x' | b'y' | b'h' | b'n' | b'd' | b'S' | b'e' | b'L' | b'w')
 }
 
 fn mask_tokens(line: &str) -> (Cow<'_, str>, usize) {
@@ -350,6 +378,9 @@ fn mask_tokens(line: &str) -> (Cow<'_, str>, usize) {
     let mut copied = 0usize;
     let mut count = 0usize;
     let mut i = 0usize;
+    // The token-byte run last scanned: every prefix inside it ends at the same place, so a line of
+    // `npm_.npm_.…` is scanned once, not once per prefix.
+    let mut run = (0usize, 0usize);
 
     while i < bytes.len() {
         if is_prefix_start(bytes[i]) {
@@ -357,10 +388,17 @@ fn mask_tokens(line: &str) -> (Cow<'_, str>, usize) {
             let edge = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || matches!(bytes[i - 1], b'_' | b'-'));
             // The table scan is the costly part: run it only at a word edge.
             if let Some((plen, min)) = if edge { prefix_at(bytes, i) } else { None } {
-                let mut j = i + plen;
-                while j < bytes.len() && is_token_byte(bytes[j]) {
-                    j += 1;
-                }
+                let from = i + plen;
+                let j = if run.0 <= from && from <= run.1 {
+                    run.1
+                } else {
+                    let mut j = from;
+                    while j < bytes.len() && is_token_byte(bytes[j]) {
+                        j += 1;
+                    }
+                    run = (from, j);
+                    j
+                };
                 // Real npm tokens are plain alphanumerics; `npm_package_name` is an env var.
                 let plain = &bytes[i..i + plen] != b"npm_" || bytes[i + plen..j].iter().all(u8::is_ascii_alphanumeric);
                 if plain && j - (i + plen) >= min {
@@ -665,6 +703,41 @@ mod tests {
         }
         // no password: nothing to mask
         assert_eq!(redact("ssh://git@github.com:22/org/repo").1, 0);
+    }
+
+    #[test]
+    fn common_credential_files_are_masked() {
+        for (line, secret) in [
+            ("    client-key-data: LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQpNSUlFb3dJQkFBS0NBUUVB", "LS0tLS1CRUdJTiBSU0EgUFJJVkFU"),
+            (r#"{"auths":{"r.io":{"auth":"dXNlcjpwYXNzd29yZA=="}}}"#, "dXNlcjpwYXNzd29yZA"),
+            ("SECRET_KEY_BASE=0123456789abcdef0123456789abcdef", "0123456789abcdef0123"),
+            ("APP_KEY=base64:Zm9vYmFyYmF6cXV4cXV1eHF1dXhxdXV4cXV1", "Zm9vYmFyYmF6cXV4"),
+            ("https://acct.blob.core.windows.net/c/x?sv=2022-11-02&sig=AbCdEf0123456789AbCdEf0123%3D", "AbCdEf0123456789"),
+            ("TWINE_PASSWORD=pypi-AgEIcHlwaS5vcmcCJGE0ZjU2ZjFjLWE5ZWQ", "AgEIcHlwaS5vcmcCJGE0"),
+            ("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw", "MfKQ9r8GKYqrTwjUPD8I"),
+            ("dckr_pat_2b3e36beeb386dfdaacb9b46004ccb7c", "2b3e36beeb386dfdaacb"),
+        ] {
+            let (s, n) = redact(line);
+            assert!(n >= 1 && !s.contains(secret), "{line} -> {s}");
+        }
+        // `auth` is only a secret as a JSON value; prose and flags around it stay.
+        assert_eq!(redact("git auth: done").1, 0);
+        assert_eq!(redact("see ?q=x&signature=y and &sig=z").1, 0);
+    }
+
+    #[test]
+    fn token_and_whitespace_runs_stay_linear() {
+        let t = std::time::Instant::now();
+        let _ = redact(&"npm_.".repeat(200_000));
+        let _ = redact(&format!("x{}{}z", "\x0ctoken:a".repeat(50_000), " ".repeat(500_000)));
+        assert!(t.elapsed().as_secs() < 2, "quadratic scan: {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn a_begin_line_keeps_its_prefix() {
+        let (s, _) = redact("+    -----BEGIN RSA PRIVATE KEY-----\n+    MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0t\n+    -----END RSA PRIVATE KEY-----\n+  password_file: /etc/x\n");
+        assert!(s.starts_with("+    [REDACTED PRIVATE KEY]"), "{s:?}");
+        assert!(!s.contains("MIIEow") && s.contains("password_file"), "{s:?}");
     }
 
     #[test]
