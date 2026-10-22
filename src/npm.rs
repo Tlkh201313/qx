@@ -294,6 +294,11 @@ fn fast_with(pm: Pm, args: &[String], cwd: Option<&Path>) -> Option<Fast> {
         return None;
     }
     let (root, pkg) = find_package(&start)?;
+    // `config` reaches scripts as npm_package_config_*, which qx does not export; and a workspace
+    // member runs under the root's .npmrc and workspace rules. Both belong to the real tool.
+    if pkg.get("config").and_then(Value::as_object).is_some_and(|m| !m.is_empty()) || workspace_member(&root) {
+        return None;
+    }
 
     match &pm {
         Pm::Npm => {
@@ -333,7 +338,8 @@ fn fast_with(pm: Pm, args: &[String], cwd: Option<&Path>) -> Option<Fast> {
             None if event == name => return None,
             None => continue,
         };
-        if script.is_empty() || script.contains("npm_") {
+        // `npm_*` variables, and node-gyp (npm puts its bundled copy on the script PATH), are npm's.
+        if script.is_empty() || script.to_ascii_lowercase().contains("npm_") || script.contains("node-gyp") {
             return None;
         }
         let mut command = script.to_string();
@@ -545,6 +551,18 @@ fn find_package(start: &Path) -> Option<(PathBuf, Value)> {
             return None;
         }
     }
+}
+
+/// A package.json above `root` that declares `workspaces`: `root` is a member of that workspace.
+fn workspace_member(root: &Path) -> bool {
+    root.ancestors().skip(1).any(|dir| {
+        let file = dir.join("package.json");
+        file.is_file()
+            && std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(t.trim_start_matches('\u{feff}')).ok())
+                .is_some_and(|p| p.get("workspaces").is_some())
+    })
 }
 
 fn npmrc_overrides(root: &Path) -> bool {
@@ -791,6 +809,30 @@ mod tests {
         assert!(fast(&["run".into(), "x".into()], Some(&d)).is_some());
         std::fs::write(d.join(".npmrc"), "ignore-scripts=true\n").unwrap();
         assert!(fast(&["run".into(), "x".into()], Some(&d)).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn what_npm_adds_that_qx_cannot_falls_back() {
+        let d = std::env::temp_dir().join(format!("qx-npmadds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let pkg = |text: &str| std::fs::write(d.join("package.json"), text).unwrap();
+        let start = |dir: &Path| fast(&["start".into()], Some(dir));
+        // `config` becomes npm_package_config_* in the script's environment.
+        pkg(r#"{"config":{"port":"8080"},"scripts":{"start":"node server.js"}}"#);
+        assert!(start(&d).is_none());
+        pkg(r#"{"config":{},"scripts":{"start":"node server.js"}}"#);
+        assert!(start(&d).is_some());
+        // npm puts its bundled node-gyp on the script PATH.
+        pkg(r#"{"scripts":{"start":"node-gyp rebuild"}}"#);
+        assert!(start(&d).is_none());
+        // A workspace member: the root's .npmrc and workspace rules apply.
+        pkg(r#"{"workspaces":["packages/*"]}"#);
+        let member = d.join("packages").join("a");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("package.json"), r#"{"scripts":{"start":"echo x"}}"#).unwrap();
+        assert!(start(&member).is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 
