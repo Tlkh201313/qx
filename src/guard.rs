@@ -1206,7 +1206,7 @@ fn check_dotnet_delete(command: &str, cwd: Option<&Path>, d: &mut Decision) {
         } else if before.ends_with(')') {
             // `(Get-Item x).Delete(...)`: the last plain word of the group before it
             let Some(open) = before.rfind('(') else { continue };
-            tokenize(&command[open + 1..at - 1]).into_iter().skip(1).filter(|t| !t.starts_with('-')).last().unwrap_or_default()
+            tokenize(&command[open + 1..at - 1]).into_iter().skip(1).rfind(|t| !t.starts_with('-')).unwrap_or_default()
         } else {
             continue;
         };

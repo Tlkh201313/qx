@@ -910,6 +910,127 @@ fn snapshot(c: &Capture) -> (Vec<u8>, bool) {
     )
 }
 
+/// A child's output. UTF-8 (and UTF-16 with a BOM) as `decode_owned`; a line that is not valid UTF-8
+/// came from a tool writing in the console's code page (`dir`, `tree`, localized errors), so it is
+/// decoded in that page instead of turning into U+FFFD. Valid UTF-8 lines are never re-read.
+pub(crate) fn decode_output(bytes: Vec<u8>) -> String {
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return decode(&bytes);
+    }
+    let bytes = match String::from_utf8(bytes) {
+        Ok(mut s) => {
+            if s.contains('\0') {
+                s.retain(|c| c != '\0');
+            }
+            return s;
+        }
+        Err(e) => e.into_bytes(),
+    };
+    let mut out = String::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|&b| b == b'\n') {
+        match std::str::from_utf8(line) {
+            Ok(s) => out.push_str(s),
+            Err(_) => out.push_str(&std_handles::from_console_page(line)),
+        }
+    }
+    if out.contains('\0') {
+        out.retain(|c| c != '\0');
+    }
+    out
+}
+
+/// Make qx's own stdin/stdout/stderr non-inheritable, once at start-up: every child would otherwise
+/// inherit them, and a daemon it starts (`start /b server`) would hold an MCP client's pipe open
+/// after qx exits. `Stdio::inherit` still works: std hands the child its own duplicate.
+pub fn seal_std_handles() {
+    #[cfg(windows)]
+    std_handles::seal();
+}
+
+#[cfg(windows)]
+mod std_handles {
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        #[cfg(test)]
+        fn GetHandleInformation(h: *mut c_void, flags: *mut u32) -> i32;
+        fn SetHandleInformation(h: *mut c_void, mask: u32, flags: u32) -> i32;
+        fn GetOEMCP() -> u32;
+        fn GetConsoleOutputCP() -> u32;
+        fn MultiByteToWideChar(page: u32, flags: u32, src: *const u8, src_len: i32, dst: *mut u16, dst_len: i32) -> i32;
+    }
+
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+
+    pub fn seal() {
+        for (_, which) in STD {
+            if let Some(h) = handle(which) {
+                // SAFETY: `h` is a live std handle; clearing a flag cannot invalidate it.
+                unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) };
+            }
+        }
+    }
+
+    /// Bytes in the console's output code page (qx's own console, else the system OEM page).
+    pub fn from_console_page(bytes: &[u8]) -> String {
+        // SAFETY: no preconditions.
+        let page = match unsafe { GetConsoleOutputCP() } {
+            0 | 65001 => oem_code_page(),
+            p => p,
+        };
+        let Ok(len) = i32::try_from(bytes.len()) else {
+            return String::from_utf8_lossy(bytes).into_owned();
+        };
+        // SAFETY: a size query (null destination); `bytes` is valid for `len` bytes.
+        let need = unsafe { MultiByteToWideChar(page, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+        if need <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        let mut wide = vec![0u16; need as usize];
+        // SAFETY: `wide` holds exactly `need` u16s, the size the query returned.
+        let got = unsafe { MultiByteToWideChar(page, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), need) };
+        if got <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        String::from_utf16_lossy(&wide[..got as usize])
+    }
+
+    pub const STD: [(&str, u32); 3] = [("stdin", -10i32 as u32), ("stdout", -11i32 as u32), ("stderr", -12i32 as u32)];
+
+    pub fn handle(which: u32) -> Option<*mut c_void> {
+        // SAFETY: GetStdHandle has no preconditions.
+        let h = unsafe { GetStdHandle(which) };
+        (!h.is_null() && h as isize != -1).then_some(h)
+    }
+
+    /// Each valid std handle and whether a child would inherit it.
+    #[cfg(test)]
+    pub fn inheritable() -> Vec<(&'static str, bool)> {
+        STD.iter()
+            .filter_map(|(name, which)| {
+                let h = handle(*which)?;
+                let mut flags = 0u32;
+                // SAFETY: `h` is a live std handle and `flags` a valid out-pointer.
+                (unsafe { GetHandleInformation(h, &mut flags) } != 0).then_some((*name, flags & 1 != 0))
+            })
+            .collect()
+    }
+
+    pub fn oem_code_page() -> u32 {
+        // SAFETY: no preconditions.
+        unsafe { GetOEMCP() }
+    }
+}
+
+#[cfg(not(windows))]
+mod std_handles {
+    pub fn from_console_page(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
 #[cfg(windows)]
 mod job {
     use std::ffi::c_void;
@@ -1178,8 +1299,8 @@ pub fn run_captured(mut cmd: Command, timeout: Option<Duration>) -> std::io::Res
     let (so, so_cut) = snapshot(&out_sink);
     let (se, se_cut) = snapshot(&err_sink);
 
-    let mut stdout = decode_owned(so);
-    let mut stderr = decode_owned(se);
+    let mut stdout = decode_output(so);
+    let mut stderr = decode_output(se);
     if so_cut {
         stdout.push_str("\n[qx] stdout truncated at 16 MiB\n");
     }
@@ -1283,7 +1404,8 @@ pub(crate) fn decode(bytes: &[u8]) -> String {
 }
 
 /// `decode` for a buffer the caller owns: valid UTF-8 (the usual case) is validated in place instead of
-/// being copied. Same result as `decode`.
+/// being copied. Same result as `decode`. (Process output goes through `decode_output`.)
+#[cfg(test)]
 pub(crate) fn decode_owned(bytes: Vec<u8>) -> String {
     if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
         return decode(&bytes);
@@ -1774,6 +1896,29 @@ mod tests {
         c.env("QX_C_ARG", "expanded");
         let o = run_captured(c, Some(Duration::from_secs(20))).unwrap();
         assert_eq!(o.stdout.trim(), "expanded", "stderr: {}", o.stderr);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_output_in_the_oem_code_page_is_decoded() {
+        // `dir`, `tree` and localized errors print in the console's code page, not UTF-8.
+        let s = decode_output(b"ok \xe2\x9c\x93\ncaf\x82\n".to_vec());
+        assert!(s.starts_with("ok \u{2713}\n"), "a UTF-8 line stays UTF-8: {s:?}");
+        assert!(!s.contains('\u{fffd}'), "{s:?}");
+        // 0x82 is `é` in the Western OEM pages; other pages map it to something else.
+        if matches!(std_handles::oem_code_page(), 437 | 850 | 858) {
+            assert!(s.ends_with("caf\u{e9}\n"), "{s:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn qx_does_not_hand_its_own_stdio_to_children() {
+        // A daemon started by a command would otherwise hold qx's stdout (an MCP pipe) open forever.
+        seal_std_handles();
+        for (name, inheritable) in std_handles::inheritable() {
+            assert!(!inheritable, "{name} is still inheritable");
+        }
     }
 
     #[test]

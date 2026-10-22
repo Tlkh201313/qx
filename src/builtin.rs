@@ -774,10 +774,8 @@ fn cmd_head(args: &[String], cwd: Option<&Path>, tail: bool) -> Option<BuiltinOu
             Some((true, rest))
         } else if let Some(rest) = a.strip_prefix("-n") {
             Some((false, rest))
-        } else if let Some(rest) = a.strip_prefix("-c") {
-            Some((true, rest))
         } else {
-            None
+            a.strip_prefix("-c").map(|rest| (true, rest))
         };
         match spec {
             Some((bytes, rest)) => {
@@ -1042,8 +1040,7 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                 i += 1;
                 continue;
             }
-            let mut chars = body.char_indices();
-            while let Some((pos, ch)) = chars.next() {
+            for (pos, ch) in body.char_indices() {
                 match ch {
                     'i' => insensitive = true,
                     'n' => number = true,
