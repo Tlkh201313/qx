@@ -39,15 +39,23 @@ pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Dige
         return None;
     }
     let l = core_label(&label.to_ascii_lowercase());
+    let (e, ec) = keep_stderr(stderr);
     let (profile, out, err, omitted, clipped) = if is_git_status(&l) {
         let (o, n) = git_status(stdout)?;
-        ("git-status", o, keep_stderr(stderr), n, false)
+        ("git-status", o, e, n, ec)
     } else if is_git_log(&l) {
         let (o, n) = git_log(stdout)?;
-        ("git-log", o, keep_stderr(stderr), n, false)
+        ("git-log", o, e, n, ec)
     } else if is_diff(&l) {
         let (o, n, c) = git_diff(stdout)?;
-        ("git-diff", o, keep_stderr(stderr), n, c)
+        ("git-diff", o, e, n, c || ec)
+    } else if is_pathlist(&l) {
+        // Searches and listings first: `rg -n jest` is a search, whatever word it searches for.
+        let (o, n) = paths(stdout)?;
+        ("paths", o, e, n, ec)
+    } else if is_search(&l) {
+        let (o, n, c) = grep(stdout)?;
+        ("search", o, e, n, c || ec)
     } else if is_test(&l) {
         if verbatim(&l, code) {
             return None;
@@ -65,17 +73,15 @@ pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Dige
     } else if is_runtime(&l) {
         let (o, e, n, c) = runtime_digest(stdout, stderr, code)?;
         ("traceback", o, e, n, c)
-    } else if is_pathlist(&l) {
-        let (o, n) = paths(stdout)?;
-        ("paths", o, keep_stderr(stderr), n, false)
-    } else if is_search(&l) {
-        let (o, n, c) = grep(stdout)?;
-        ("search", o, keep_stderr(stderr), n, c)
     } else if let Some((o, n)) = json_min(&l, stdout) {
-        ("json", o, keep_stderr(stderr), n, false)
+        ("json", o, e, n, ec)
     } else {
         return None;
     };
+    // A digest is still a reply: a 5000-commit log or a 1 MB JSON line is held to a budget, and
+    // anything cut makes it lossy, so the full text is spooled.
+    let (out, cut) = bound(out, if profile == "git-diff" { 1500 } else { 400 });
+    let clipped = clipped || cut;
 
     let before = stdout.len() + stderr.len();
     let after = out.len() + err.len();
@@ -92,15 +98,36 @@ pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Dige
     })
 }
 
+/// Lines past `cap`, or one longer than a line may be, go through compaction; the flag says
+/// something was cut.
+fn bound(text: String, cap: usize) -> (String, bool) {
+    if text.lines().count() <= cap && !text.lines().any(|l| l.len() > compact::MAX_LINE_CHARS) {
+        return (text, false);
+    }
+    compact::compact(&text, cap, cap * 2 / 5, cap * 3 / 10)
+}
+
 /// The caller asked for the output itself: `--nocapture` and `-s` print what the tests print, and
 /// `--json` output is for a parser. A passing run's summary-only digest would drop all of it.
 fn verbatim(l: &str, code: i32) -> bool {
     let machine = |w: &str| w.starts_with('-') && ["json", "junit", "tap", "xml"].iter().any(|k| w.contains(k));
-    words(l).any(machine)
-        || (code == 0
-            && words(l).any(|w| {
-                matches!(w, "--nocapture" | "-s" | "--show-output" | "-v" | "-vv" | "-vvv" | "--verbose" | "--capture=no")
-            }))
+    let shows = |w: &str| {
+        matches!(
+            w,
+            "--nocapture" | "--no-capture" | "-s" | "--show-output" | "-v" | "-vv" | "-vvv" | "--verbose" | "--capture=no" | "--capture=tee-sys"
+        ) || w.starts_with("--verbose=")
+            || w == "--reporter=verbose"
+            // `-sv`, `-xvs`: a cluster of short flags that holds -s or -v (not -k/-m/-p/-r, which take a value).
+            || (w.len() > 2
+                && w.starts_with('-')
+                && !w.starts_with("--")
+                && w[1..].bytes().all(|c| c.is_ascii_alphabetic())
+                && !matches!(w.as_bytes()[1], b'k' | b'm' | b'p' | b'r')
+                && w[1..].contains(['s', 'v']))
+    };
+    let w: Vec<&str> = words(l).collect();
+    w.iter().any(|x| machine(x))
+        || (code == 0 && (w.iter().any(|x| shows(x)) || w.windows(2).any(|p| p[0] == "--reporter" && p[1] == "verbose")))
 }
 
 fn merge(stdout: &str, stderr: &str) -> String {
@@ -119,12 +146,12 @@ fn merge(stdout: &str, stderr: &str) -> String {
     s
 }
 
-fn keep_stderr(stderr: &str) -> String {
+/// Stderr beside a digest, compacted; the flag says lines were cut (so the full text is spooled).
+fn keep_stderr(stderr: &str) -> (String, bool) {
     if stderr.trim().is_empty() {
-        return String::new();
+        return (String::new(), false);
     }
-    let (s, _) = compact::compact(stderr, 120, 50, 40);
-    s
+    compact::compact(stderr, 120, 50, 40)
 }
 
 fn words(l: &str) -> impl Iterator<Item = &str> {
@@ -318,7 +345,17 @@ fn is_diff(l: &str) -> bool {
 }
 
 fn is_test(l: &str) -> bool {
-    if words(l).any(|w| matches!(w, "pytest" | "jest" | "vitest" | "nextest")) {
+    // The runner in command position (`pytest`, `python -m pytest`, `yarn jest`, `cargo nextest`),
+    // not anywhere: `rg -n jest` searches for the word.
+    let runner = |w: &str| matches!(w, "pytest" | "py.test" | "jest" | "vitest" | "nextest");
+    let w: Vec<&str> = words(l).take(3).collect();
+    let at_front = match w.as_slice() {
+        [first, ..] if runner(first) => true,
+        ["python" | "python3" | "py", "-m", r, ..] => runner(r),
+        ["yarn" | "pnpm" | "bun" | "bunx" | "npx" | "cargo", r, ..] => runner(r),
+        _ => false,
+    };
+    if at_front {
         return true;
     }
     if !words(l).any(|w| w == "test") {
@@ -713,7 +750,13 @@ fn git_diff(text: &str) -> Option<(String, usize, bool)> {
             in_hunk = true;
             continue;
         }
-        // Inside a hunk `--- x` is the removed line `-- x`, not a file header.
+        // Inside a hunk `--- x` is the removed line `-- x`, not a file header. A note qx's redaction
+        // put there (`[qx] no END line ...`) is not the end of the hunk either.
+        if in_hunk && line.starts_with("[qx]") {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
         if in_hunk && !matches!(line.as_bytes().first(), None | Some(b' ' | b'+' | b'-' | b'\\')) {
             in_hunk = false; // `commit ...` of the next `git show` entry
         }
@@ -885,6 +928,40 @@ fn summary_line(t: &str) -> bool {
         || t.contains("vulnerabilit")
 }
 
+/// MSBuild's `    1 Warning(s)` / `    2 Error(s)` with a count above zero.
+fn nonzero_tally(t: &str) -> bool {
+    (t.ends_with(" Warning(s)") || t.ends_with(" Error(s)"))
+        && t.split_whitespace().next().is_some_and(|n| n.parse::<u64>().is_ok_and(|n| n > 0))
+}
+
+/// Progress and bookkeeping a green test or build run prints: dropping it loses nothing.
+fn routine_line(t: &str) -> bool {
+    const STARTS: &[&str] = &[
+        "Compiling ", "Checking ", "Finished ", "Running ", "Fresh ", "Downloaded ", "Downloading ", "Updating ",
+        "Locking ", "Adding ", "Blocking ", "Installing ", "Installed ", "Replacing ", "Replaced ", "Doc-tests ",
+        "running ", "collecting ", "collected ", "platform ", "rootdir:", "cachedir:", "plugins:", "configfile:",
+        "Collecting ", "Using cached ", "Requirement already satisfied", "Building wheel", "Created wheel",
+        "Stored in directory", "Preparing metadata", "Getting requirements", "Determining projects to restore",
+        "All projects are up-to-date", "Restored ", "Time Elapsed", "Ran all test suites", "Test Suites:", "Tests",
+        "Snapshots:", "Time:", "Duration", "Test Files", "Start at", "RUN ", "PASS ", "ok ", "--- PASS", "=== RUN",
+        "=== PAUSE", "=== CONT", "npm warn deprecated", "up to date", "added ", "removed ", "changed ", "audited ",
+        "found 0 vulnerabilities", "To address", "npm audit", "Run `npm audit", "npm fund", "run `npm fund`",
+        "Build succeeded", "0 Warning(s)", "0 Error(s)", "\u{2713}", "\u{221a}",
+    ];
+    t.is_empty()
+        // progress dots (`cargo test -q`, pytest) and pytest's `file.py .... [ 50%]`
+        || t.chars().all(|c| matches!(c, '.' | 's' | 'x' | 'S' | 'X'))
+        || t.ends_with("%]")
+        || t.ends_with(" ok")
+        || t.ends_with(" PASSED")
+        || t == "PASSED"
+        || t.ends_with("packages are looking for funding")
+        || t.starts_with('=')
+        || (t.starts_with('-') && t.chars().all(|c| c == '-'))
+        || t.contains(" -> ")
+        || STARTS.iter().any(|p| t.starts_with(p))
+}
+
 fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool)> {
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
@@ -943,6 +1020,9 @@ fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool
             || t.starts_with("warning:")
             || t.starts_with("WARNING: ")
             || t.starts_with("--> ")
+            // located warnings: MSBuild/MSVC `file(3,13): warning CS0168`, gcc/clang `a.c:3:5: warning:`
+            || (build && (t.contains("): warning ") || t.contains(": warning:") || t.contains(": warning ")))
+            || nonzero_tally(t)
         {
             keep[i] = true;
         }
@@ -976,7 +1056,9 @@ fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool
 
     let mut out = String::new();
     let mut kept = 0usize;
-    let mut clipped = false;
+    // A green run that drops more than progress (prints, console.log, unknown notes) keeps the
+    // full text on disk: the caller sees it was cut and where it went.
+    let mut clipped = code == 0 && lines.iter().zip(&keep).any(|(l, k)| !k && !routine_line(l.trim()));
     // msbuild/tsc print each located error again in their summary; the location
     // makes an exact repeat a true duplicate (rustc headers repeat without one).
     let mut seen = std::collections::HashSet::new();
@@ -1047,9 +1129,14 @@ fn split_numbered(line: &str) -> Option<(&str, &str, &str)> {
             continue;
         }
         // Another colon in the path part means an earlier one was not the separator: the
-        // `12:30:` of a timestamp is not a line number.
+        // `12:30:` of a timestamp is not a line number. Nor is `2024-01-01 12` a path: a space
+        // needs a directory separator beside it, and a path has a letter.
         let drive = matches!(b, [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic());
-        if line[if drive { 2 } else { 0 }..i].contains(':') {
+        let path = &line[if drive { 2 } else { 0 }..i];
+        if path.contains(':')
+            || (path.contains(char::is_whitespace) && !path.contains(['/', '\\']))
+            || !path.chars().any(char::is_alphabetic)
+        {
             continue;
         }
         let content = &line[j + 1..];
@@ -1368,6 +1455,79 @@ mod tests {
         assert!(out.contains("untracked (1):\n  new.txt"), "{out}");
         assert!(out.contains("ignored (1):\n  target/"), "{out}");
         assert!(!out.contains("Ignored files:"), "{out}");
+    }
+
+    #[test]
+    fn digest_replies_stay_within_the_output_budget() {
+        // 1 MB of pretty JSON minifies to one huge line; 5000 commits condense to 5000 lines.
+        let items: Vec<serde_json::Value> = (0..12_000).map(|i| serde_json::json!({"name": format!("pod-{i}"), "ready": true})).collect();
+        let json = serde_json::to_string_pretty(&items).unwrap();
+        let d = digest("curl http://x", &json, "", 0).unwrap();
+        assert!(d.stdout.lines().all(|l| l.len() <= 4200) && d.lossy(), "json line of {} chars", d.stdout.len());
+        let log: String = (0..5000)
+            .map(|i| format!("commit {i:040x}\nAuthor: a <a@b.c>\nDate:   Tue Oct 14 12:00:00 2026 +0000\n\n    change {i}\n\n"))
+            .collect();
+        let d = digest("git log", &log, "", 0).unwrap();
+        assert!(d.stdout.lines().count() <= 450 && d.lossy(), "{} lines", d.stdout.lines().count());
+    }
+
+    #[test]
+    fn requested_test_output_survives_a_green_run() {
+        let pass = "test_a.py::test_x hello-from-print\nPASSED\n===== 1 passed in 0.01s =====\n";
+        for label in ["pytest -sv", "pytest -xvs", "pytest --capture=tee-sys", "vitest --reporter=verbose", "jest --verbose=true", "cargo nextest run --no-capture"] {
+            assert!(digest(label, pass, "", 0).is_none(), "{label}");
+        }
+        // jest prints console.log of a passing test with no flag at all: dropping it must spool.
+        let jest = "PASS src/a.test.js\n  console.log\n    hello-from-log\n\n      at Object.<anonymous> (src/a.test.js:3:11)\n\nTest Suites: 1 passed, 1 total\nTests:       1 passed, 1 total\nSnapshots:   0 total\nTime:        0.5 s\nRan all test suites.\n";
+        if let Some(d) = digest("npx jest", jest, "", 0) {
+            assert!(d.stdout.contains("hello-from-log") || d.lossy(), "{}", d.stdout);
+        }
+        // Progress noise alone is not worth a spool file.
+        let noise: String = (0..50).map(|i| format!("test_a.py::test_{i} PASSED\n")).collect::<String>() + "===== 50 passed in 0.10s =====\n";
+        let d = digest("pytest -k smoke", &noise, "", 0).unwrap();
+        assert!(!d.lossy(), "{}", d.stdout);
+    }
+
+    #[test]
+    fn a_passing_build_keeps_its_located_warnings() {
+        let out = "  P -> C:\\p\\bin\\P.dll\nC:\\p\\Program.cs(3,13): warning CS0168: The variable 'x' is declared but never used [C:\\p\\P.csproj]\n\nBuild succeeded.\n    1 Warning(s)\n    0 Error(s)\n\nTime Elapsed 00:00:02.08\n";
+        let d = digest("dotnet build", out, "", 0).unwrap();
+        assert!(d.stdout.contains("warning CS0168") && d.stdout.contains("1 Warning(s)"), "{}", d.stdout);
+    }
+
+    #[test]
+    fn a_bare_timestamp_is_not_a_grep_location() {
+        assert!(split_match("2024-01-01 12:30:45 ERROR x").is_none());
+        let raw: String = (0..60).map(|i| format!("2024-01-01 12:{i:02}:45 ERROR x\n")).collect();
+        assert!(grep(&raw).is_none_or(|(o, _, _)| !o.contains("2024-01-01 12 (")));
+        // a path with a space and a separator is still a path
+        assert_eq!(split_match("My Docs/a.txt:3:x").map(|m| m.0), Some("My Docs/a.txt"));
+    }
+
+    #[test]
+    fn a_redaction_note_inside_a_hunk_does_not_end_it() {
+        let raw = "diff --git a/c.yml b/c.yml\n--- a/c.yml\n+++ b/c.yml\n@@ -1,1 +1,6 @@\n config:\n+    [REDACTED PRIVATE KEY]\n[qx] no END line within 200 lines; showing output again\n+  password_file: /etc/x\n";
+        let (out, _, _) = git_diff(raw).unwrap();
+        assert!(out.contains("+  password_file"), "{out}");
+    }
+
+    #[test]
+    fn searching_for_a_runner_name_is_a_search_not_a_test_run() {
+        let mut out: String = (0..40).map(|i| format!("src/a{i}.test.js:1:import {{ jest }} from '@jest/globals';\n")).collect();
+        out.push_str("src/z.test.js:9:  expect(f).toThrow('Error: boom');\n");
+        for label in ["rg -n jest", "grep -rn pytest .", "git grep vitest"] {
+            if let Some(d) = digest(label, &out, "", 0) {
+                assert_ne!(d.profile, "test", "{label}");
+            }
+        }
+        assert!(is_test("python -m pytest -q") && is_test("npx jest") && is_test("cargo test"));
+    }
+
+    #[test]
+    fn a_cut_stderr_marks_the_digest_lossy() {
+        let err: String = (0..300).map(|i| format!("warning: could not open directory 'd{i}/': Permission denied\n")).collect();
+        let d = digest("git status", "On branch main\nnothing to commit, working tree clean\n", &err, 0).unwrap();
+        assert!(d.lossy(), "{}", d.stderr);
     }
 
     #[test]

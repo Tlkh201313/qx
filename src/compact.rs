@@ -58,7 +58,7 @@ pub fn strip_ansi(s: &str) -> String {
     out
 }
 
-const MAX_LINE_CHARS: usize = 4000;
+pub(crate) const MAX_LINE_CHARS: usize = 4000;
 
 /// Markers that usually mean "the agent needs this line even if it is buried".
 const IMPORTANT_MARKERS: &[&str] = &[
