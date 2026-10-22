@@ -1513,11 +1513,16 @@ fn check_sql(text: &str, d: &mut Decision) {
     if u.contains("TRUNCATE ") {
         d.deny("SQL TRUNCATE deletes every row");
     }
-    if u.contains("DELETE FROM") && !u.contains(" WHERE ") {
-        d.deny("DELETE without WHERE deletes every row");
-    }
-    if u.contains("UPDATE ") && !u.contains(" WHERE ") {
-        d.warn("UPDATE without WHERE rewrites every row");
+    // One statement at a time: a WHERE in another statement protects nothing.
+    for s in u.split(';') {
+        let s = format!(" {} ", s.trim());
+        if s.contains(" DELETE FROM ") && !s.contains(" WHERE ") {
+            d.deny("DELETE without WHERE deletes every row");
+        }
+        // `UPDATE t SET ..`, not `SELECT .. FOR UPDATE`.
+        if s.contains(" UPDATE ") && s.contains(" SET ") && !s.contains(" WHERE ") {
+            d.deny("UPDATE without WHERE rewrites every row");
+        }
     }
 }
 
@@ -2802,6 +2807,24 @@ mod tests {
         assert!(!check_shell_mode(Mode::Safe, &nested, None).allowed());
         // Ordinary depth is fine.
         assert!(!denied("env env ls"));
+    }
+
+    #[test]
+    fn sql_is_judged_statement_by_statement() {
+        for bad in [
+            r#"psql -c "UPDATE users SET admin = true""#,
+            r#"psql -c "DELETE FROM a; SELECT 1 WHERE true""#,
+            r#"sqlite3 x.db "UPDATE t SET x=1; DELETE FROM t WHERE id=1""#,
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        for ok in [
+            r#"psql -c "SELECT * FROM t FOR UPDATE""#,
+            r#"psql -c "UPDATE t SET x=1 WHERE id=2""#,
+            r#"psql -c "DELETE FROM t WHERE id = 1""#,
+        ] {
+            assert!(!denied(ok), "{ok}");
+        }
     }
 
     #[test]

@@ -26,18 +26,18 @@ pub struct Paths {
 
 impl Paths {
     pub fn from_env() -> Paths {
-        let home = std::env::var_os("USERPROFILE")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        let local_app_data = std::env::var_os("LOCALAPPDATA")
+        Self::from_lookup(|k| std::env::var_os(k))
+    }
+
+    /// The home directory is `USERPROFILE`, else `HOME`; empty when neither is set (callers refuse
+    /// then, rather than write client configs relative to the current directory).
+    pub fn from_lookup(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Paths {
+        let var = |k: &str| env(k).filter(|v| !v.is_empty());
+        let home = var("USERPROFILE").or_else(|| var("HOME")).map(PathBuf::from).unwrap_or_default();
+        let local_app_data = var("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join("AppData").join("Local"));
-        let pick = |key: &str, fallback: PathBuf| {
-            std::env::var_os(key)
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or(fallback)
-        };
+        let pick = |key: &str, fallback: PathBuf| var(key).map(PathBuf::from).unwrap_or(fallback);
         Paths {
             dsh_home: pick("DSH_HOME", home.join(".dsh")),
             hermes_home: pick("HERMES_HOME", local_app_data.join("hermes")),
@@ -78,24 +78,20 @@ pub fn plan(c: Client, p: &Paths, exe: &Path, a: Action) -> Result<Vec<Change>, 
             }, a),
         }]),
         Client::OpenCode => {
-            let (file, alternative) = opencode_file(p);
-            let path: &[&str] = &["mcp", "servers", "qx"];
-            // A legacy `mcp.qx` object means the file shape is one we do not understand.
-            if file.exists() {
-                let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
-                if legacy_opencode(&text) {
-                    return Ok(vec![Change {
-                        client: c,
-                        file: file.clone(),
-                        edit: Edit::Refuse(opencode_refusal(&file, exe)),
-                    }]);
-                }
-            }
-            let _ = alternative;
+            let (file, _) = opencode_file(p);
+            // V1 lists servers directly under `mcp`; V2 under `mcp.servers`. A file shows which one
+            // it is; a new file gets V2's shape.
+            let v1 = read_optional(&file)?.as_deref().is_some_and(opencode_v1);
+            let path: &[&str] = if v1 { &["mcp", "qx"] } else { &["mcp", "servers", "qx"] };
             Ok(vec![Change {
                 client: c,
                 file: file.clone(),
-                edit: edit_json_file(&file, path, |existing| opencode_entry(exe, existing), a),
+                edit: edit_json_file(
+                    &file,
+                    path,
+                    |existing| if v1 { opencode_entry_v1(exe, existing) } else { opencode_entry(exe, existing) },
+                    a,
+                ),
             }])
         }
         Client::Codex => {
@@ -158,21 +154,21 @@ fn opencode_file(p: &Paths) -> (PathBuf, Option<PathBuf>) {
 }
 
 fn has_qx(text: &str) -> bool {
-    jsonc::member(text, &["mcp", "servers", "qx"])
-        .map(|r| r.is_some())
-        .unwrap_or(false)
+    [&["mcp", "servers", "qx"][..], &["mcp", "qx"][..]]
+        .iter()
+        .any(|path| jsonc::member(text, path).ok().flatten().is_some())
 }
 
-fn legacy_opencode(text: &str) -> bool {
-    jsonc::member(text, &["mcp", "qx"]).ok().flatten().is_some()
-}
-
-fn opencode_refusal(file: &Path, exe: &Path) -> String {
-    format!(
-        "{} has a legacy `mcp.qx` entry. Move it under `\"servers\"`, or paste:\n  \"mcp\": {{\n    \"servers\": {{\n      \"qx\": {}\n    }}\n  }}",
-        file.display(),
-        serde_json::to_string_pretty(&opencode_entry(exe, None)).unwrap_or_default()
-    )
+/// An OpenCode V1 config: `mcp` holds servers itself (objects with a `type` or `command`), and no
+/// V2 `mcp.servers` map. (In V1 a server could be named `servers`; it then has a `type`.)
+fn opencode_v1(text: &str) -> bool {
+    let Some(v) = parse_strict(text) else { return false };
+    let Some(mcp) = v.get("mcp").and_then(Value::as_object) else { return false };
+    let server = |s: &Value| s.get("type").is_some() || s.get("command").is_some();
+    match mcp.get("servers") {
+        Some(s) if !server(s) => false,
+        _ => mcp.values().any(server),
+    }
 }
 
 fn read_optional(file: &Path) -> Result<Option<String>, String> {
@@ -258,6 +254,21 @@ fn claude_entry(exe: &Path, existing: Option<&Value>) -> Value {
     })
 }
 
+/// OpenCode V1's local server: no `codemode`, and `timeout` there is the tool-listing timeout, so
+/// none is written (a user's own stays).
+fn opencode_entry_v1(exe: &Path, existing: Option<&Value>) -> Value {
+    let mut entry = json!({
+        "type": "local",
+        "command": [exe.to_string_lossy(), "mcp"],
+        "environment": merge_env(existing, "opencode", &[]),
+        "enabled": true,
+    });
+    if let Some(t) = existing.and_then(|e| e.get("timeout")) {
+        entry["timeout"] = t.clone();
+    }
+    entry
+}
+
 fn opencode_entry(exe: &Path, existing: Option<&Value>) -> Value {
     let mut entry = json!({
         "type": "local",
@@ -329,10 +340,12 @@ pub fn status(c: Client, p: &Paths) -> Status {
         }
         Client::OpenCode => {
             let (file, _) = opencode_file(p);
+            let v1 = std::fs::read_to_string(&file).ok().as_deref().is_some_and(opencode_v1);
+            let at: &[&str] = if v1 { &["mcp", "qx"] } else { &["mcp", "servers", "qx"] };
             let command = std::fs::read_to_string(&file)
                 .ok()
                 .and_then(|text| {
-                    let range = jsonc::member(&text, &["mcp", "servers", "qx", "command"]).ok()??;
+                    let range = jsonc::member(&text, &[at, &["command"]].concat()).ok()??;
                     let value: Value =
                         serde_json::from_str(&jsonc::to_strict_json(&text[range])).ok()?;
                     Some(match value {
@@ -340,7 +353,8 @@ pub fn status(c: Client, p: &Paths) -> Status {
                         other => other.as_str()?.to_string(),
                     })
                 });
-            if let Ok(text) = std::fs::read_to_string(&file) {
+            // V1 has no Code Mode to hide the tools behind.
+            if let Some(text) = std::fs::read_to_string(&file).ok().filter(|_| !v1) {
                 let codemode = jsonc::member(&text, &["mcp", "servers", "qx", "codemode"])
                     .ok()
                     .flatten()
@@ -451,6 +465,11 @@ pub fn run(args: &[String]) -> i32 {
         clients.extend(Client::ALL);
     }
     let paths = Paths::from_env();
+    if paths.home.as_os_str().is_empty() {
+        // Every client config lives under the home directory; a relative path would land in the cwd.
+        eprintln!("qx setup: neither USERPROFILE nor HOME is set, so the client configs cannot be found");
+        return 2;
+    }
     let exe = match crate::deploy::canonical() {
         Some(path) => path,
         None => {
@@ -601,21 +620,43 @@ mod tests {
     }
 
     #[test]
-    fn opencode_refuses_unknown_shapes() {
-        let p = paths("opencode-legacy");
+    fn opencode_v1_configs_get_the_v1_shape() {
+        // OpenCode V1 lists servers directly under `mcp` (no `servers`, no `codemode`, numeric timeout).
+        let p = paths("opencode-v1");
         let dir = p.home.join(".config").join("opencode");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("opencode.json"),
-            r#"{"mcp": {"qx": {"type": "local", "command": ["x"]}}}"#,
-        )
-        .unwrap();
-        let changes = plan(Client::OpenCode, &p, Path::new(r"C:\q\qx.exe"), Action::Install).unwrap();
-        match &changes[0].edit {
-            Edit::Refuse(reason) => assert!(reason.contains("\"servers\""), "{reason}"),
-            _ => panic!("a legacy mcp.qx entry must be refused"),
+        let file = dir.join("opencode.json");
+        let exe = Path::new(r"C:\q\qx.exe");
+        for start in [
+            r#"{"mcp": {"qx": {"type": "local", "command": ["x"], "environment": {"QX_GUARD": "safe"}}}}"#,
+            r#"{"mcp": {"other": {"type": "local", "command": ["o"]}}}"#,
+        ] {
+            std::fs::write(&file, start).unwrap();
+            let text = changed(&plan(Client::OpenCode, &p, exe, Action::Install).unwrap()[0].edit)
+                .expect("an install")
+                .to_string();
+            let v: Value = serde_json::from_str(&jsonc::to_strict_json(&text)).unwrap();
+            assert_eq!(v["mcp"]["qx"]["command"][0], r"C:\q\qx.exe", "{text}");
+            assert_eq!(v["mcp"]["qx"]["environment"]["QX_CLIENT"], "opencode", "{text}");
+            assert!(v["mcp"].get("servers").is_none() && v["mcp"]["qx"].get("codemode").is_none(), "{text}");
+            if start.contains("QX_GUARD") {
+                assert_eq!(v["mcp"]["qx"]["environment"]["QX_GUARD"], "safe", "{text}");
+            }
+            std::fs::write(&file, &text).unwrap();
+            assert!(matches!(plan(Client::OpenCode, &p, exe, Action::Install).unwrap()[0].edit, Edit::Unchanged));
+            let removed = changed(&plan(Client::OpenCode, &p, exe, Action::Remove).unwrap()[0].edit)
+                .expect("a removal")
+                .to_string();
+            assert!(!removed.contains("qx.exe"), "{removed}");
         }
         let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn home_falls_back_to_home_when_userprofile_is_unset() {
+        let env = |k: &str| (k == "HOME").then(|| std::ffi::OsString::from(r"C:\h"));
+        assert_eq!(Paths::from_lookup(env).home, Path::new(r"C:\h"));
+        assert!(Paths::from_lookup(|_| None).home.as_os_str().is_empty());
     }
 
     #[test]
