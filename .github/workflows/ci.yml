@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+      # The GNU grep/sed parity tests must run here, not skip.
+      QX_REQUIRE_ORACLE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --release --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --release --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: pi bridge
+        run: |
+          cargo build --release --locked
+          node integrations/pi/bridge.test.mjs
+          node integrations/pi/smoke.mjs target/release/qx.exe
+
+  msrv:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82
+      - name: Build with the minimum supported Rust
+        run: cargo build --locked

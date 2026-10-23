@@ -2,8 +2,15 @@
 name = "qx"
 version = "0.9.0"
 edition = "2021"
-description = "Fast local command executor for coding agents"
+rust-version = "1.82"
+description = "Fast local command executor and MCP server for coding agents on Windows"
 license = "MIT"
+repository = "https://github.com/Tlkh201313/qx"
+readme = "README.md"
+keywords = ["mcp", "windows", "agent", "cli", "shell"]
+categories = ["command-line-utilities", "development-tools"]
+# The name qx on crates.io belongs to another project: install with cargo install --git.
+publish = false
 
 [dependencies]
 serde_json = "1"
