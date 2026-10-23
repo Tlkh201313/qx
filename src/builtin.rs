@@ -168,8 +168,48 @@ fn cmd_sleep(args: &[String]) -> Option<BuiltinOut> {
     if !(0.0..=10.0).contains(&secs) {
         return None;
     }
-    std::thread::sleep(Duration::from_secs_f64(secs));
-    Some(ok(String::new()))
+    // In slices, so a cancel or the call's timeout ends it like it ends a real `sleep`.
+    let end = std::time::Instant::now() + Duration::from_secs_f64(secs);
+    loop {
+        if crate::exec::should_stop() {
+            return Some(stopped());
+        }
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Some(ok(String::new()));
+        }
+        std::thread::sleep(left.min(Duration::from_millis(50)));
+    }
+}
+
+/// A built-in cut short by a cancel or the call's timeout: exit 124, like a killed child.
+fn stopped() -> BuiltinOut {
+    BuiltinOut {
+        code: 124,
+        stdout: String::new(),
+        stderr: "qx: stopped (cancelled or timed out)\n".to_string(),
+        elapsed: Duration::ZERO,
+    }
+}
+
+/// `remove_dir_all`, one top-level entry at a time so a cancel or timeout stops it between entries.
+/// Each entry still goes through std's own removal, which never follows a link and clears read-only.
+fn remove_tree(path: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        if crate::exec::should_stop() {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stopped (cancelled or timed out)"));
+        }
+        let p = entry?.path();
+        let md = fs::symlink_metadata(&p)?;
+        if md.is_dir() && !md.file_type().is_symlink() {
+            fs::remove_dir_all(&p)?;
+        } else if md.file_type().is_symlink() && fs::metadata(&p).is_ok_and(|m| m.is_dir()) {
+            fs::remove_dir(&p)?; // a directory link: the link only
+        } else {
+            fs::remove_dir_all(&p).or_else(|_| fs::remove_file(&p))?;
+        }
+    }
+    fs::remove_dir(path)
 }
 
 // ---------------------------------------------------------------- listing
@@ -734,10 +774,8 @@ fn cmd_head(args: &[String], cwd: Option<&Path>, tail: bool) -> Option<BuiltinOu
             Some((true, rest))
         } else if let Some(rest) = a.strip_prefix("-n") {
             Some((false, rest))
-        } else if let Some(rest) = a.strip_prefix("-c") {
-            Some((true, rest))
         } else {
-            None
+            a.strip_prefix("-c").map(|rest| (true, rest))
         };
         match spec {
             Some((bytes, rest)) => {
@@ -944,12 +982,20 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut invert = false;
     let mut quiet = false;
     let mut count_only = false;
-    // GNU: `-A`/`-B` win over `-C` in either order, and any of them (even `-A0`) prints `--`.
+    // GNU: an explicit -A/-B wins over -C, and any of them (even 0) turns on `--` separators.
     let mut before: Option<usize> = None;
     let mut after: Option<usize> = None;
     let mut around: Option<usize> = None;
     let mut include: Option<String> = None;
     let mut pattern: Option<String> = None;
+    // A second -e or --include adds to the first in GNU grep; this scan holds one of each.
+    fn set_once(slot: &mut Option<String>, v: String) -> Option<()> {
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(v);
+        Some(())
+    }
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -968,9 +1014,9 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                     if !simple_include(v) {
                         return None;
                     }
-                    include = Some(v.to_string());
+                    set_once(&mut include, v.to_string())?;
                 }
-                "regexp" => pattern = Some(val?.to_string()),
+                "regexp" => set_once(&mut pattern, val?.to_string())?,
                 "invert-match" => invert = true,
                 "quiet" | "silent" => quiet = true,
                 "fixed-strings" => fixed = true,
@@ -981,6 +1027,7 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                 "line-number" => number = true,
                 "files-with-matches" => list_only = true,
                 "recursive" => recursive = true,
+                "dereference-recursive" => return None,
                 // Colour is never emitted; buffering is not observable in captured output.
                 "color" | "colour" | "line-buffered" => {}
                 _ => return None,
@@ -993,13 +1040,14 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                 i += 1;
                 continue;
             }
-            let mut chars = body.char_indices();
-            while let Some((pos, ch)) = chars.next() {
+            for (pos, ch) in body.char_indices() {
                 match ch {
                     'i' => insensitive = true,
                     'n' => number = true,
                     'l' => list_only = true,
-                    'r' | 'R' => recursive = true,
+                    'r' => recursive = true,
+                    // -R follows symlinks and junctions; the walk never does.
+                    'R' => return None,
                     'F' => fixed = true,
                     'v' => invert = true,
                     'q' => quiet = true,
@@ -1009,12 +1057,13 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                     'e' => {
                         // `-e pat`, `-epat` and `-ne pat` all name the pattern.
                         let rest = &body[pos + ch.len_utf8()..];
-                        pattern = Some(if rest.is_empty() {
+                        let p = if rest.is_empty() {
                             i += 1;
                             args.get(i)?.clone()
                         } else {
                             rest.to_string()
-                        });
+                        };
+                        set_once(&mut pattern, p)?;
                         break;
                     }
                     'A' | 'B' | 'C' => {
@@ -1043,6 +1092,8 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         i += 1;
     }
     let context = before.is_some() || after.is_some() || around.is_some();
+    let bctx = before.or(around).unwrap_or(0);
+    let actx = after.or(around).unwrap_or(0);
     if context && (count_only || list_only) {
         // GNU answers these with a "context is ignored" warning; qx words warnings badly.
         return None;
@@ -1065,7 +1116,8 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             // No path means stdin, which qx never gives a child.
             return None;
         }
-        specs.push((".", path_of(cwd, ".")));
+        // `grep -r x` searches `.` but names files without a `./` prefix.
+        specs.push(("", path_of(cwd, ".")));
     } else {
         for raw in &args[i..] {
             if raw == "-" {
@@ -1089,8 +1141,10 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         }
         let base = raw.trim_end_matches(['/', '\\']);
         let mut full = false;
-        crate::fsops::walk_every_file(path, |file| {
-            if files.len() >= MAX_GREP_FILES {
+        // A walk that skipped anything (too deep, unreadable, too many files) is not an answer:
+        // "no match" from half a tree misleads.
+        let complete = crate::fsops::walk_every_file(path, |file| {
+            if files.len() >= MAX_GREP_FILES || crate::exec::should_stop() {
                 full = true;
                 return false;
             }
@@ -1119,7 +1173,7 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             files.push((disp, file.to_path_buf()));
             true
         });
-        if full {
+        if full || !complete {
             return None;
         }
     }
@@ -1134,14 +1188,15 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     } else {
         pattern.to_string()
     };
-    let (bctx, actx) = (before.or(around).unwrap_or(0), after.or(around).unwrap_or(0));
     let mut out = String::new();
     let mut hits = 0usize;
+    let mut printed = false; // anything printed yet, across files: GNU separates groups of different files
     'files: for (disp, path) in &files {
-        let bytes = fs::read(path).ok()?;
-        if bytes.len() as u64 > READ_CAP {
+        // Size first: a multi-gigabyte log must not be read just to be declined.
+        if fs::metadata(path).ok()?.len() > READ_CAP {
             return None;
         }
+        let bytes = fs::read(path).ok()?;
         if bytes[..bytes.len().min(8192)].contains(&0) {
             // GNU prints "Binary file ... matches"; never guess at that.
             return None;
@@ -1166,8 +1221,8 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             }
         }
         if selected.is_empty() {
-            // GNU counts every file it searched, zero included; `-l` wins over `-c`.
-            if count_only && !list_only {
+            // GNU counts every file it searched, zero included; `-l` wins over `-c`, and `-q` prints nothing.
+            if count_only && !list_only && !quiet {
                 if multiple {
                     out.push_str(disp);
                     out.push(':');
@@ -1209,14 +1264,14 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             if !show[idx] {
                 continue;
             }
-            // A file's first group follows the previous file's groups with `--` too.
-            let gap = match last {
+            let new_group = match last {
                 Some(p) => p + 1 != idx,
-                None => !out.is_empty(),
+                None => printed, // first line of this file, after another file's lines
             };
-            if context && gap {
+            if context && new_group {
                 out.push_str("--\n");
             }
+            printed = true;
             last = Some(idx);
             let sep = if is_sel[idx] { ':' } else { '-' };
             let line = raw.strip_suffix('\n').unwrap_or(raw);
@@ -1426,9 +1481,14 @@ fn norm_path(path: &Path) -> String {
     s.trim_end_matches(['\\', '/']).to_string()
 }
 
-fn dangerous(path: &Path) -> bool {
+/// Paths `rm` never removes: a drive root, the user profile, and the directory the command
+/// runs in (the call's `cwd` as well as the process's own).
+fn dangerous(path: &Path, call_cwd: Option<&Path>) -> bool {
     let s = norm_path(path);
     if s.is_empty() || (s.len() == 2 && s.ends_with(':')) {
+        return true;
+    }
+    if call_cwd.is_some_and(|c| s == norm_path(c)) {
         return true;
     }
     if let Some(home) = crate::resolve::home_dir() {
@@ -1477,7 +1537,9 @@ fn cmd_rm(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut code = 0;
     for p in paths {
         let path = path_of(cwd, p);
-        if dangerous(&path) {
+        // Like GNU rm: `.` and `..` are never removed, however they are spelled.
+        let dot = matches!(p.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next(), Some("." | ".."));
+        if dot || dangerous(&path, cwd) {
             err.push_str(&format!("rm: refusing to remove {}\n", path.display()));
             code = 1;
             continue;
@@ -1491,7 +1553,10 @@ fn cmd_rm(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         }
         let res = if path.is_dir() {
             if recursive {
-                fs::remove_dir_all(&path)
+                let link = fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+                // A link to a directory: std removes the link only. A real tree: entry by entry,
+                // so a cancel or timeout can stop it.
+                if link { fs::remove_dir_all(&path) } else { remove_tree(&path) }
             } else {
                 Err(std::io::Error::other(
                     "is a directory (use -r)",
@@ -1501,6 +1566,9 @@ fn cmd_rm(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             fs::remove_file(&path)
         };
         if let Err(e) = res {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                return Some(stopped());
+            }
             err.push_str(&format!("rm: {}: {e}\n", path.display()));
             code = 1;
         }
@@ -1514,6 +1582,9 @@ fn cmd_rm(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
 }
 
 fn copy_rec(src: &Path, dst: &Path, depth: usize) -> std::io::Result<()> {
+    if crate::exec::should_stop() {
+        return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stopped (cancelled or timed out)"));
+    }
     if depth > 64 {
         return Err(std::io::Error::other(
             "directory nesting is too deep (possible junction cycle)",
@@ -1611,7 +1682,9 @@ fn cmd_cp(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             code = 1;
             continue;
         }
-        let target = if dst.is_dir() {
+        // `cp -r src/. dst` copies what is inside `src`; `file_name()` would drop the `.` and nest it.
+        let contents = *s == "." || s.ends_with("/.") || s.ends_with("\\.");
+        let target = if dst.is_dir() && !contents {
             dst.join(src.file_name().unwrap_or_default())
         } else {
             dst.clone()
@@ -1636,6 +1709,37 @@ fn cmd_cp(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         stderr: err,
         elapsed: Duration::ZERO,
     })
+}
+
+/// The copy half of a move across volumes (the caller deletes the source afterwards), with GNU mv's
+/// rules: a non-empty target directory is refused, an empty one is replaced, a directory never
+/// replaces a file nor a file a directory. The copy goes to a sibling first and is renamed into place
+/// only once complete, so a failure (a locked file, a full disk) never leaves a half tree behind.
+fn move_across(src: &Path, target: &Path) -> std::io::Result<()> {
+    let refuse = |why: &str| Err(std::io::Error::other(why.to_string()));
+    let src_dir = fs::symlink_metadata(src)?.is_dir();
+    if src_dir && has_dir_link(src, 0) {
+        return refuse("the tree holds a directory link; use the real mv");
+    }
+    if let Ok(md) = fs::symlink_metadata(target) {
+        match (src_dir, md.is_dir()) {
+            (true, true) if fs::read_dir(target)?.next().is_some() => return refuse("target directory is not empty"),
+            (true, true) => fs::remove_dir(target)?,
+            (true, false) => return refuse("cannot overwrite a non-directory with a directory"),
+            (false, true) => return refuse("cannot overwrite a directory with a non-directory"),
+            (false, false) => {}
+        }
+    }
+    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let temp = target.with_file_name(format!(".{name}.qx-mv-{}", std::process::id()));
+    let cleanup = |t: &Path| {
+        let _ = if src_dir { fs::remove_dir_all(t) } else { fs::remove_file(t) };
+    };
+    if let Err(e) = copy_rec(src, &temp, 0) {
+        cleanup(&temp);
+        return Err(e);
+    }
+    fs::rename(&temp, target).inspect_err(|_| cleanup(&temp))
 }
 
 fn cmd_mv(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
@@ -1684,7 +1788,7 @@ fn cmd_mv(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                 code = 1;
                 continue;
             }
-            if let Err(e2) = copy_rec(&src, &target, 0) {
+            if let Err(e2) = move_across(&src, &target) {
                 err.push_str(&format!(
                     "mv: {} -> {}: {e}; {e2}\n",
                     src.display(),
@@ -2067,9 +2171,130 @@ mod tests {
     #[test]
     fn rm_refuses_dangerous_paths() {
         let d = tmp("danger");
-        assert!(dangerous(Path::new("C:\\")));
-        assert!(dangerous(Path::new(".")));
-        assert!(!dangerous(&d));
+        assert!(dangerous(Path::new("C:\\"), None));
+        assert!(dangerous(Path::new("."), None));
+        assert!(!dangerous(&d, None));
+        // the directory the call runs in, which is not the process cwd
+        assert!(dangerous(&d, Some(&d)));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_move_across_volumes_never_merges_into_or_half_fills_a_target() {
+        let root = tmp("mvacross");
+        let (src, dst) = (root.join("src"), root.join("dst"));
+        fs::create_dir_all(src.join("a")).unwrap();
+        fs::write(src.join("a").join("f.txt"), "new").unwrap();
+        // A non-empty target directory: GNU mv refuses; nothing may be overwritten.
+        fs::create_dir_all(dst.join("a")).unwrap();
+        fs::write(dst.join("a").join("f.txt"), "old").unwrap();
+        fs::write(dst.join("a").join("g.txt"), "keep").unwrap();
+        assert!(move_across(&src.join("a"), &dst.join("a")).is_err());
+        assert_eq!(fs::read_to_string(dst.join("a").join("f.txt")).unwrap(), "old");
+        assert!(fs::read_dir(&dst).unwrap().count() == 1, "no temp left behind");
+        // An empty target directory is replaced, as GNU mv does.
+        fs::remove_dir_all(dst.join("a")).unwrap();
+        fs::create_dir(dst.join("a")).unwrap();
+        move_across(&src.join("a"), &dst.join("a")).unwrap();
+        assert_eq!(fs::read_to_string(dst.join("a").join("f.txt")).unwrap(), "new");
+        // A directory never replaces a file, and a file never replaces a directory.
+        fs::write(dst.join("file"), "x").unwrap();
+        assert!(move_across(&src.join("a"), &dst.join("file")).is_err());
+        assert!(move_across(&src.join("a").join("f.txt"), &dst.join("a")).is_err());
+        // A file replaces a file.
+        fs::write(src.join("one.txt"), "1").unwrap();
+        move_across(&src.join("one.txt"), &dst.join("file")).unwrap();
+        assert_eq!(fs::read_to_string(dst.join("file")).unwrap(), "1");
+        assert!(fs::read_dir(&dst).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains("qx-mv")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rm_refuses_the_call_cwd_and_dot_operands() {
+        let root = tmp("rmcwd");
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(root.join("f"), "x").unwrap();
+        fs::write(sub.join("g"), "x").unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+        for operand in [
+            ".".to_string(),
+            format!("{}{sep}.", sub.display()),
+            sub.to_string_lossy().into_owned(),
+            "..".to_string(),
+            // A trailing separator is still `.`/`..` (a failure here only deletes this temp tree).
+            "../".to_string(),
+            "..\\".to_string(),
+            "./".to_string(),
+        ] {
+            let out = cmd_rm(&["-rf".into(), operand.clone()], Some(&sub)).unwrap();
+            assert_eq!(out.code, 1, "{operand}: {}", out.stderr);
+            assert!(root.join("f").exists() && sub.join("g").exists(), "{operand} removed files");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grep_declines_what_it_cannot_answer_exactly() {
+        let d = scratch("grep-decline");
+        fs::write(d.join("a.txt"), "foo\nbar\n").unwrap();
+        // A second pattern or include used to replace the first.
+        assert!(run("grep", &["-e", "foo", "-e", "bar", "a.txt"], &d).is_none());
+        assert!(run("grep", &["-r", "--include=*.rs", "--include=*.txt", "foo", "."], &d).is_none());
+        // -R follows links, which the walk never does.
+        assert!(run("grep", &["-Rn", "foo", "."], &d).is_none());
+        assert!(run("grep", &["--dereference-recursive", "foo", "."], &d).is_none());
+        // A walk cut short (here: deeper than the walk goes) is not an answer.
+        let mut deep = d.join("deep");
+        for _ in 0..66 {
+            deep = deep.join("d");
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("x.txt"), "needle\n").unwrap();
+        assert!(run("grep", &["-rn", "needle", "deep"], &d).is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn grep_context_groups_and_flags_follow_gnu() {
+        let d = scratch("grep-ctx");
+        fs::write(d.join("a.txt"), "alpha\nbeta\nalpha gamma\n").unwrap();
+        fs::write(d.join("b.rs"), "let alpha = 1;\nlet gamma = 2;\n").unwrap();
+        let out = |args: &[&str]| {
+            let o = run("grep", args, &d).expect("built-in declined");
+            (o.code, o.stdout)
+        };
+        // Any context option, even 0, separates non-adjacent groups, and groups of different files.
+        assert_eq!(out(&["-0", "alpha", "a.txt"]), (0, "alpha\n--\nalpha gamma\n".into()));
+        assert_eq!(
+            out(&["-A1", "alpha", "a.txt", "b.rs"]),
+            (0, "a.txt:alpha\na.txt-beta\na.txt:alpha gamma\n--\nb.rs:let alpha = 1;\nb.rs-let gamma = 2;\n".into())
+        );
+        // An explicit -B/-A wins over -C.
+        assert_eq!(out(&["-C1", "-B0", "gamma", "a.txt"]), (0, "alpha gamma\n".into()));
+        // -q prints nothing, counts included.
+        assert_eq!(out(&["-qc", "nope", "a.txt"]), (1, String::new()));
+        assert_eq!(out(&["-qc", "alpha", "a.txt"]), (0, String::new()));
+        // With no path, -r searches `.` and prints names without a `./` prefix.
+        let (code, text) = out(&["-rn", "gamma"]);
+        assert!(code == 0 && text.starts_with("a.txt:3:") && !text.contains("./"), "{text}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cp_r_dot_merges_the_contents_into_an_existing_dir() {
+        let d = scratch("cpdot");
+        fs::create_dir_all(d.join("src")).unwrap();
+        fs::create_dir_all(d.join("dst")).unwrap();
+        fs::write(d.join("src").join("a.txt"), "a").unwrap();
+        let out = run("cp", &["-r", "src/.", "dst"], &d).unwrap();
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(d.join("dst").join("a.txt").exists(), "contents not merged");
+        assert!(!d.join("dst").join("src").exists(), "nested one level too deep");
+        // a plain directory operand still nests under the destination
+        let out = run("cp", &["-r", "src", "dst"], &d).unwrap();
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(d.join("dst").join("src").join("a.txt").exists());
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -2213,7 +2438,7 @@ mod tests {
     #[test]
     fn grep_matches_the_real_tool_or_declines() {
         let Some(grep) = real_grep() else {
-            eprintln!("skipped: no grep.exe next to Git");
+            oracle_missing("no grep.exe next to Git");
             return;
         };
         let d = scratch("grep");
@@ -2301,6 +2526,8 @@ mod tests {
         // Shapes a literal in-process scan must never guess at.
         fs::write(d.join("bin.dat"), b"alpha\0binary").unwrap();
         let declined: Vec<Vec<&str>> = vec![
+            // A directory without -r is an error GNU words better.
+            vec!["-cl", "alpha", "."],
             vec!["alpha", "bin.dat"],
             vec!["a.p", "a.txt"],
             vec!["alpha"],
@@ -2341,7 +2568,7 @@ mod tests {
     #[test]
     fn sed_prints_the_range_the_real_tool_prints() {
         let Some(sed) = real_sed() else {
-            eprintln!("skipped: no real sed");
+            oracle_missing("no real sed");
             return;
         };
         let d = scratch("sed");
@@ -2391,6 +2618,12 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// CI sets QX_REQUIRE_ORACLE=1: there a missing oracle is a failure, not a silent pass.
+    fn oracle_missing(why: &str) {
+        assert!(std::env::var("QX_REQUIRE_ORACLE").ok().as_deref() != Some("1"), "oracle required: {why}");
+        eprintln!("skipped: {why}");
+    }
+
     fn real_grep() -> Option<&'static str> {
         [
             r"C:\Program Files\Git\usr\bin\grep.exe",
@@ -2432,7 +2665,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1) as u64));
         }
-        eprintln!("skipped: the real tool could not start here ({})", last.2.trim());
+        oracle_missing(&format!("the real tool could not start here ({})", last.2.trim()));
         None
     }
 }

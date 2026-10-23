@@ -411,12 +411,23 @@ pub fn build_command_at(
     args: &[String],
     cwd: Option<&std::path::Path>,
 ) -> Result<Command, String> {
+    build_command_env(program, args, cwd, &[])
+}
+
+/// `build_command_at` for a call that will also get `envs` (`NAME=value` prefixes): a toolchain
+/// variable among them must reach rustup's proxy, so the direct-toolchain shortcut stands aside.
+pub fn build_command_env(
+    program: &str,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+    envs: &[(String, String)],
+) -> Result<Command, String> {
     // A cmdlet is not a CreateProcess target; a `.ps1` is handled by `Target::Ps1`.
     if verb_noun(program) {
         return powershell_call(program, args);
     }
     let npmish = npmish(program);
-    if let Some(r) = resolve::rustup_direct(program, args, cwd) {
+    if let Some(r) = resolve::rustup_direct(program, args, cwd, envs) {
         let mut c = Command::new(r.exe);
         c.args(args);
         prepare(&mut c);
@@ -490,7 +501,15 @@ pub fn command_for(program: &str, target: Target, args: &[String]) -> Result<Com
                 // A profile adds 300+ ms and can print into the output.
                 c.arg("-NoProfile");
             }
-            add_args(&mut c, args);
+            match cmd_c_line(&exe, args) {
+                // The text after `/c` is a command line: raw, as `cmd_exe` passes it.
+                #[cfg(windows)]
+                Some(raw) => {
+                    use std::os::windows::process::CommandExt;
+                    c.raw_arg(raw);
+                }
+                _ => add_args(&mut c, args),
+            }
             prepare(&mut c);
             if let Some(v) = &venv {
                 // After `prepare`, which clears the inherited environment: this is what makes
@@ -540,6 +559,45 @@ pub fn command_for(program: &str, target: Target, args: &[String]) -> Result<Com
             Ok(c)
         }
         Target::Missing => Err(not_found(program)),
+    }
+}
+
+/// `cmd [/d] [/s] [/q] /c|/k <text>`: the raw argument string cmd.exe needs. Rust's own quoting turns
+/// every inner quote into `\"`, which cmd prints literally. A single text argument is the command line
+/// as written; several are joined, with all but the first quoted when they need it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn cmd_c_line(exe: &Path, args: &[String]) -> Option<String> {
+    if !exe.file_stem().is_some_and(|s| s.eq_ignore_ascii_case("cmd")) {
+        return None;
+    }
+    let mut i = 0;
+    while args.get(i).is_some_and(|a| ["/d", "/s", "/q"].iter().any(|f| a.eq_ignore_ascii_case(f))) {
+        i += 1;
+    }
+    let mode = args.get(i).filter(|a| a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("/k"))?;
+    let rest = &args[i + 1..];
+    if rest.is_empty() || rest.iter().any(|a| a.contains(['\n', '\r', '\0'])) {
+        return None;
+    }
+    let text = match rest {
+        [one] => one.clone(),
+        many => many
+            .iter()
+            .enumerate()
+            .map(|(n, a)| if n == 0 { a.clone() } else { quote_for_cmd_line(a) })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    Some(format!("/d /s {mode} \"{text}\""))
+}
+
+/// `cmd_quote` for a word of a `cmd /c` line the caller wrote: quote what needs it, but leave `%VAR%`
+/// alone, since cmd expands it there (the single-argument form already does).
+fn quote_for_cmd_line(s: &str) -> String {
+    if s.is_empty() || s.chars().any(|c| c.is_whitespace() || "&|<>^()\"".contains(c)) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
     }
 }
 
@@ -727,7 +785,7 @@ fn segments(s: &str) -> Vec<&str> {
 }
 
 fn first_word(seg: &str) -> &str {
-    seg.trim_start().split_whitespace().next().unwrap_or("")
+    seg.split_whitespace().next().unwrap_or("")
 }
 
 /// PowerShell-only syntax. Quoted text never starts a command segment, so
@@ -831,8 +889,9 @@ fn cmd_quote(s: &str) -> String {
     if s.is_empty() {
         return "\"\"".to_string();
     }
+    // A bare `"` must be quoted too: left alone it flips cmd's quote state and a later `&` runs.
     if s.chars()
-        .any(|c| c.is_whitespace() || "&|<>^()".contains(c))
+        .any(|c| c.is_whitespace() || "&|<>^()\"".contains(c))
     {
         // shortcut: a `%VAR%` inside a quoted arg is still expanded by cmd.exe; no escape exists there.
         format!("\"{}\"", s.replace('"', "\"\""))
@@ -847,6 +906,9 @@ pub(crate) const CAPTURE_CAP: usize = 16 * 1024 * 1024;
 pub(crate) struct Capture {
     data: std::sync::Mutex<Buf>,
     truncated: std::sync::atomic::AtomicBool,
+    /// Set by `snapshot`: a daemon still writing to the pipe is drained and discarded, so it
+    /// cannot grow a hidden buffer after the call has returned.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 /// The first bytes up to the head budget, then a ring of the newest ones: a huge log's final error
@@ -865,6 +927,7 @@ fn capture_from_cap<R: Read + Send + 'static>(
     let sink = std::sync::Arc::new(Capture {
         data: std::sync::Mutex::new(Buf::default()),
         truncated: std::sync::atomic::AtomicBool::new(false),
+        closed: std::sync::atomic::AtomicBool::new(false),
     });
     let shared = sink.clone();
     let (tx, rx) = mpsc::channel();
@@ -880,12 +943,17 @@ fn capture_from_cap<R: Read + Send + 'static>(
                         Ok(d) => d,
                         Err(_) => break,
                     };
+                    if shared.closed.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue; // keep draining so the writer never blocks, but keep nothing
+                    }
                     let take = n.min(head_cap.saturating_sub(b.head.len()));
                     b.head.extend_from_slice(&chunk[..take]);
                     if take < n {
-                        shared.truncated.store(true, std::sync::atomic::Ordering::Relaxed);
                         b.tail.extend(&chunk[take..n]);
                         let excess = b.tail.len().saturating_sub(tail_cap);
+                        if excess > 0 {
+                            shared.truncated.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         b.tail.drain(..excess);
                         b.dropped += excess;
                     }
@@ -901,6 +969,7 @@ fn capture_from_cap<R: Read + Send + 'static>(
 fn snapshot(c: &Capture) -> (Vec<u8>, bool) {
     let mut data = match c.data.lock() {
         Ok(mut b) => {
+            c.closed.store(true, std::sync::atomic::Ordering::Relaxed);
             let mut head = std::mem::take(&mut b.head);
             let mut tail: Vec<u8> = b.tail.drain(..).collect();
             let mut dropped = std::mem::take(&mut b.dropped);
@@ -925,6 +994,127 @@ fn snapshot(c: &Capture) -> (Vec<u8>, bool) {
         data,
         c.truncated.load(std::sync::atomic::Ordering::Relaxed),
     )
+}
+
+/// A child's output. UTF-8 (and UTF-16 with a BOM) as `decode_owned`; a line that is not valid UTF-8
+/// came from a tool writing in the console's code page (`dir`, `tree`, localized errors), so it is
+/// decoded in that page instead of turning into U+FFFD. Valid UTF-8 lines are never re-read.
+pub(crate) fn decode_output(bytes: Vec<u8>) -> String {
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return decode(&bytes);
+    }
+    let bytes = match String::from_utf8(bytes) {
+        Ok(mut s) => {
+            if s.contains('\0') {
+                s.retain(|c| c != '\0');
+            }
+            return s;
+        }
+        Err(e) => e.into_bytes(),
+    };
+    let mut out = String::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|&b| b == b'\n') {
+        match std::str::from_utf8(line) {
+            Ok(s) => out.push_str(s),
+            Err(_) => out.push_str(&std_handles::from_console_page(line)),
+        }
+    }
+    if out.contains('\0') {
+        out.retain(|c| c != '\0');
+    }
+    out
+}
+
+/// Make qx's own stdin/stdout/stderr non-inheritable, once at start-up: every child would otherwise
+/// inherit them, and a daemon it starts (`start /b server`) would hold an MCP client's pipe open
+/// after qx exits. `Stdio::inherit` still works: std hands the child its own duplicate.
+pub fn seal_std_handles() {
+    #[cfg(windows)]
+    std_handles::seal();
+}
+
+#[cfg(windows)]
+mod std_handles {
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        #[cfg(test)]
+        fn GetHandleInformation(h: *mut c_void, flags: *mut u32) -> i32;
+        fn SetHandleInformation(h: *mut c_void, mask: u32, flags: u32) -> i32;
+        fn GetOEMCP() -> u32;
+        fn GetConsoleOutputCP() -> u32;
+        fn MultiByteToWideChar(page: u32, flags: u32, src: *const u8, src_len: i32, dst: *mut u16, dst_len: i32) -> i32;
+    }
+
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+
+    pub fn seal() {
+        for (_, which) in STD {
+            if let Some(h) = handle(which) {
+                // SAFETY: `h` is a live std handle; clearing a flag cannot invalidate it.
+                unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) };
+            }
+        }
+    }
+
+    /// Bytes in the console's output code page (qx's own console, else the system OEM page).
+    pub fn from_console_page(bytes: &[u8]) -> String {
+        // SAFETY: no preconditions.
+        let page = match unsafe { GetConsoleOutputCP() } {
+            0 | 65001 => oem_code_page(),
+            p => p,
+        };
+        let Ok(len) = i32::try_from(bytes.len()) else {
+            return String::from_utf8_lossy(bytes).into_owned();
+        };
+        // SAFETY: a size query (null destination); `bytes` is valid for `len` bytes.
+        let need = unsafe { MultiByteToWideChar(page, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+        if need <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        let mut wide = vec![0u16; need as usize];
+        // SAFETY: `wide` holds exactly `need` u16s, the size the query returned.
+        let got = unsafe { MultiByteToWideChar(page, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), need) };
+        if got <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        String::from_utf16_lossy(&wide[..got as usize])
+    }
+
+    pub const STD: [(&str, u32); 3] = [("stdin", -10i32 as u32), ("stdout", -11i32 as u32), ("stderr", -12i32 as u32)];
+
+    pub fn handle(which: u32) -> Option<*mut c_void> {
+        // SAFETY: GetStdHandle has no preconditions.
+        let h = unsafe { GetStdHandle(which) };
+        (!h.is_null() && h as isize != -1).then_some(h)
+    }
+
+    /// Each valid std handle and whether a child would inherit it.
+    #[cfg(test)]
+    pub fn inheritable() -> Vec<(&'static str, bool)> {
+        STD.iter()
+            .filter_map(|(name, which)| {
+                let h = handle(*which)?;
+                let mut flags = 0u32;
+                // SAFETY: `h` is a live std handle and `flags` a valid out-pointer.
+                (unsafe { GetHandleInformation(h, &mut flags) } != 0).then_some((*name, flags & 1 != 0))
+            })
+            .collect()
+    }
+
+    pub fn oem_code_page() -> u32 {
+        // SAFETY: no preconditions.
+        unsafe { GetOEMCP() }
+    }
+}
+
+#[cfg(not(windows))]
+mod std_handles {
+    pub fn from_console_page(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
 }
 
 #[cfg(windows)]
@@ -1086,6 +1276,22 @@ pub fn set_cancel(flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
     CANCEL.with(|c| *c.borrow_mut() = flag);
 }
 
+thread_local! {
+    /// When the running call's `timeout_ms` ends, for work done in-process (built-ins).
+    static DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+pub fn set_deadline(at: Option<Instant>) {
+    DEADLINE.with(|d| d.set(at));
+}
+
+/// The call running on this thread was cancelled or has run out of time: in-process work
+/// (a built-in `rm -r`, `cp -r`, `sleep`, a grep walk) stops at its next step.
+pub fn should_stop() -> bool {
+    CANCEL.with(|c| c.borrow().as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)))
+        || DEADLINE.with(|d| d.get().is_some_and(|t| Instant::now() >= t))
+}
+
 /// `QX_TRACE=1` prints phase timings to stderr: the first thing to ask when a command
 /// feels slow is where its milliseconds went.
 pub fn trace(start: Instant, msg: &str) {
@@ -1214,8 +1420,8 @@ fn collect(
     let (so, so_cut) = snapshot(&out_sink);
     let (se, se_cut) = snapshot(&err_sink);
 
-    let mut stdout = decode_owned(so);
-    let mut stderr = decode_owned(se);
+    let mut stdout = decode_output(so);
+    let mut stderr = decode_output(se);
     if so_cut {
         stdout.push_str("\n[qx] stdout truncated at 16 MiB\n");
     }
@@ -1447,7 +1653,8 @@ pub(crate) fn decode(bytes: &[u8]) -> String {
 }
 
 /// `decode` for a buffer the caller owns: valid UTF-8 (the usual case) is validated in place instead of
-/// being copied. Same result as `decode`.
+/// being copied. Same result as `decode`. (Process output goes through `decode_output`.)
+#[cfg(test)]
 pub(crate) fn decode_owned(bytes: Vec<u8>) -> String {
     if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
         return decode(&bytes);
@@ -2020,6 +2227,98 @@ mod tests {
         let t = std::time::Instant::now();
         assert_eq!(run_stream(&mut c, Some(Duration::from_secs(1))).unwrap(), 124);
         assert!(t.elapsed() < Duration::from_secs(8));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_c_with_separate_arguments_still_expands_variables() {
+        let args = ["/c".to_string(), "echo".to_string(), "%QX_C_ARG%".to_string()];
+        let mut c = build_command("cmd", &args).unwrap();
+        c.env("QX_C_ARG", "expanded");
+        let o = run_captured(c, Some(Duration::from_secs(20))).unwrap();
+        assert_eq!(o.stdout.trim(), "expanded", "stderr: {}", o.stderr);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_output_in_the_oem_code_page_is_decoded() {
+        // `dir`, `tree` and localized errors print in the console's code page, not UTF-8.
+        let s = decode_output(b"ok \xe2\x9c\x93\ncaf\x82\n".to_vec());
+        assert!(s.starts_with("ok \u{2713}\n"), "a UTF-8 line stays UTF-8: {s:?}");
+        assert!(!s.contains('\u{fffd}'), "{s:?}");
+        // 0x82 is `é` in the Western OEM pages; other pages map it to something else.
+        if matches!(std_handles::oem_code_page(), 437 | 850 | 858) {
+            assert!(s.ends_with("caf\u{e9}\n"), "{s:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn qx_does_not_hand_its_own_stdio_to_children() {
+        // A daemon started by a command would otherwise hold qx's stdout (an MCP pipe) open forever.
+        seal_std_handles();
+        for (name, inheritable) in std_handles::inheritable() {
+            assert!(!inheritable, "{name} is still inheritable");
+        }
+    }
+
+    #[test]
+    fn cmd_quote_neutralises_a_bare_quote() {
+        // An odd `"` flips cmd's quote state, and the `&` after it runs as a second command.
+        assert_eq!(cmd_quote("a\"b"), "\"a\"\"b\"");
+        assert_eq!(cmd_quote("plain"), "plain");
+        assert_eq!(cmd_quote("a b"), "\"a b\"");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_bare_quote_in_an_argument_cannot_start_a_second_command() {
+        let args = ["/b".to_string(), "a\"b".to_string(), "c&echo PWNED".to_string()];
+        let o = run_captured(build_command("dir", &args).unwrap(), Some(Duration::from_secs(20))).unwrap();
+        assert!(
+            !o.stdout.contains("PWNED") && !o.stderr.contains("PWNED"),
+            "the second command ran: stdout={:?} stderr={:?}",
+            o.stdout,
+            o.stderr
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_c_receives_its_text_unmangled() {
+        let args = ["/c".to_string(), "echo \"a b\"".to_string()];
+        let o = run_captured(build_command("cmd", &args).unwrap(), Some(Duration::from_secs(20))).unwrap();
+        assert_eq!(o.stdout.trim(), "\"a b\"", "stderr: {}", o.stderr);
+    }
+
+    #[test]
+    fn a_snapshot_closes_the_capture_to_later_bytes() {
+        struct Fed(mpsc::Receiver<Vec<u8>>);
+        impl Read for Fed {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.recv() {
+                    Ok(chunk) => {
+                        buf[..chunk.len()].copy_from_slice(&chunk);
+                        Ok(chunk.len())
+                    }
+                    Err(_) => Ok(0),
+                }
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let (sink, done) = capture_from_cap(Fed(rx), 1024);
+        tx.send(b"early".to_vec()).unwrap();
+        let t = Instant::now();
+        while sink.data.lock().unwrap().head.len() < 5 && t.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (data, _) = snapshot(&sink);
+        assert_eq!(data, b"early");
+        // a daemon that keeps writing after the call returned must not grow a hidden buffer
+        tx.send(b"late".to_vec()).unwrap();
+        drop(tx);
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(sink.data.lock().is_ok_and(|b| b.head.is_empty() && b.tail.is_empty()), "bytes after the snapshot were buffered");
     }
 
     #[test]

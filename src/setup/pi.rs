@@ -112,12 +112,15 @@ pub fn edit_pi(
                     Err(e) => Edit::Refuse(e),
                 },
             },
-            Err(_) => match a {
+            // Only a file that is not there is "absent"; one that cannot be read (UTF-16, locked)
+            // may hold the user's other servers and must not be replaced.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match a {
                 Action::Remove => Edit::Unchanged,
                 Action::Install => Edit::Changed(
                     set_member("{}", &["mcpServers", "qx"], &entry).unwrap_or_default(),
                 ),
             },
+            Err(e) => Edit::Refuse(format!("cannot read {}: {e}", file.display())),
         };
         return vec![(file, edit)];
     }
@@ -221,6 +224,22 @@ mod tests {
         }
         let again = edit_pi(Some((0, 85)), &p, exe, Action::Install);
         assert!(again.iter().all(|(_, e)| matches!(e, Edit::Unchanged)), "second run rewrote files");
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn an_unreadable_mcp_json_is_refused_not_overwritten() {
+        let p = paths("unreadable");
+        let file = mcp_file(&p);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        // UTF-16LE with a BOM: not valid UTF-8, and holds other servers the user cares about.
+        let bytes: Vec<u8> = vec![0xFF, 0xFE, b'{', 0, b'}', 0];
+        std::fs::write(&file, &bytes).unwrap();
+        for action in [Action::Install, Action::Remove] {
+            let out = edit_pi(Some((1, 3)), &p, Path::new(r"C:\q\qx.exe"), action);
+            assert!(matches!(out[0].1, Edit::Refuse(_)), "an unreadable config must be refused");
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
         let _ = std::fs::remove_dir_all(&p.home);
     }
 

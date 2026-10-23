@@ -298,6 +298,14 @@ impl Root {
     /// may be created, but every existing ancestor is canonicalized and checked
     /// first, so a symlink or junction cannot walk the write outside the root.
     fn resolve_for_write(&self, raw: &str) -> Result<(PathBuf, bool), FsError> {
+        // Relative paths are joined onto a verbatim `\\?\` cwd, which skips Win32 name rules: `nul`
+        // or `name.` would become real, undeletable files and `a.txt:x` an alternate data stream.
+        if let Some(bad) = Path::new(raw).components().find_map(|c| match c {
+            Component::Normal(s) => win_name_problem(&s.to_string_lossy()),
+            _ => None,
+        }) {
+            return Err(FsError::arg(format!("\"{raw}\": {bad}")).fb("write"));
+        }
         let candidate = self.candidate(raw);
         let name = candidate
             .file_name()
@@ -367,11 +375,11 @@ impl Root {
     }
 
     fn check_mutable(&self, path: &Path) -> Result<(), FsError> {
-        let rel = path.strip_prefix(&self.cwd).unwrap_or(path);
-        for c in rel.components() {
+        // The whole path, not just the part below cwd: a caller may pick cwd = `.git/hooks`.
+        for c in path.components() {
             if let Component::Normal(s) = c {
                 let s = s.to_string_lossy();
-                if matches!(s.as_ref(), ".git" | ".hg" | ".svn") {
+                if [".git", ".hg", ".svn"].iter().any(|v| s.eq_ignore_ascii_case(v)) {
                     return Err(FsError::new(
                         "FS_PROTECTED",
                         format!("refusing to modify VCS metadata: {}", path.display()),
@@ -381,6 +389,20 @@ impl Root {
         }
         Ok(())
     }
+}
+
+/// Why Windows cannot hold a file or directory with this name, if it cannot.
+fn win_name_problem(name: &str) -> Option<&'static str> {
+    if name.contains(':') {
+        return Some("a ':' in a name makes an alternate data stream, not a file");
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Some("Windows strips a trailing '.' or ' ', so the file could not be opened again");
+    }
+    let stem = name.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.as_bytes()[3].is_ascii_digit() && stem.as_bytes()[3] != b'0');
+    reserved.then_some("a reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9)")
 }
 
 fn nearest_existing(path: &Path) -> Option<PathBuf> {
@@ -878,14 +900,27 @@ fn write(root: &Root, args: &Value) -> Result<Reply, FsError> {
     let (path, existed) = root.resolve_for_write(raw).map_err(|e| e.fb("write"))?;
     root.check_mutable(&path).map_err(|e| e.fb("write"))?;
 
+    let mut written = std::borrow::Cow::Borrowed(content);
     if existed {
-        let (_, current) = read_file(&path, "write")?;
+        let (before, current) = read_file(&path, "write")?;
         check_observed(&root.cwd, &path, current, &root.display(&path))
             .map_err(|e| e.fb("write"))?;
-        atomic_replace(&path, content.as_bytes(), current).map_err(|e| e.fb("write"))?;
+        // `read` showed lossy, LF-only text: writing it back must not re-encode or flatten the file.
+        match carry_over_encoding(&before, content) {
+            Ok(text) => written = std::borrow::Cow::Owned(text),
+            Err(()) => {
+                return Err(FsError::new(
+                    "FS_ENCODING",
+                    format!("\"{raw}\" is not valid UTF-8 (UTF-16 or a legacy code page); qx write would corrupt it"),
+                )
+                .fb("write"));
+            }
+        }
+        atomic_replace(&path, written.as_bytes(), current).map_err(|e| e.fb("write"))?;
     } else {
         create_noreplace(&path, content.as_bytes()).map_err(|e| e.fb("write"))?;
     }
+    let content = written.as_ref();
     let version = version_after(&path, content.as_bytes()).map_err(|e| e.fb("write"))?;
     remember(&root.cwd, &path, version);
     let display = root.display(&path);
@@ -988,14 +1023,46 @@ fn edit(root: &Root, args: &Value) -> Result<Reply, FsError> {
     })
 }
 
+/// The model sees LF-only text (`read` strips the CRs), so `old` and `new` arrive with LF. Try `old`
+/// verbatim first (it may sit in the LF part of a mixed file); only when it is absent, spell it in the
+/// file's other ending. `new` then takes the ending of the text it replaces, whether or not `old` itself
+/// held a line break.
 fn match_line_endings(text: &str, old: &str, new: &str) -> (String, String) {
-    if text.contains("\r\n") && old.contains('\n') && !old.contains("\r\n") {
-        (old.replace('\n', "\r\n"), new.replace('\n', "\r\n"))
-    } else if !text.contains("\r\n") && old.contains("\r\n") {
-        (old.replace("\r\n", "\n"), new.replace("\r\n", "\n"))
-    } else {
-        (old.to_string(), new.to_string())
+    let crlf = text.matches("\r\n").count();
+    let lf_only = text.matches('\n').count().saturating_sub(crlf);
+    let mut old = old.to_string();
+    if !text.contains(&old) {
+        if crlf > 0 && old.contains('\n') && !old.contains("\r\n") {
+            old = old.replace('\n', "\r\n");
+        } else if crlf == 0 && old.contains("\r\n") {
+            old = old.replace("\r\n", "\n");
+        }
     }
+    let new = if old.contains("\r\n") || (crlf > lf_only && !old.contains('\n')) {
+        new.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else if crlf == 0 {
+        new.replace("\r\n", "\n")
+    } else {
+        new.to_string()
+    };
+    (old, new)
+}
+
+/// What `write` must keep of the file it replaces: the model read LF-only text without the BOM.
+fn carry_over_encoding(before: &[u8], content: &str) -> Result<String, ()> {
+    let Ok(old) = std::str::from_utf8(before) else {
+        return Err(()); // UTF-16 or a legacy code page: rewriting it as UTF-8 would corrupt it
+    };
+    let crlf = old.matches("\r\n").count();
+    let lf_only = old.matches('\n').count().saturating_sub(crlf);
+    let mut out = content.to_string();
+    if crlf > lf_only && !out.contains('\r') {
+        out = out.replace('\n', "\r\n");
+    }
+    if old.starts_with('\u{feff}') && !out.starts_with('\u{feff}') {
+        out.insert(0, '\u{feff}');
+    }
+    Ok(out)
 }
 
 // --------------------------------------------------------------------- glob
@@ -1128,11 +1195,22 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     let needle = req_str(args, "pattern")?;
     let raw_path = path_arg(args).unwrap_or(".");
     let root_path = root.resolve_existing(raw_path).map_err(|e| e.fb("grep"))?;
+    if needle.contains(['\n', '\r']) {
+        return Err(FsError::new(
+            "FS_UNSUPPORTED",
+            format!(
+                "qx grep matches single lines; a pattern with a line break never matches (use the native {} tool)",
+                native(Native::Grep)
+            ),
+        )
+        .fb("grep"));
+    }
     let include = opt_str(args, "include");
     if let Some(inc) = include {
-        if inc.contains(',') {
+        // A comma inside braces (`*.{ts,tsx}`) is one glob; only a top-level comma is a list.
+        if split_top_level(inc).len() > 1 {
             return Err(FsError::arg(format!(
-                "include takes one glob; comma-separated lists are not supported (use the native {} tool)",
+                "include takes one glob; comma-separated lists are not supported (use *.{{a,b}} or the native {} tool)",
                 native(Native::Grep)
             ))
             .fb("grep"));
@@ -1251,6 +1329,13 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     }
     if total == 0 {
         out.push_str("No matches found.\n");
+        // `TODO|FIXME`, `fn\s+main`: a model often means a regex; say this search was literal.
+        if needle.contains(['|', '\\', '*', '[', '(', '^', '$', '+']) {
+            out.push_str(&format!(
+                "[qx] the pattern was searched as literal text; for a regex use the native {} tool\n",
+                native(Native::Grep)
+            ));
+        }
     } else if total > shown {
         out.push_str(&format!(
             "\n[qx] showing {shown} of {total} matches; narrow the search or use the native {} tool.\n",
@@ -1502,37 +1587,48 @@ fn stat(root: &Root, args: &Value) -> Result<Reply, FsError> {
 
 /// Visit every file below `root` - the built-in skip list (`node_modules`, `target`, `.git`)
 /// does not apply - until `visit` returns false or the walk cap is hit. Symlinks are not
-/// followed: neither is `grep -r`.
-pub(crate) fn walk_every_file<F: FnMut(&Path) -> bool>(root: &Path, mut visit: F) {
-    fn go<F: FnMut(&Path) -> bool>(dir: &Path, depth: usize, count: &mut usize, visit: &mut F) -> bool {
+/// followed: neither is `grep -r`. Returns whether every file was visited: false when `visit`
+/// stopped it, a cap or the depth limit cut it, or a directory or entry could not be read.
+pub(crate) fn walk_every_file<F: FnMut(&Path) -> bool>(root: &Path, mut visit: F) -> bool {
+    // (keep going, nothing skipped so far)
+    fn go<F: FnMut(&Path) -> bool>(dir: &Path, depth: usize, count: &mut usize, visit: &mut F, whole: &mut bool) -> bool {
         if depth > MAX_WALK_DEPTH {
+            *whole = false;
             return true;
         }
         let Ok(entries) = fs::read_dir(dir) else {
+            *whole = false;
             return true;
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                *whole = false;
+                continue;
+            };
             let Ok(ft) = entry.file_type() else {
+                *whole = false;
                 continue;
             };
             if ft.is_symlink() {
                 continue;
             }
             if ft.is_dir() {
-                if !go(&entry.path(), depth + 1, count, visit) {
+                if !go(&entry.path(), depth + 1, count, visit, whole) {
                     return false;
                 }
             } else if ft.is_file() {
                 *count += 1;
                 if *count > MAX_WALK_FILES || !visit(&entry.path()) {
+                    *whole = false;
                     return false;
                 }
             }
         }
         true
     }
-    let mut count = 0usize;
-    go(root, 0, &mut count, &mut visit);
+    let (mut count, mut whole) = (0usize, true);
+    go(root, 0, &mut count, &mut visit, &mut whole);
+    whole
 }
 
 pub(crate) fn walk_files<F: FnMut(&Path, &fs::DirEntry)>(root: &Path, mut visit: F) {
@@ -1741,17 +1837,20 @@ fn glob_general(pattern: &str, text: &str, ignore_case: bool) -> bool {
 }
 
 /// Allocation-free answer for the shapes that cover nearly every real pattern: `LIT`, `*LIT`, `**/LIT` and
-/// `**/*LIT`, where LIT has no glob character. `**/` may start at any offset (so `**/name` also matches
-/// `xname`, as `glob_go` does) and `*` cannot cross '/'. `None` means "use the general matcher".
+/// `**/*LIT`, where LIT has no glob character. `**/LIT` needs LIT to start a path segment, while the `*`
+/// of `**/*LIT` may start inside a name; `*` cannot cross '/'. `None` means "use the general matcher".
 fn glob_fast(pattern: &str, text: &str, ignore_case: bool) -> Option<bool> {
     let plain = |s: &str| !s.contains(['*', '?', '[', '\\']);
-    let (lit, anywhere, star) = if let Some(rest) = pattern.strip_prefix("**/") {
-        let lit = rest.strip_prefix('*').unwrap_or(rest);
-        (lit, true, false)
+    // (literal, `**/` prefix, `*` prefix, literal must start a path segment)
+    let (lit, anywhere, star, segment) = if let Some(rest) = pattern.strip_prefix("**/") {
+        match rest.strip_prefix('*') {
+            Some(lit) => (lit, true, false, false),
+            None => (rest, true, false, true),
+        }
     } else if let Some(lit) = pattern.strip_prefix('*') {
-        (lit, false, true)
+        (lit, false, true, false)
     } else {
-        (pattern, false, false)
+        (pattern, false, false, false)
     };
     if !plain(lit) {
         return None;
@@ -1759,7 +1858,9 @@ fn glob_fast(pattern: &str, text: &str, ignore_case: bool) -> Option<bool> {
     let (t, l) = (text.as_bytes(), lit.as_bytes());
     let eq = |a: &[u8]| if ignore_case { a.eq_ignore_ascii_case(l) } else { a == l };
     Some(if anywhere {
-        t.len() >= l.len() && eq(&t[t.len() - l.len()..])
+        t.len() >= l.len()
+            && eq(&t[t.len() - l.len()..])
+            && (!segment || t.len() == l.len() || t[t.len() - l.len() - 1] == b'/')
     } else if star {
         t.len() >= l.len() && eq(&t[t.len() - l.len()..]) && !t[..t.len() - l.len()].contains(&b'/')
     } else {
@@ -1786,7 +1887,10 @@ fn glob_go(
                 if i + 1 < p.len() && p[i + 1] == '*' {
                     let j = i + 2;
                     if j < p.len() && p[j] == '/' {
-                        glob_go(p, j + 1, t, k, memo) || (k < t.len() && glob_go(p, i, t, k + 1, memo))
+                        // `**/` swallows whole directories: what follows starts a path segment.
+                        let at_segment = k == 0 || t[k - 1] == '/';
+                        (at_segment && glob_go(p, j + 1, t, k, memo))
+                            || (k < t.len() && glob_go(p, i, t, k + 1, memo))
                     } else {
                         glob_go(p, j, t, k, memo) || (k < t.len() && glob_go(p, i, t, k + 1, memo))
                     }
@@ -2002,6 +2106,98 @@ mod tests {
     }
 
     #[test]
+    fn vcs_metadata_is_protected_whatever_the_cwd() {
+        let base = tmp("vcs-cwd");
+        let hooks = base.join("repo").join(".git").join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        // A cwd chosen inside .git must not turn its contents into ordinary workspace files.
+        let r = invoke(&hooks, "write", json!({"path":"pre-commit","content":"#!/bin/sh\necho hi\n"}));
+        assert!(r.is_error, "{}", r.text);
+        assert_eq!(r.structured["code"], "FS_PROTECTED");
+        assert!(!hooks.join("pre-commit").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn write_refuses_names_windows_cannot_handle() {
+        let dir = tmp("win-names");
+        for bad in ["nul", "log-12:30.txt", "notes.md.", "x.txt ", "sub/aux.rs", "COM1.log"] {
+            let r = invoke(&dir, "write", json!({"path":bad,"content":"x"}));
+            assert!(r.is_error, "{bad:?} was written");
+            assert_eq!(r.structured["code"], "FS_BAD_ARG", "{bad:?}");
+        }
+        // `a:b/...` is drive-relative on Windows (drive A:): refused, whatever the code.
+        assert!(invoke(&dir, "write", json!({"path":"a:b/c.txt","content":"x"})).is_error);
+        assert!(!dir.join("log-12").exists() && !dir.join("sub").exists() && !dir.join("a").exists());
+        // (`NUL.txt` is NUL too, per Windows naming rules, but `null` and `con-notes` are not.)
+        for ok in ["con-notes.md", "console.log", "null/x.txt.bak"] {
+            let r = invoke(&dir, "write", json!({"path":ok,"content":"x"}));
+            assert!(!r.is_error, "{ok:?}: {}", r.text);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_explains_patterns_that_cannot_match_literally() {
+        let dir = tmp("grep-literal");
+        fs::write(dir.join("a.txt"), "TODO: x\na\nb\n").unwrap();
+        let r = invoke(&dir, "grep", json!({"pattern":"TODO|FIXME"}));
+        assert!(!r.is_error && r.text.contains("No matches found") && r.text.contains("literal"), "{}", r.text);
+        let r = invoke(&dir, "grep", json!({"pattern":"a\nb"}));
+        assert!(r.is_error, "{}", r.text);
+        assert_eq!(r.structured["code"], "FS_UNSUPPORTED");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_include_takes_a_brace_glob() {
+        let dir = tmp("grep-brace");
+        for f in ["a.ts", "b.tsx", "c.rs"] {
+            fs::write(dir.join(f), "needle\n").unwrap();
+        }
+        let r = invoke(&dir, "grep", json!({"pattern":"needle","include":"*.{ts,tsx}"}));
+        assert!(!r.is_error, "{}", r.text);
+        assert!(r.text.contains("a.ts") && r.text.contains("b.tsx") && !r.text.contains("c.rs"), "{}", r.text);
+        let r = invoke(&dir, "grep", json!({"pattern":"needle","include":"*.ts,*.tsx"}));
+        assert_eq!(r.structured["code"], "FS_BAD_ARG", "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confinement_holds_against_dotdot_and_junctions() {
+        let base = tmp("confine");
+        let (work, outside) = (base.join("work"), base.join("outside"));
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "secret\n").unwrap();
+        let r = invoke(&work, "write", json!({"path":"../escape.txt","content":"x"}));
+        assert_eq!(r.structured["code"], "FS_OUTSIDE_WORKSPACE", "{}", r.text);
+        assert!(!base.join("escape.txt").exists());
+        let link = work.join("out");
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !made {
+            println!("skip: cannot create a junction here");
+            let _ = fs::remove_dir_all(&base);
+            return;
+        }
+        let r = invoke(&work, "read", json!({"path":"out/secret.txt"}));
+        assert_eq!(r.structured["code"], "FS_OUTSIDE_WORKSPACE", "{}", r.text);
+        let r = invoke(&work, "write", json!({"path":"out/new.txt","content":"x"}));
+        assert!(r.is_error && !outside.join("new.txt").exists(), "{}", r.text);
+        let r = invoke(&work, "grep", json!({"pattern":"secret"}));
+        assert!(!r.text.contains("secret.txt"), "{}", r.text);
+        let r = invoke(&work, "glob", json!({"pattern":"**/*.txt"}));
+        assert!(!r.text.contains("secret.txt"), "{}", r.text);
+        let _ = fs::remove_dir(&link);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn glob_is_recursive_skips_generated_dirs_and_supports_braces() {
         let dir = tmp("glob");
         fs::create_dir_all(dir.join("src")).unwrap();
@@ -2075,6 +2271,70 @@ mod tests {
         assert!(!r.is_error, "{}", r.text);
         assert_eq!(r.structured["skipped_binary"], 1);
         assert!(r.text.contains("a.txt:1: needle"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn double_star_slash_starts_at_a_path_segment() {
+        // `**/name` is "name in any directory", not "anything that ends in name".
+        assert!(!glob_match("**/name", "xname", false));
+        assert!(!glob_match("**/index.js", "a/reindex.js", false));
+        assert!(!glob_match("src/**/mod.rs", "src/a/submod.rs", false));
+        assert!(glob_match("**/name", "name", false) && glob_match("**/name", "a/b/name", false));
+        assert!(glob_match("src/**/mod.rs", "src/mod.rs", false) && glob_match("src/**/mod.rs", "src/a/b/mod.rs", false));
+        // a star after the slash may still start inside a name
+        assert!(glob_match("**/*.rs", "xb.rs", false) && glob_match("**/*.rs", "a/xb.rs", false));
+    }
+
+    #[test]
+    fn write_refuses_files_it_would_corrupt_and_keeps_bom_and_line_endings() {
+        let dir = tmp("write-encoding");
+        let latin1: &[u8] = b"caf\xe9\nx\n";
+        let utf16: &[u8] = b"\xff\xfeh\0i\0\n\0x\0\n\0";
+        for (name, bytes) in [("l1.txt", latin1), ("u16.txt", utf16)] {
+            fs::write(dir.join(name), bytes).unwrap();
+            assert!(!invoke(&dir, "read", json!({"path":name})).is_error);
+            let r = invoke(&dir, "write", json!({"path":name,"content":"replacement\n"}));
+            assert!(r.is_error, "{name}: {}", r.text);
+            assert_eq!(r.structured["code"], "FS_ENCODING", "{name}");
+            assert_eq!(fs::read(dir.join(name)).unwrap(), bytes, "{name} was rewritten");
+        }
+        // The model never saw the CRs or the BOM; the file must not lose them.
+        for (name, before, content, after) in [
+            ("crlf.txt", &b"a\r\nb\r\n"[..], "a\nb\nc\n", &b"a\r\nb\r\nc\r\n"[..]),
+            ("bom.txt", &b"\xef\xbb\xbfhello\n"[..], "hi\n", &b"\xef\xbb\xbfhi\n"[..]),
+            ("bomkept.txt", &b"\xef\xbb\xbfhello\n"[..], "\u{feff}hi\n", &b"\xef\xbb\xbfhi\n"[..]),
+            ("lf.txt", &b"a\nb\n"[..], "a\nc\n", &b"a\nc\n"[..]),
+        ] {
+            fs::write(dir.join(name), before).unwrap();
+            assert!(!invoke(&dir, "read", json!({"path":name})).is_error);
+            let r = invoke(&dir, "write", json!({"path":name,"content":content}));
+            assert!(!r.is_error, "{name}: {}", r.text);
+            assert_eq!(fs::read(dir.join(name)).unwrap(), after, "{name}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_keeps_crlf_for_multiline_new_text_and_matches_mixed_files() {
+        let dir = tmp("edit-crlf");
+        fs::write(dir.join("a.txt"), "a\r\nfoo();\r\nb\r\n").unwrap();
+        assert!(!invoke(&dir, "read", json!({"path":"a.txt"})).is_error);
+        let r = invoke(&dir, "edit", json!({"path":"a.txt","old_string":"foo();","new_string":"foo();\nbar();"}));
+        assert!(!r.is_error, "{}", r.text);
+        assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"a\r\nfoo();\r\nbar();\r\nb\r\n");
+        // a multi-line match inside the LF part of a file that also has CRLF
+        fs::write(dir.join("m.txt"), "x\r\ny\nz\nw\n").unwrap();
+        assert!(!invoke(&dir, "read", json!({"path":"m.txt"})).is_error);
+        let r = invoke(&dir, "edit", json!({"path":"m.txt","old_string":"y\nz","new_string":"y\nq"}));
+        assert!(!r.is_error, "{}", r.text);
+        assert_eq!(fs::read(dir.join("m.txt")).unwrap(), b"x\r\ny\nq\nw\n");
+        // the old behaviour stays: an LF old_string finds CRLF text
+        fs::write(dir.join("c.txt"), "p\r\nq\r\n").unwrap();
+        assert!(!invoke(&dir, "read", json!({"path":"c.txt"})).is_error);
+        let r = invoke(&dir, "edit", json!({"path":"c.txt","old_string":"p\nq","new_string":"p\nr"}));
+        assert!(!r.is_error, "{}", r.text);
+        assert_eq!(fs::read(dir.join("c.txt")).unwrap(), b"p\r\nr\r\n");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -187,7 +187,7 @@ fn compaction_over_budget_keeps_both_ends_and_says_so() {
         }
         let (c, cut) = compact::compact(&text, 200, 100, 60);
         let kept = c.lines().filter(|l| l.starts_with("error: over-")).count();
-        assert!(cut && kept <= 40 && kept >= 20, "round {round}: kept {kept} of {}", at.len());
+        assert!(cut && (20..=40).contains(&kept), "round {round}: kept {kept} of {}", at.len());
         assert!(c.contains(&format!("over-{round}-0 ")), "round {round}: first error lost");
         assert!(c.contains(&format!("over-{round}-{} ", at.len() - 1)), "round {round}: last error lost");
         assert!(c.contains("more important line(s) omitted"), "round {round}: cut not reported");

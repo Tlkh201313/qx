@@ -1,4 +1,4 @@
-﻿//! MCP (stdio) server exposing `run` (commands) and `fs` (filesystem).
+//! MCP (stdio) server exposing `run` (commands) and `fs` (filesystem).
 //!
 //! Tool names, fallback pointers and output shape come from `client`, so the same
 //! server speaks correctly to dsh, Claude Code, Codex, OpenCode, Hermes and pi.
@@ -196,13 +196,18 @@ static INFLIGHT: Mutex<Vec<(String, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
 /// already finished). `Inflight::begin` honours the first kind; the list is capped so the second cannot grow it.
 static EARLY_CANCELS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-struct Inflight(Option<String>);
+struct Inflight(Option<String>, Option<Arc<AtomicBool>>);
 
 impl Inflight {
+    /// Whether the client cancelled this call (or went away) before it started: it must not run at all.
+    fn cancelled(&self) -> bool {
+        self.1.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+
     /// Registers the calling worker thread's command for cancellation until dropped.
     fn begin(id: &Option<Value>) -> Self {
         let Some(key) = id.as_ref().map(Value::to_string) else {
-            return Inflight(None);
+            return Inflight(None, None);
         };
         // Lock order is always INFLIGHT then EARLY_CANCELS, held across check-and-insert, so a cancel
         // lands either in the flag or in the early list this reads, never between the two.
@@ -217,8 +222,8 @@ impl Inflight {
             running.push((key.clone(), flag.clone()));
             flag
         };
-        exec::set_cancel(Some(flag));
-        Inflight(Some(key))
+        exec::set_cancel(Some(flag.clone()));
+        Inflight(Some(key), Some(flag))
     }
 }
 
@@ -403,7 +408,7 @@ fn run_schema() -> Value {
     let mut schema = json!({
         "name": "run",
         "description": format!(
-            "Run a local command fast. Prefer `program` + `args` (direct exec, no shell); a PowerShell cmdlet (`Get-ChildItem`) or a `.ps1` path also works as `program`. A single `command` runs without a shell; otherwise `shell` decides: auto = PowerShell for cmdlet/variable syntax, Git Bash when a pipeline runs a POSIX utility (ls, cat, head, grep, wcâ€¦), else cmd. Children never prompt: stdin is empty, PowerShell runs -NonInteractive, git gets GIT_EDITOR=true and GIT_TERMINAL_PROMPT=0. In-process built-ins: pwd, echo, ls, cat, head, tail, wc, grep, mkdir, rm, cp, mv, touch, which, basename, dirname, realpath, whoami, hostname, seq, sleep. Output is compacted, preserves errors from the middle, and redacts secrets. On failure, fall back to the native {} for sandbox escalation, background jobs, or PTY work.",
+            "Run a local command fast. Prefer `program` + `args` (direct exec, no shell); a PowerShell cmdlet (`Get-ChildItem`) or a `.ps1` path also works as `program`. A single `command` runs without a shell; otherwise `shell` decides: auto = PowerShell for cmdlet/variable syntax, Git Bash when a pipeline runs a POSIX utility (ls, cat, head, grep, wc…), else cmd. Children never prompt: stdin is empty, PowerShell runs -NonInteractive, git gets GIT_EDITOR=true and GIT_TERMINAL_PROMPT=0. In-process built-ins: pwd, echo, ls, cat, head, tail, wc, grep, mkdir, rm, cp, mv, touch, which, basename, dirname, realpath, whoami, hostname, seq, sleep. Output is compacted, preserves errors from the middle, and redacts secrets. On failure, fall back to the native {} for sandbox escalation, background jobs, or PTY work.",
             c.native(Native::Shell)
         ),
         "inputSchema": {
@@ -504,6 +509,27 @@ fn fs_schema() -> Value {
     schema
 }
 
+/// The command line the digest classifies. Plain words stop after four args (long paths and
+/// test names would only confuse the classifier), but every `-flag` counts: `-- --nocapture`
+/// and `-s` ask for the output itself.
+pub(crate) fn run_label(program: Option<&str>, args: &[String], cmdline: Option<&str>) -> String {
+    let Some(p) = program else {
+        return cmdline.unwrap_or("").to_string();
+    };
+    let mut l = p.to_string();
+    for (i, a) in args.iter().enumerate() {
+        if !(a.starts_with('-') || (i < 4 && l.len() <= 80)) {
+            continue;
+        }
+        if l.len() >= 400 {
+            break;
+        }
+        l.push(' ');
+        l.push_str(a);
+    }
+    l
+}
+
 fn call_tool(req: &Value, id: Option<Value>) -> Value {
     let params = req.get("params").cloned().unwrap_or(Value::Null);
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -516,8 +542,25 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
         return tool_text(id, "unknown tool (expected `run` or `fs`)", true);
     }
 
-    let program = args.get("program").and_then(|v| v.as_str());
-    let cmdline = args.get("command").and_then(|v| v.as_str());
+    // A field of the wrong type is an error: ignoring it would run the command somewhere else
+    // (`cwd`), for another time (`timeout_ms`), or as a different command (`program`).
+    let text_arg = |key: &str| -> Result<Option<&str>, String> {
+        match args.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.as_str())),
+            Some(other) => Err(format!("`{key}` must be a string, got {other}")),
+        }
+    };
+    let (program, cmdline, cwd_text) = match (text_arg("program"), text_arg("command"), text_arg("cwd")) {
+        (Ok(p), Ok(c), Ok(d)) => (p, c, d),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return tool_text(id, &e, true),
+    };
+    // An empty `program` or `command` is an absent one.
+    let program = program.filter(|p| !p.trim().is_empty());
+    let cmdline = cmdline.filter(|c| !c.trim().is_empty());
+    if program.is_some() && cmdline.is_some() {
+        return tool_text(id, "give `program` + `args`, or `command`, not both", true);
+    }
     let shell = args.get("shell").and_then(|v| v.as_str()).unwrap_or("auto");
 
     // A dropped non-string argument would silently run a different command.
@@ -535,40 +578,49 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
         }
         Some(_) => return tool_text(id, "`args` must be an array of strings", true),
     };
-    let cwd = args
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from);
+    if program.is_none() && !list.is_empty() {
+        // `{"command":"git stash","args":["pop"]}` would otherwise run `git stash`.
+        return tool_text(id, "`args` go with `program`; with `command`, put the arguments in the command line", true);
+    }
+    // Absolute from here on: the guard, the built-ins and the child all mean the same directory.
+    let cwd = cwd_text.map(|t| std::path::absolute(t).unwrap_or_else(|_| t.into()));
     // A bad cwd must fail loudly: built-ins would otherwise run against the wrong place.
     if let Some(d) = cwd.as_ref().filter(|d| !d.is_dir()) {
         return tool_text(id, &format!("cwd is not a directory: {}", d.display()), true);
     }
-    let timeout_ms = args
-        .get("timeout_ms")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(120_000)
-        .clamp(1_000, 3_600_000);
-    let full = args.get("mode").and_then(|v| v.as_str()) == Some("full");
-    let label = if let Some(p) = program {
-        let mut l = p.to_string();
-        for a in list.iter().take(4) {
-            if l.len() > 80 {
-                break;
+    let timeout_ms: u64 = match args.get("timeout_ms") {
+        None | Some(Value::Null) => 120_000,
+        Some(v) => {
+            // Whole-number floats (`600000.0`) are what JavaScript and Python callers produce.
+            let whole = v.as_u64().or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.fract() == 0.0 && *f < 1e15).map(|f| f as u64));
+            match whole {
+                Some(n) => n,
+                None => {
+                    return tool_text(id, &format!("`timeout_ms` must be a whole number of milliseconds, got {v}"), true)
+                }
             }
-            l.push(' ');
-            l.push_str(a);
         }
-        l
-    } else {
-        cmdline.unwrap_or("").to_string()
-    };
+    }
+    .clamp(1_000, 3_600_000);
+    let full = args.get("mode").and_then(|v| v.as_str()) == Some("full");
+    let label = run_label(program, &list, cmdline);
 
     let guard_cmd = match program {
         Some(p) => std::iter::once(p).chain(list.iter().map(String::as_str)).collect::<Vec<_>>().join(" "),
         None => cmdline.unwrap_or("").to_string(),
     };
     let guard_cmd = guard_cmd.as_str();
-    let _inflight = Inflight::begin(&id);
+    let inflight = Inflight::begin(&id);
+    // Cancelled while it waited for a worker slot, or the client already left: run nothing.
+    // Built-ins would otherwise finish their file changes and a program would be spawned just to be killed.
+    if inflight.cancelled() {
+        return tool_result(
+            id,
+            "exit_code: 124\ntimed_out: true\n(cancelled before it started; not run)\n",
+            true,
+            json!({"timed_out": true, "exit_code": 124, "source": "cancelled"}),
+        );
+    }
     let decision = if let Some(p) = program {
         guard::check(p, &list, cwd.as_deref())
     } else if let Some(c) = cmdline {
@@ -601,14 +653,17 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
     guard::record("mcp", guard_cmd, &decision);
 
     let timeout = Duration::from_millis(timeout_ms);
+    // mode "full" promises the untouched text: built-ins must not sample their own output either.
+    let full_env: Vec<(String, String)> = if full { vec![("QX_LS_FULL".into(), "1".into())] } else { Vec::new() };
     let (outcome, source) = if let Some(p) = program {
-        match run_direct(p, &list, &[], cwd.as_deref(), timeout, "program") {
+        match run_direct(p, &list, &full_env, cwd.as_deref(), timeout, "program") {
             Ok(x) => x,
             Err(e) => return tool_text(id, &e, true),
         }
     } else if let Some(c) = cmdline {
         // The guard above judged the whole line; env prefixes only change what runs.
-        let (envs, c) = exec::peel_env(c);
+        let (mut envs, c) = exec::peel_env(c);
+        envs.extend(full_env);
         let direct = exec::split_simple(c)
             .and_then(|(prog, sargs)| run_direct(&prog, &sargs, &envs, cwd.as_deref(), timeout, "direct").ok());
         match direct {
@@ -741,10 +796,30 @@ fn run_direct(
             return exec::run_chain(cmds, Some(timeout)).map(|o| (o, "direct")).map_err(started);
         }
     }
-    if let Some(b) = builtin::try_exec(program, args, cwd, envs) {
-        return Ok((b.into(), "builtin"));
+    // Built-ins run in this thread: the call's deadline lets them stop on time, like a child.
+    struct Deadline;
+    impl Drop for Deadline {
+        fn drop(&mut self) {
+            exec::set_deadline(None);
+        }
     }
-    let mut cmd = exec::build_command_at(program, args, cwd)?;
+    let _deadline = Deadline;
+    exec::set_deadline(Some(std::time::Instant::now() + timeout));
+    let stopped = |mut o: exec::Outcome| {
+        o.timed_out = true;
+        o.code = 124;
+        o
+    };
+    if let Some(b) = builtin::try_exec(program, args, cwd, envs) {
+        let o: exec::Outcome = b.into();
+        return Ok((if exec::should_stop() { stopped(o) } else { o }, "builtin"));
+    }
+    // A built-in that declined because it was stopped must not start the real tool instead.
+    if exec::should_stop() {
+        let none = builtin::BuiltinOut { code: 124, stdout: String::new(), stderr: String::new(), elapsed: Duration::ZERO };
+        return Ok((stopped(none.into()), "builtin"));
+    }
+    let mut cmd = exec::build_command_env(program, args, cwd, envs)?;
     exec::apply_envs(&mut cmd, envs);
     if let Some(d) = cwd {
         cmd.current_dir(d);
@@ -841,6 +916,7 @@ mod tests {
 
     #[test]
     fn output_policy_follows_the_matrix() {
+        let _server = server_lock(); // a neighbour's EOF must not cancel these calls
         let list = |c: Client| {
             client::scoped(c, || {
                 handle(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}})).unwrap()
@@ -913,26 +989,104 @@ mod tests {
     }
 
     #[test]
+    fn a_builtin_stops_on_timeout_and_on_cancel() {
+        let _server = server_lock();
+        let t = std::time::Instant::now();
+        let r = client::scoped(Client::Dsh, || call_id(80, json!({"program":"sleep","args":["5"],"timeout_ms":1000})));
+        assert!(t.elapsed() < Duration::from_secs(3), "timeout ignored: {:?}", t.elapsed());
+        assert_eq!(r.pointer("/result/structuredContent/timed_out"), Some(&json!(true)), "{r}");
+        let worker = std::thread::spawn(|| {
+            client::scoped(Client::Dsh, || call_id(81, json!({"program":"sleep","args":["5"],"timeout_ms":60000})))
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(respond(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":81}}"#).is_none());
+        let t = std::time::Instant::now();
+        let r = worker.join().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(3), "cancel ignored: {:?}", t.elapsed());
+        assert_eq!(r.pointer("/result/structuredContent/timed_out"), Some(&json!(true)), "{r}");
+    }
+
+    #[test]
+    fn mixed_run_shapes_are_errors_not_other_commands() {
+        let _server = server_lock();
+        // `args` without `program` used to be dropped, running only the command's first words.
+        let r = call(json!({"command":"echo hi","args":["x"]}));
+        assert_eq!(r.pointer("/result/isError"), Some(&json!(true)), "{r}");
+        let text = r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default();
+        assert!(text.contains("args"), "{text}");
+        // An empty `program` beside a `command` is no program at all.
+        let r = call(json!({"program":"","command":"echo hi"}));
+        assert_ne!(r.pointer("/result/isError"), Some(&json!(true)), "{r}");
+    }
+
+    #[test]
+    fn wrong_typed_cwd_timeout_and_program_are_errors_not_defaults() {
+        let _server = server_lock();
+        let err = |args: Value| -> String {
+            let r = call(args);
+            assert_eq!(r.pointer("/result/isError"), Some(&json!(true)), "{r}");
+            r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default().to_string()
+        };
+        // A non-string cwd used to run the command (even a delete) in qx's own directory.
+        assert!(err(json!({"program":"echo","args":["x"],"cwd":123})).contains("cwd"));
+        assert!(err(json!({"program":"echo","args":["x"],"timeout_ms":"500"})).contains("timeout_ms"));
+        assert!(err(json!({"program":"echo","args":["x"],"timeout_ms":-5})).contains("timeout_ms"));
+        assert!(err(json!({"program":7})).contains("program"));
+        assert!(err(json!({"program":"echo","command":"echo y"})).contains("not both"));
+        // A whole-number float is what JavaScript and Python callers produce.
+        let ok = call(json!({"program":"echo","args":["x"],"timeout_ms":5000.0}));
+        assert_ne!(ok.pointer("/result/isError"), Some(&json!(true)), "{ok}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_call_cancelled_before_it_starts_does_not_run() {
+        let _server = server_lock();
+        let d = std::env::temp_dir().join(format!("qx-mcp-cancelfirst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let cwd = d.to_string_lossy().to_string();
+        for (id, args, marker) in [
+            (900u64, json!({"program":"mkdir","args":["made"],"cwd":cwd}), "made"),
+            (901u64, json!({"command":"cmd /c echo x> marker.txt","cwd":cwd}), "marker.txt"),
+        ] {
+            let note = format!(r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{{"requestId":{id}}}}}"#);
+            assert!(respond(&note).is_none());
+            let r = client::scoped(Client::Dsh, || call_id(id, args));
+            assert!(!d.join(marker).exists(), "the cancelled call still ran ({marker}): {r}");
+            assert_eq!(r.pointer("/result/structuredContent/timed_out"), Some(&json!(true)), "{r}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn an_env_prefix_reaches_builtins_and_the_log_keeps_args() {
+        let _server = server_lock();
         let d = std::env::temp_dir().join(format!("qx-mcp-env-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         for i in 0..230 {
             std::fs::write(d.join(format!("f{i:03}.txt")), "").unwrap();
         }
         let cwd = d.to_string_lossy().to_string();
-        let plain = client::scoped(Client::Dsh, || call(json!({"command":"ls","cwd":cwd,"mode":"full"})));
-        let full = client::scoped(Client::Dsh, || {
+        let plain = client::scoped(Client::Dsh, || call(json!({"command":"ls","cwd":cwd})));
+        let prefixed = client::scoped(Client::Dsh, || {
             call(json!({"command":"QX_LS_FULL=1 ls","cwd":cwd,"mode":"full"}))
         });
+        // README: mode "full" returns the untouched text, so the built-in's sampling stays off too.
+        let full = client::scoped(Client::Dsh, || call(json!({"command":"ls","cwd":cwd,"mode":"full"})));
+        let program = client::scoped(Client::Dsh, || call(json!({"program":"ls","cwd":cwd,"mode":"full"})));
         let text = |r: &Value| r.pointer("/result/structuredContent/stdout").and_then(Value::as_str).unwrap().to_string();
         assert!(text(&plain).contains("more entries") || text(&plain).lines().count() < 230);
-        assert_eq!(text(&full).lines().count(), 230);
+        for r in [&prefixed, &full, &program] {
+            assert_eq!(text(r).lines().count(), 230, "{r}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
     #[cfg(windows)]
     #[test]
     fn cancel_stops_the_running_command() {
+        let _server = server_lock();
         let worker = std::thread::spawn(|| {
             client::scoped(Client::Dsh, || {
                 call_id(77, json!({"program":"ping","args":["-n","30","127.0.0.1"],"timeout_ms":60000}))
@@ -949,6 +1103,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_cancel_that_arrives_before_the_call_gets_a_slot_is_not_lost() {
+        let _server = server_lock();
         // The reader answers `notifications/cancelled` while the call still waits for a worker slot.
         assert!(respond(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":78}}"#).is_none());
         let t = std::time::Instant::now();
@@ -972,6 +1127,18 @@ mod tests {
             drop(guard);
             assert!(hit, "cancel {i} was lost between the two lists");
         }
+    }
+
+    #[test]
+    fn the_digest_label_keeps_trailing_flags() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let l = run_label(Some("cargo"), &s(&["test", "--workspace", "--all-features", "--", "--nocapture"]), None);
+        assert!(l.ends_with("--nocapture"), "{l}");
+        // the same label makes the digest hand back a passing run's own output
+        assert!(digest::digest(&l, "running 1 test\nhello\ntest a ... ok\ntest result: ok. 1 passed\n", "", 0).is_none());
+        let paths: Vec<String> = (0..50).map(|i| format!("path{i}/file.rs")).collect();
+        assert!(run_label(Some("rg"), &paths, None).len() < 100);
+        assert_eq!(run_label(None, &[], Some("echo hi")), "echo hi");
     }
 
     #[test]
@@ -1174,9 +1341,9 @@ mod tests {
             .pointer("/result/structuredContent/stderr")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        // A sandbox that denies msys its named objects (NtCreateDirectoryObject) cannot run
+        // A sandbox that denies msys its named objects, signal pipe or file mapping cannot run
         // this at all; that is the environment refusing, not the fallback being wrong.
-        if stderr.contains("fatal error") && stderr.contains("NtCreateDirectoryObject") {
+        if stderr.contains("fatal error") && stderr.to_ascii_lowercase().contains("usr\\bin\\wc.exe") {
             println!("skip: this process cannot run msys binaries (named-object access denied)");
             let _ = std::fs::remove_dir_all(&d);
             return;

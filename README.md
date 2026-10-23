@@ -5,12 +5,29 @@ possible Windows process creations. It exists because on a machine with several
 real-time antivirus scanners, **spawning a process is the expensive part** — not
 the command itself.
 
+**Platform:** Windows 10/11. The crate builds elsewhere, but command lines are
+routed through `cmd.exe`/PowerShell/Git Bash and the client configs live under
+`%USERPROFILE%`, so qx is only supported on Windows. Building needs Rust 1.82 or
+newer; Git for Windows is recommended (its `usr\bin` tools back declined
+built-ins).
+
+**Install:**
+
+```powershell
+cargo install --git https://github.com/Tlkh201313/qx --locked
+qx setup all     # register qx with every installed agent CLI
+qx doctor        # check what each client points at
+```
+
+Do not run `cargo install qx`: the `qx` name on crates.io belongs to an
+unrelated project. To build from a clone, see [Build & install](#build--install).
+
 ## What it does
 
-1. **In-process built-ins** — 31 common commands run inside qx with **zero process
+1. **In-process built-ins** — 32 common commands run inside qx with **zero process
    creation**: `pwd echo true false sleep clear cls ls dir cat type head tail wc grep
-   mkdir rm del cp copy mv move touch which basename dirname realpath whoami
-   hostname seq`.
+   sed mkdir rm del erase cp copy mv move touch which basename dirname realpath
+   whoami hostname seq` (`sed` answers `sed -n 'A,Bp'` line ranges only).
    Anything a built-in does not reproduce exactly goes to the real tool instead:
    unknown flags, wildcards, `/x` arguments (cmd switches like `dir /b`, MSYS paths
    like `/tmp/x`), `tail -n +N`, `basename f .txt`, `echo -e`, `ls -lh`, `seq 1e3`,
@@ -87,7 +104,8 @@ the command itself.
      pins itself (`packageManager: pnpm@<version>`), has no `pnpm-workspace.yaml`
      in the root or any ancestor, no `workspaces` key, no `pre`/`post` script,
      and no `.npmrc` key pnpm would honor differently (`shell-emulator`,
-     `enable-pre-post-scripts`, and the shared list below). Scripts see
+     `enable-pre-post-scripts`, and the keys that change how npm runs scripts,
+     such as `script-shell` and `ignore-scripts`). Scripts see
      `PNPM_SCRIPT_SRC_DIR`, `npm_package_json`, `INIT_CWD`, `npm_execpath`,
      `npm_node_execpath`, `NODE`, and - when node's version is known -
      `npm_config_user_agent = pnpm/<version> …`. Everything else goes to pnpm.
@@ -188,6 +206,14 @@ qx is meant to be allow-listed in Claude Code (`Bash(qx:*)`, `mcp__qx__*`). That
 removes Claude's own confirmation prompt, so qx enforces its own gate before
 every command — including built-ins and shell wrappers.
 
+**What the gate is not:** it reads the command line, not what the command goes
+on to do. A script file (`python cleanup.py`, `npm run reset`, a `.bat`), a build
+step, or inline code that computes its target (`python -c "import shutil;
+shutil.rmtree(...)"` is a *warning*, not a block) runs whatever it contains. It
+is a heuristic safety net against the common destructive one-liners, not a
+sandbox. If an agent may run arbitrary scripts, keep your client's own approval
+prompts, or use `QX_GUARD=strict`, which turns every warning into a block.
+
 **Deny** (CLI exit 126, MCP `isError`):
 - `rm`/`del`/`rd` of drive roots, `C:\Windows`, Program Files, your home (or a
   parent such as `C:\Users`), the current directory, or a parent of it; the same
@@ -259,7 +285,8 @@ directories where deletion is routine.
 ## Build & install
 
 ```powershell
-cd C:\Users\USER\Projects\qx
+git clone https://github.com/Tlkh201313/qx
+cd qx
 cargo build --release
 target\release\qx.exe deploy
 ```
@@ -286,7 +313,7 @@ qx --raw <cmd>                          # no compaction
 qx --stream <cmd>                       # live output (default on a TTY)
 qx which npm                            # show the real binary / shim bypass
 qx doctor                               # why is this machine slow?
-QX_STATS=1 qx <cmd>                     # record savings
+$env:QX_STATS = 1; qx <cmd>             # record savings (captured runs)
 qx gain                                 # savings report
 ```
 
@@ -332,7 +359,7 @@ Each client editor keeps the `env` keys the existing entry already had and sets
 ### Claude Code
 
 ```powershell
-claude mcp add --scope user qx "C:\Users\USER\.cargo\bin\qx.exe" mcp
+claude mcp add --scope user qx "$env:USERPROFILE\.cargo\bin\qx.exe" mcp
 ```
 
 `qx setup claude-code` also adds a `PreToolUse` hook to `~\.claude\settings.json`
@@ -363,19 +390,27 @@ status digests still apply.
 `qx setup codex` writes `[mcp_servers.qx]` into `%CODEX_HOME%\config.toml`
 (default `~\.codex\config.toml`), with `startup_timeout_sec = 20` and
 `tool_timeout_sec = 600`, plus a `[mcp_servers.qx.env]` subtable holding
-`QX_CLIENT = "codex"` and any keys you already had. Codex shows the model only
-`structuredContent`, so qx omits `stdout` duplication from the text view for
-this client. The block is edited line by line, so comments and every other table
-in the file survive; a flow-style `mcp_servers = { … }` table is refused with a
-paste-ready block instead.
+`QX_CLIENT = "codex"` and any keys you already had. When a server sends
+`structuredContent`, Codex shows the model only that (JSON-escaped), so qx sends
+Codex the text view alone. The block is edited line by line, so comments and
+every other table in the file survive; a flow-style `mcp_servers = { … }` table,
+or an inline `env = { … }` in the qx table, is refused with a paste-ready block
+instead (`--remove` still works on it).
 
 ### OpenCode
 
+`qx setup opencode` edits `~\.config\opencode\opencode.json` (or `.jsonc`) in
+the shape the file already uses: OpenCode V2 keeps servers under `mcp.servers`
+(qx sets `codemode: false` so its tools are listed directly, and a 600 s
+execution timeout); OpenCode V1 lists them directly under `mcp` (qx writes
+`type`, `command`, `environment` and `enabled`). A new file gets the V2 shape.
+By hand, OpenCode V2:
+
 ```powershell
-opencode mcp add qx --global -- "C:\Users\USER\.cargo\bin\qx.exe" mcp
+opencode mcp add qx --global -- "$env:USERPROFILE\.cargo\bin\qx.exe" mcp
 ```
 
-This writes `mcp.servers.qx` to the global config. Keep
+Keep
 `"qx_*": "allow"` in the permission block so the agent never stops for a qx
 approval. Restart OpenCode after replacing `qx.exe`: a running MCP process
 holds the old executable image until it is restarted.
@@ -400,7 +435,7 @@ Doing it by hand looks like this:
       config:
         serverName: qx
         transport: stdio
-        command: C:/Users/USER/.cargo/bin/qx.exe
+        command: C:/Users/<you>/.cargo/bin/qx.exe
         args: [mcp]
         env:
           QX_CLIENT: dsh
@@ -423,7 +458,7 @@ escalation. Restart dsh after changing the `command` path.
 ```yaml
 mcp_servers:
   qx:
-    command: 'C:\Users\USER\.cargo\bin\qx.exe'
+    command: 'C:\Users\<you>\.cargo\bin\qx.exe'
     args: [mcp]
     env:
       QX_CLIENT: hermes
@@ -437,7 +472,7 @@ what selects its profile: qx then keeps the text output and puts only metadata
 in `structuredContent` (Hermes prints both copies). Two things to know: Hermes
 ignores MCP server instructions, so the routing rule has to live in its own
 prompt, and if `tool_search` is set to `auto` the qx tools may not be exposed at
-all — `qx doctor` flags that.
+all — set it so they are.
 
 ### pi
 
@@ -523,8 +558,10 @@ The server instructions name the tools with that client's ids (`mcp__qx__run`, o
 self-report is ambiguous; that is the only reliable way to reach the Hermes
 profile.
 
-## Measured on this machine (AV active)
+## Measured on one machine (AV active)
 
+These numbers come from the author's Windows 11 machine (28 threads, four
+real-time antivirus products), so treat them as an illustration, not a promise.
 0.7 numbers, median of 5 through `Measure-Command`, against the 0.6 build that
 was on `PATH`:
 
@@ -610,4 +647,13 @@ creation. Fixing that is worth more than any CLI:
 
 ```powershell
 cargo test --release
+node integrations/pi/bridge.test.mjs
 ```
+
+Some tests compare built-ins with Git for Windows' GNU `grep` and `sed`; where
+those cannot start they skip. CI sets `QX_REQUIRE_ORACLE=1`, which turns a
+missing oracle into a failure.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

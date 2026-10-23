@@ -21,18 +21,32 @@ fn is_env_header(trimmed: &str) -> bool {
     matches!(trimmed, "[mcp_servers.qx.env]" | "[mcp_servers.\"qx\".env]")
 }
 
+/// A header as TOML reads it: no trailing comment, no spaces (`[ mcp_servers . qx ] # note`).
+fn norm_header(line: &str) -> String {
+    strip_comment(line).chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 /// Every run of lines belonging to a qx table, in file order.
 fn qx_tables(lines: &[&str]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        if is_qx_header(lines[i].trim()) {
+        if is_qx_header(&norm_header(lines[i])) {
             let mut end = i + 1;
             while end < lines.len() && !lines[end].trim().starts_with('[') {
                 end += 1;
             }
+            // Trailing blank and comment lines introduce the next table: they are not ours,
+            // unless that next table is another qx table (`[mcp_servers.qx.env]`).
+            let next_is_qx = lines.get(end).is_some_and(|l| is_qx_header(&norm_header(l)));
+            while !next_is_qx && end > i + 1 && {
+                let t = lines[end - 1].trim();
+                t.is_empty() || t.starts_with('#')
+            } {
+                end -= 1;
+            }
             out.push((i, end));
-            i = end;
+            i = end.max(i + 1);
         } else {
             i += 1;
         }
@@ -47,7 +61,7 @@ pub fn edit_codex(text: Option<&str>, exe: &Path, a: Action) -> Edit {
             Action::Install => Edit::Changed(render(exe, &[], "\n")),
         };
     };
-    if refuses(text) {
+    if refuses(text, a) {
         return Edit::Refuse(refusal(exe));
     }
     let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
@@ -106,7 +120,7 @@ pub fn edit_codex(text: Option<&str>, exe: &Path, a: Action) -> Edit {
 pub fn codex_command(text: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     for (start, end) in qx_tables(&lines) {
-        if is_env_header(lines[start].trim()) {
+        if is_env_header(&norm_header(lines[start])) {
             continue;
         }
         if let Some(value) = lines[start..end]
@@ -123,7 +137,7 @@ pub fn codex_command(text: &str) -> Option<String> {
 fn kept_env(lines: &[&str], tables: &[(usize, usize)]) -> Vec<String> {
     let mut out = Vec::new();
     for (start, end) in tables {
-        if !is_env_header(lines[*start].trim()) {
+        if !is_env_header(&norm_header(lines[*start])) {
             continue;
         }
         for line in &lines[start + 1..*end] {
@@ -206,15 +220,24 @@ fn strip_comment(line: &str) -> &str {
 }
 
 /// Inline tables and dotted keys hide the entry inside one line: refuse, never guess.
-fn refuses(text: &str) -> bool {
+fn refuses(text: &str, action: Action) -> bool {
     let mut in_mcp_servers = false;
+    let mut in_qx_table = false;
     for line in text.lines() {
         let t = strip_comment(line).trim();
         if t.starts_with('[') {
-            in_mcp_servers = t == "[mcp_servers]";
+            let header = norm_header(t);
+            in_mcp_servers = header == "[mcp_servers]";
+            in_qx_table = is_qx_header(&header) && !is_env_header(&header);
             continue;
         }
         let squashed: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+        // An env written inline (`env = { .. }`) or dotted (`env.K = ..`) in the qx table would be
+        // regenerated away with the table.
+        // Removing the whole table drops nothing the user did not ask to drop.
+        if action == Action::Install && in_qx_table && (squashed.starts_with("env=") || squashed.starts_with("env.")) {
+            return true;
+        }
         if squashed.starts_with("mcp_servers={") || squashed.starts_with("mcp_servers.qx") {
             return true;
         }
@@ -356,6 +379,44 @@ model = \"y\"
                     matches!(other, Edit::Unchanged)
                 ),
             }
+        }
+    }
+
+    #[test]
+    fn codex_never_silently_drops_an_inline_env() {
+        let src = "[mcp_servers.qx]\ncommand = 'old'\nenv = { QX_GUARD = \"safe\" }\n";
+        match edit_codex(Some(src), Path::new(EXE), Action::Install) {
+            Edit::Refuse(reason) => assert!(reason.contains("[mcp_servers.qx]"), "{reason}"),
+            Edit::Changed(out) => assert!(out.contains("QX_GUARD"), "the user's env was dropped:\n{out}"),
+            Edit::Unchanged => {}
+        }
+    }
+
+    #[test]
+    fn codex_remove_works_when_install_would_refuse_an_inline_env() {
+        let src = "[mcp_servers.qx]\ncommand = 'x'\nenv = { QX_GUARD = \"strict\" }\n\n[profiles.fast]\nmodel = \"y\"\n";
+        assert!(matches!(edit_codex(Some(src), Path::new(EXE), Action::Install), Edit::Refuse(_)));
+        let out = changed(edit_codex(Some(src), Path::new(EXE), Action::Remove));
+        assert!(!out.contains("mcp_servers.qx"), "{out}");
+        assert!(out.contains("[profiles.fast]\nmodel = \"y\""), "{out}");
+    }
+
+    #[test]
+    fn codex_leaves_the_next_tables_comments_alone() {
+        let src = "[mcp_servers.qx]\ncommand = 'x'\n\n# >>> caveman >>>\n[mcp_servers.caveman]\ncommand = 'c'\n";
+        let out = changed(edit_codex(Some(src), Path::new(EXE), Action::Install));
+        assert!(out.contains("# >>> caveman >>>\n[mcp_servers.caveman]\ncommand = 'c'"), "{out}");
+        let out = changed(edit_codex(Some(src), Path::new(EXE), Action::Remove));
+        assert!(out.contains("# >>> caveman >>>\n[mcp_servers.caveman]\ncommand = 'c'"), "{out}");
+        assert!(!out.contains("mcp_servers.qx"), "{out}");
+    }
+
+    #[test]
+    fn codex_recognises_a_header_with_a_comment_or_spaces() {
+        for src in ["[mcp_servers.qx] # mine\ncommand = 'old'\n", "[ mcp_servers . qx ]\ncommand = 'old'\n"] {
+            let out = changed(edit_codex(Some(src), Path::new(EXE), Action::Install));
+            assert_eq!(count(&out, "[mcp_servers.qx]"), 1, "{src} -> {out}");
+            assert!(!out.contains("command = 'old'"), "{src} -> {out}");
         }
     }
 

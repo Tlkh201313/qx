@@ -146,6 +146,23 @@ fn venv_redirect_with(python: &Path, env: impl Fn(&str) -> Option<String>) -> Op
     if major < 3 || (major == 3 && minor < 11) {
         return None;
     }
+    // A relative `home` would resolve against qx's directory, not the venv's.
+    if !home.is_absolute() {
+        return None;
+    }
+    // A free-threaded (`python3.13t.exe`) or debug (`python_d.exe`) venv launches that build, not
+    // `<home>\python.exe`: its extension modules need it.
+    let executable = config
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("executable"))
+        .and_then(|(_, v)| Path::new(v.trim()).file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()));
+    if executable.is_some_and(|n| n != "python.exe")
+        || scripts.join("python_d.exe").is_file()
+        || scripts.join(format!("python{major}.{minor}t.exe")).is_file()
+    {
+        return None;
+    }
     let base = home.join("python.exe");
     base.is_file().then(|| VenvRedirect {
         base,
@@ -165,13 +182,11 @@ fn parse_pyvenv(text: &str) -> Option<(PathBuf, (u32, u32))> {
         match key.trim().to_ascii_lowercase().as_str() {
             "home" => home = Some(PathBuf::from(value)),
             // uv writes `uv`/`version_info`; the stdlib writes `version` too.
-            "version_info" | "version" => {
-                if version.is_none() {
-                    let mut parts = value.split('.');
-                    let major = parts.next()?.parse().ok()?;
-                    let minor = parts.next().and_then(|m| m.parse().ok()).unwrap_or(0);
-                    version = Some((major, minor));
-                }
+            "version_info" | "version" if version.is_none() => {
+                let mut parts = value.split('.');
+                let major = parts.next()?.parse().ok()?;
+                let minor = parts.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+                version = Some((major, minor));
             }
             _ => {}
         }
@@ -371,6 +386,38 @@ mod tests {
         )
         .unwrap();
         assert!(venv_redirect_with(&python, none).is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn variant_and_relative_venvs_keep_their_own_launcher() {
+        let d = tmp("venv-variant");
+        let (v, h) = (d.join("v"), d.join("h"));
+        fs::create_dir_all(v.join("Scripts")).unwrap();
+        fs::create_dir_all(&h).unwrap();
+        for f in ["python.exe", "python3.13t.exe"] {
+            fs::write(h.join(f), "").unwrap();
+        }
+        let python = v.join("Scripts").join("python.exe");
+        fs::write(&python, "").unwrap();
+        let none = |_: &str| None;
+        let cfg = |body: String| fs::write(v.join("pyvenv.cfg"), body).unwrap();
+        // A free-threaded venv runs python3.13t.exe; the GIL build would break cp313t extensions.
+        cfg(format!("home = {}\nversion = 3.13.1\nexecutable = {}\n", h.display(), h.join("python3.13t.exe").display()));
+        assert!(venv_redirect_with(&python, none).is_none());
+        cfg(format!("home = {}\nversion = 3.13.1\n", h.display()));
+        fs::write(v.join("Scripts").join("python3.13t.exe"), "").unwrap();
+        assert!(venv_redirect_with(&python, none).is_none(), "a t launcher in Scripts");
+        fs::remove_file(v.join("Scripts").join("python3.13t.exe")).unwrap();
+        fs::write(v.join("Scripts").join("python_d.exe"), "").unwrap();
+        assert!(venv_redirect_with(&python, none).is_none(), "a debug venv");
+        fs::remove_file(v.join("Scripts").join("python_d.exe")).unwrap();
+        // A relative home would resolve against qx's own directory, not the venv's.
+        cfg("home = h\nversion = 3.12.1\n".to_string());
+        assert!(venv_redirect_with(&python, none).is_none());
+        // The plain case still redirects.
+        cfg(format!("home = {}\nversion = 3.13.1\nexecutable = {}\n", h.display(), h.join("python.exe").display()));
+        assert!(venv_redirect_with(&python, none).is_some());
         let _ = fs::remove_dir_all(&d);
     }
 

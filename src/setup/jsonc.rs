@@ -58,6 +58,10 @@ pub fn remove_member(text: &str, path: &[&str]) -> Result<String, String> {
     if path.is_empty() {
         return Err("empty path".into());
     }
+    // An absent (or non-object) parent holds nothing to remove: that is a no-op, not an error.
+    if path.len() > 1 && member(text, &path[..path.len() - 1])?.is_none() {
+        return Ok(text.to_string());
+    }
     let parent_start = parent_object(text, path)?;
     let (list, _close) = members(text, parent_start)?;
     let key = path[path.len() - 1];
@@ -158,10 +162,12 @@ fn cut(text: &str, open: usize, start: usize, end: usize, first: bool) -> String
     let mut after = end;
     skip(bytes, &mut after);
     if bytes.get(after) == Some(&b',') {
-        // Also take the whitespace that followed the comma, but leave the next member's
-        // own indentation alone.
+        // Also take the whitespace that followed the comma, but never a comment: it
+        // belongs to the next member, and `skip` would swallow it.
         let mut tail = after + 1;
-        skip(bytes, &mut tail);
+        while bytes.get(tail).is_some_and(u8::is_ascii_whitespace) {
+            tail += 1;
+        }
         end = tail;
     } else if !first {
         // Last member: remove the comma that separated it from the previous one.
@@ -651,6 +657,21 @@ mod tests {
         assert!(v.get("qx").is_none());
         // Removing something absent changes nothing.
         assert_eq!(remove_member(src, &["zz"]).unwrap(), src);
+    }
+
+    #[test]
+    fn remove_member_with_an_absent_parent_is_a_no_op() {
+        let src = "{\"a\":1}";
+        assert_eq!(remove_member(src, &["mcpServers", "qx"]).unwrap(), src);
+        assert_eq!(remove_member("{}", &["mcp", "servers", "qx"]).unwrap(), "{}");
+    }
+
+    #[test]
+    fn remove_member_keeps_comments_after_the_comma() {
+        let src = "{\n  \"qx\": {\"x\":1},\n  // keep: important\n  \"b\": 2\n}";
+        assert_eq!(remove_member(src, &["qx"]).unwrap(), "{\n  // keep: important\n  \"b\": 2\n}");
+        let src = "{\n  \"qx\": 1,\n  /* keep */\n  \"b\": 2\n}";
+        assert_eq!(remove_member(src, &["qx"]).unwrap(), "{\n  /* keep */\n  \"b\": 2\n}");
     }
 
     #[test]

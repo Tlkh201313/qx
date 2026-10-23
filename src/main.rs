@@ -54,6 +54,7 @@ impl Default for RunOpts {
 }
 
 fn main() {
+    exec::seal_std_handles();
     let args: Vec<String> = std::env::args().skip(1).collect();
     std::process::exit(dispatch(&args));
 }
@@ -93,6 +94,12 @@ fn dispatch(args: &[String]) -> i32 {
     }
 }
 
+/// Whether output streams live to the terminal: an explicit --stream/--capture decides; otherwise
+/// a terminal streams, unless QX_REDACT=1 asks for redaction, which only captured output can get.
+fn streams(tty: bool, explicit: Option<bool>, redact: Option<&str>) -> bool {
+    explicit.unwrap_or(tty && !matches!(redact, Some("1" | "on")))
+}
+
 fn parse_num(v: Option<&String>, fallback: usize) -> usize {
     v.and_then(|s| s.parse::<usize>().ok()).unwrap_or(fallback)
 }
@@ -101,8 +108,10 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
     let mut o = RunOpts::default();
     // `echo data | qx grep x`: the command reads qx's stdin. At a terminal it already does.
     exec::INHERIT_STDIN.store(!std::io::stdin().is_terminal(), std::sync::atomic::Ordering::Relaxed);
+    let tty = o.stream;
+    let mut explicit_stream: Option<bool> = None;
     if force_raw {
-        o.stream = false;
+        explicit_stream = Some(false);
         o.compact = false;
     }
 
@@ -117,11 +126,11 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
         }
         match a {
             "--stream" => {
-                o.stream = true;
+                explicit_stream = Some(true);
                 i += 1;
             }
             "--capture" => {
-                o.stream = false;
+                explicit_stream = Some(false);
                 i += 1;
             }
             "--raw" | "--full" | "--no-compact" => {
@@ -154,7 +163,7 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
             }
             "--cwd" => {
                 i += 1;
-                o.cwd = args.get(i).map(PathBuf::from);
+                o.cwd = args.get(i).map(|t| std::path::absolute(t).unwrap_or_else(|_| PathBuf::from(t)));
                 i += 1;
             }
             "--shell" => {
@@ -163,10 +172,10 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
                 i += 1;
             }
             "-c" | "--command" => {
+                // Flags may follow the command line (`qx -c "..." --cwd D`); they still apply.
                 i += 1;
                 shell_cmd = args.get(i).cloned();
                 i += 1;
-                break;
             }
             "-h" | "--help" => {
                 print_help();
@@ -178,6 +187,12 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
             }
             _ => break,
         }
+    }
+
+    o.stream = streams(tty, explicit_stream, std::env::var("QX_REDACT").ok().as_deref());
+    if shell_cmd.is_some() && i < args.len() {
+        eprintln!("qx: unexpected arguments after -c: {} (put them inside the quoted command)", args[i..].join(" "));
+        return 2;
     }
 
     // A bad cwd must fail loudly: built-ins would otherwise run against the wrong place.
@@ -216,7 +231,11 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
     let (mut cmd, label) = if let Some(sh) = shell_cmd {
         // `CI=1 npm test`: the prefix goes to the child only, never into qx's own environment
         // (that would also reach qx's switches such as QX_REDACT).
-        let (envs, run) = exec::peel_env(&sh);
+        let (mut envs, run) = exec::peel_env(&sh);
+        if !o.compact {
+            // --raw promises the untouched text: built-ins must not sample their own output either.
+            envs.push(("QX_LS_FULL".into(), "1".into()));
+        }
         let run = run.to_string();
         // A quoted command with no shell syntax does not need a shell at all.
         if let Some((prog, sargs)) = exec::split_simple(&run) {
@@ -229,7 +248,7 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
             if let Some(code) = direct_exec(&prog, &sargs, &envs, &o, &sh) {
                 return code;
             }
-            if let Ok(mut c) = exec::build_command_at(&prog, &sargs, o.cwd.as_deref()) {
+            if let Ok(mut c) = exec::build_command_env(&prog, &sargs, o.cwd.as_deref(), &envs) {
                 exec::apply_envs(&mut c, &envs);
                 exec::apply_cwd(&mut c, &o.cwd);
                 return execute(vec![c], &o, &sh);
@@ -251,18 +270,13 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
             return 2;
         };
         let rest = &args[i + 1..];
-        let mut label = program.clone();
-        for a in rest.iter().take(4) {
-            if label.len() > 80 {
-                break;
-            }
-            label.push(' ');
-            label.push_str(a);
-        }
+        // The same label the MCP server builds: every flag counts (`-- --nocapture` keeps test output).
+        let label = mcp::run_label(Some(program), rest, None);
         if let Some(code) = direct_exec(program, rest, &[], &o, &label) {
             return code;
         }
-        if let Some(b) = builtin::try_exec(program, rest, o.cwd.as_deref(), &[]) {
+        let full_env: Vec<(String, String)> = if o.compact { Vec::new() } else { vec![("QX_LS_FULL".into(), "1".into())] };
+        if let Some(b) = builtin::try_exec(program, rest, o.cwd.as_deref(), &full_env) {
             return emit(b.into(), &o, &label);
         }
         match exec::build_command_at(program, rest, o.cwd.as_deref()) {
@@ -359,7 +373,7 @@ fn emit(out: exec::Outcome, o: &RunOpts, label: &str) -> i32 {
     // raw output unless QX_REDACT=1; QX_REDACT=off disables it entirely.
     let setting = std::env::var("QX_REDACT").ok();
     let setting = setting.as_deref();
-    let do_redact = setting != Some("off") && (setting == Some("1") || !o.stream);
+    let do_redact = setting != Some("off") && (matches!(setting, Some("1" | "on")) || !o.stream);
     let mut redactions = 0usize;
     if do_redact {
         let (a, n) = redact_text(so);
@@ -676,7 +690,7 @@ FLAGS
 
 SAFETY GATE
   QX_GUARD=safe|strict|off   default safe (deny catastrophic, warn risky)
-  QX_REDACT=on|off           secret redaction (default on for captured output)
+  QX_REDACT=1|off            1: redact at a terminal too (output is captured); off: never
   QX_ALLOW_ROOTS=C:\a;C:\b   extra roots where deletion is normal
   QX_ALLOW_FORCE_PUSH=1      permit git push --force
   QX_AUDIT=1                 log every command, not only warnings/blocks
@@ -690,11 +704,12 @@ SAFETY GATE
 
 BUILT-INS (no process spawn)
   pwd echo true false sleep clear cls
-  ls dir cat type head tail wc grep
-  mkdir rm del cp copy mv move touch
-  which where basename dirname realpath
+  ls dir cat type head tail wc grep sed
+  mkdir rm del erase cp copy mv move touch
+  which basename dirname realpath
   whoami hostname seq
   grep takes literal patterns, -i -n -l -r -v -q -c -A/-B/-C -F -e PAT; else the real grep.
+  sed answers sed -n 'A,Bp' line ranges; `where` is always the real where.exe.
   head -c N / tail -c N read one byte window when it is text; binary runs the real tool.
   Unknown flags fall back to the real executable.
 
@@ -707,4 +722,33 @@ EXAMPLES
   qx mcp
 "#
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn flags_after_dash_c_are_honoured_and_strays_refused() {
+        // `--cwd` after `-c` used to be dropped, so the command ran somewhere else.
+        let missing = std::env::temp_dir().join("qx-no-such-dir-for-cli-test");
+        assert_eq!(run_cli(&s(&["--capture", "-c", "exit 3", "--cwd", &missing.to_string_lossy()]), false), 2);
+        assert_eq!(run_cli(&s(&["--capture", "-c", "exit 0", "stray"]), false), 2);
+        assert_eq!(run_cli(&s(&["--capture", "-c", "exit 3"]), false), 3);
+    }
+
+    #[test]
+    fn an_explicit_redact_request_captures_instead_of_streaming() {
+        // At a terminal, QX_REDACT=1 can only be honoured on captured output.
+        assert!(!streams(true, None, Some("1")));
+        assert!(!streams(true, None, Some("on")));
+        assert!(streams(true, None, None));
+        assert!(streams(true, None, Some("off")));
+        assert!(streams(true, Some(true), Some("1")), "an explicit --stream wins");
+        assert!(!streams(false, None, None));
+    }
 }
