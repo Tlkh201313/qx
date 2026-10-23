@@ -19,7 +19,8 @@ use std::process::{Command, Stdio};
 pub fn run(args: &[String]) -> i32 {
     if args.first().map(String::as_str) != Some("claude") {
         eprintln!("usage: qx hook claude   (Claude Code PreToolUse hook; reads the event on stdin)");
-        return 2;
+        // Not 2: Claude Code reads exit 2 as "block this tool call", so a typo would stop every command.
+        return 0;
     }
     // A broken hook must never block the tool call: on any doubt, print nothing and exit 0.
     let mut input = String::new();
@@ -63,9 +64,9 @@ fn respond(event: &Value) -> Option<Value> {
         }
     }
     // Claude Code checks permissions on the rewritten line: `Bash(qx:*)` would auto-approve a
-    // `qx git push` that used to prompt, and `Bash(git status:*)` would stop covering `qx git status`.
+    // `qx git push` that used to prompt, and `qx ls` loses the read-only `ls`'s free pass.
     let bypass = event["permission_mode"].as_str() == Some("bypassPermissions");
-    if rules.restricts(tool, &rewritten) || !(bypass || rules.same_answer(tool, &base, &rewritten)) {
+    if rules.restricts(tool, &rewritten) || !(bypass || rules.allows_both(tool, &base, &rewritten)) {
         return None;
     }
     let mut updated = input.clone();
@@ -785,6 +786,13 @@ fn rtk_rewrite(command: &str) -> Rtk {
         .stderr(Stdio::null())
         .spawn();
     let Ok(mut child) = run else { return Rtk::Keep };
+    let Some(mut out) = child.stdout.take() else { return Rtk::Unknown };
+    // Read while rtk runs: a rewritten line longer than the pipe buffer would otherwise hold rtk
+    // until the deadline below.
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        out.read_to_end(&mut buf).map(|_| buf)
+    });
     // rtk answers in ~30 ms; a hung rtk must not hold every Bash call until the hook's own timeout.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let status = loop {
@@ -798,10 +806,7 @@ fn rtk_rewrite(command: &str) -> Rtk {
             }
         }
     };
-    let mut stdout = Vec::new();
-    if child.stdout.take().map(|mut o| o.read_to_end(&mut stdout)).is_none() {
-        return Rtk::Unknown;
-    }
+    let Ok(Ok(stdout)) = reader.join() else { return Rtk::Unknown };
     match (status.code(), String::from_utf8(stdout)) {
         (Some(1), _) => Rtk::Keep,
         (Some(0 | 3), Ok(line)) if !line.trim().is_empty() => {
@@ -828,6 +833,10 @@ impl Rules {
         if let Some(home) = crate::resolve::home_dir() {
             files.push(home.join(".claude"));
         }
+        // The settings Claude Code itself reads, wherever the command later `cd`s to.
+        let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+        files.extend(var("CLAUDE_CONFIG_DIR"));
+        files.extend(var("CLAUDE_PROJECT_DIR").map(|p| p.join(".claude")));
         // Project settings sit at the project root, which may be any ancestor of the cwd.
         files.extend(cwd.into_iter().flat_map(Path::ancestors).map(|d| d.join(".claude")));
         if let Some(pf) = std::env::var_os("ProgramFiles") {
@@ -854,13 +863,14 @@ impl Rules {
         Some(rules)
     }
 
-    /// Whether the allow rules answer each command of `rewritten` as they answer the same
-    /// command of `base`, so the rewrite neither skips a prompt nor adds one. Each command is
-    /// tried with and without its leading `VAR=x` words, and the whole line once more, since
-    /// how Claude Code splits a line is its own business.
-    fn same_answer(&self, tool: &str, base: &str, rewritten: &str) -> bool {
+    /// Whether the allow rules approve each command of `base` and of `rewritten`, so the rewrite
+    /// neither skips a prompt nor adds one: Claude Code approves some read-only commands (`ls`,
+    /// `cat`) on its own, which `qx ls` would lose. Each command is tried with and without its
+    /// leading `VAR=x` words, and the whole line once more, since how Claude Code splits a line
+    /// is its own business.
+    fn allows_both(&self, tool: &str, base: &str, rewritten: &str) -> bool {
         let (Some(a), Some(b)) = (commands(tool, base), commands(tool, rewritten)) else { return false };
-        a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| self.allows(tool, x) == self.allows(tool, y))
+        a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| self.allows(tool, x) && self.allows(tool, y))
     }
 
     /// `Tool`, `Tool(exact)`, `Tool(prefix:*)` and `Tool(glob *)` allow rules.
@@ -883,6 +893,10 @@ impl Rules {
     /// anywhere in the line (`cd x && git push` still meets `Bash(git push:*)`).
     fn restricts(&self, tool: &str, command: &str) -> bool {
         self.patterns.iter().any(|rule| {
+            // Claude Code also holds `cat .env` to a `Read(./.env)` rule; `qx cat .env` escapes it.
+            if ["Read", "Edit", "Write"].iter().any(|t| rule.split('(').next() == Some(*t)) {
+                return true;
+            }
             let Some(rest) = rule.strip_prefix(tool) else { return false };
             if rest.is_empty() {
                 return true;
@@ -896,7 +910,7 @@ impl Rules {
     }
 }
 
-/// The texts `Rules::same_answer` compares: the whole line, then per command its text from the
+/// The texts `Rules::allows_both` checks: the whole line, then per command its text from the
 /// first word and from the program on.
 fn commands<'a>(tool: &str, line: &'a str) -> Option<Vec<&'a str>> {
     let mut out = vec![line.trim()];
@@ -1124,24 +1138,25 @@ mod tests {
     }
 
     #[test]
-    fn allow_rules_answer_the_same_after_rewrite() {
+    fn allow_rules_must_approve_both_lines() {
         let qx = Rules { patterns: vec![], allow: vec!["Bash(qx:*)".into(), "Bash(git status:*)".into()], rtk: false };
-        assert!(qx.same_answer("Bash", "git status", "qx git status"));
-        assert!(!qx.same_answer("Bash", "git push", "qx git push"));
-        assert!(!qx.same_answer("Bash", "FOO=1 git push", "FOO=1 qx git push"));
-        assert!(!qx.same_answer("Bash", "git status && git push", "qx git status && qx git push"));
+        assert!(qx.allows_both("Bash", "git status", "qx git status"));
+        assert!(!qx.allows_both("Bash", "git push", "qx git push"));
+        assert!(!qx.allows_both("Bash", "FOO=1 git push", "FOO=1 qx git push"));
+        assert!(!qx.allows_both("Bash", "git status && git push", "qx git status && qx git push"));
         // A redirect is part of the command an exact rule must match.
         let exact = Rules { patterns: vec![], allow: vec!["Bash(qx:*)".into(), "Bash(git status)".into()], rtk: false };
-        assert!(exact.same_answer("Bash", "git status", "qx git status"));
-        assert!(!exact.same_answer("Bash", "git status > out", "qx git status > out"));
+        assert!(exact.allows_both("Bash", "git status", "qx git status"));
+        assert!(!exact.allows_both("Bash", "git status > out", "qx git status > out"));
         let plain = Rules { patterns: vec![], allow: vec!["Bash(git status *)".into()], rtk: false };
-        assert!(!plain.same_answer("Bash", "git status -s", "qx git status -s"));
+        assert!(!plain.allows_both("Bash", "git status -s", "qx git status -s"));
+        // No allow rules: Claude Code may approve `ls` itself, never `qx ls`.
         let none = Rules { patterns: vec![], allow: vec![], rtk: false };
-        assert!(none.same_answer("Bash", "git push", "qx git push"));
+        assert!(!none.allows_both("Bash", "ls", "qx ls"));
         let all = Rules { patterns: vec![], allow: vec!["Bash".into()], rtk: false };
-        assert!(all.same_answer("Bash", "git push", "qx git push"));
+        assert!(all.allows_both("Bash", "git push", "qx git push"));
         let ps = Rules { patterns: vec![], allow: vec!["PowerShell(qx:*)".into()], rtk: false };
-        assert!(!ps.same_answer("PowerShell", "cd x; git push", "cd x; qx git push"));
+        assert!(!ps.allows_both("PowerShell", "cd x; git push", "cd x; qx git push"));
     }
 
     #[test]
@@ -1161,6 +1176,9 @@ mod tests {
         assert!(all.restricts("Bash", "anything"));
         let other = Rules { patterns: vec!["BashOutput".into()], allow: vec![], rtk: false };
         assert!(!other.restricts("Bash", "anything"));
+        // `cat .env` is held to Read rules; `qx cat .env` would not be.
+        let read = Rules { patterns: vec!["Read(./.env)".into()], allow: vec![], rtk: false };
+        assert!(read.restricts("Bash", "cat notes.txt"));
     }
 
     /// Replays real commands (`QX_HOOK_CORPUS`: a JSON list of `{"tool", "command"}`) and writes

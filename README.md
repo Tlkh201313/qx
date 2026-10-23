@@ -375,10 +375,14 @@ qx instead. Shell builtins, servers and watchers, background calls, the commands
 `$(...)`, and arguments Git Bash would rewrite for its own tools (`sed -n '/x/p'`) stay
 as written, and so do lines that define functions or aliases (`eval`, `source`,
 `Set-Alias`) and qx's own command names (`which`, `check`). A command a `deny` or `ask`
-rule names is left alone, so the rule still sees it. Claude Code checks `allow` rules
-against the rewritten line, so outside `bypassPermissions` a line is only rewritten when
-every allow rule answers it the same before and after: with `Bash(qx:*)` allowed,
-`git push` keeps its prompt instead of passing as `qx git push`. A settings file that is
+rule names is left alone, so the rule still sees it, and any `Read`, `Edit` or `Write`
+deny or ask rule turns rewriting off (Claude Code holds `cat .env` to them, not `qx cat .env`).
+Claude Code checks `allow` rules against the rewritten line, so outside `bypassPermissions`
+a line is only rewritten when allow rules approve it both before and after: with
+`Bash(qx:*)` and `Bash(git status:*)` allowed, `git status` becomes `qx git status`, while
+`git push` keeps its prompt and a read-only `ls` keeps its free pass. Add `Bash(qx:*)` and
+your usual allow rules to get rewrites outside bypass mode. Rules come from `~\.claude`,
+`CLAUDE_CONFIG_DIR`, `CLAUDE_PROJECT_DIR` and every parent of the cwd. A settings file that is
 not valid JSON(C) turns the hook off. When the rtk hook also rewrites a line, this hook
 builds on rtk's version, since Claude Code keeps only one rewrite.
 Inside Claude Code (`CLAUDECODE=1`), output that fits the Bash tool's own limit
