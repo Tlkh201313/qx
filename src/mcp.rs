@@ -36,6 +36,9 @@ impl Limits {
 }
 
 pub fn serve() -> i32 {
+    // The server outlives its calls, so a parked PowerShell is ready for the next one.
+    #[cfg(windows)]
+    exec::keep_powershell_warm();
     let stdin = std::io::stdin();
     serve_io(stdin.lock(), std::io::stdout(), Limits::from_env())
 }
@@ -1014,6 +1017,8 @@ mod tests {
     }
 
     /// Replies land here instead of stdout, so `serve_io` can be driven by a test.
+    // Only the Windows server tests drive these two.
+    #[cfg_attr(not(windows), allow(dead_code))]
     #[derive(Clone, Default)]
     struct Sink(Arc<Mutex<Vec<u8>>>);
 
@@ -1027,6 +1032,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     impl Sink {
         /// Every reply, with a batch reply spread out so an id can be looked up directly.
         fn replies(&self) -> Vec<Value> {
@@ -1049,8 +1055,10 @@ mod tests {
     /// A line source that answers everything at once and only reports EOF once a call has really
     /// taken the worker slot. Which of the two calls wins that slot is a thread-startup race, so
     /// the winner's id is recorded for the test instead of being assumed.
+    #[cfg_attr(not(windows), allow(dead_code))]
     struct SlowEof(std::io::Cursor<Vec<u8>>, Arc<std::sync::Mutex<Option<String>>>);
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     impl SlowEof {
         fn new(text: &str) -> (Self, Arc<std::sync::Mutex<Option<String>>>) {
             let slot = Arc::new(std::sync::Mutex::new(None));
@@ -1210,7 +1218,9 @@ mod tests {
         let ping = by_id(32).unwrap_or_else(|| panic!("id 32 unanswered: {replies:?}"));
         assert!(ping.get("result").is_some(), "{ping}");
         let refused = by_id(33).unwrap_or_else(|| panic!("id 33 unanswered: {replies:?}"));
-        assert_eq!(refused.pointer("/result/structuredContent/source"), Some(&json!("busy")));
+        // The text, not `structuredContent`: which one a reply carries depends on the client
+        // profile, and `CLAUDECODE=1` in the test's own environment selects one without it.
+        assert!(refused.pointer("/result/content/0/text").and_then(Value::as_str).unwrap().contains("qx busy"), "{refused}");
     }
 
     #[cfg(windows)]
@@ -1238,7 +1248,7 @@ mod tests {
         let running_id = started.lock().unwrap_or_else(|e| e.into_inner()).clone().expect("a call took the slot");
         let queued_id = if running_id == "11" { 12 } else { 11 };
         let running = sink.reply(running_id.parse::<u64>().unwrap()).expect("the running call answers");
-        assert_eq!(running.pointer("/result/structuredContent/timed_out"), Some(&json!(true)));
+        assert!(running.pointer("/result/content/0/text").and_then(Value::as_str).unwrap().contains("timed_out: true"), "{running}");
         let queued = sink.reply(queued_id).expect("the queued call answers");
         assert_eq!(queued.pointer("/result/isError"), Some(&json!(true)));
         let text = queued.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
@@ -1263,7 +1273,6 @@ mod tests {
         assert_eq!(code, 0);
         let busy = sink.reply(22).expect("the over-limit call answers");
         assert_eq!(busy.pointer("/result/isError"), Some(&json!(true)));
-        assert_eq!(busy.pointer("/result/structuredContent/source"), Some(&json!("busy")));
         let text = busy.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
         assert!(text.contains("qx busy"), "over-limit text: {text}");
     }

@@ -485,12 +485,12 @@ pub fn command_for(program: &str, target: Target, args: &[String]) -> Result<Com
                 None => exe.as_path(),
             };
             let mut c = Command::new(program);
-            c.args(prefix);
+            add_args(&mut c, &prefix);
             if skip_profile {
                 // A profile adds 300+ ms and can print into the output.
                 c.arg("-NoProfile");
             }
-            c.args(args);
+            add_args(&mut c, args);
             prepare(&mut c);
             if let Some(v) = &venv {
                 // After `prepare`, which clears the inherited environment: this is what makes
@@ -573,6 +573,60 @@ fn git_root(cmd: &Command) -> Option<PathBuf> {
     (named(bin, "bin") && named(mingw, "mingw64")).then(|| mingw.parent().map(Path::to_path_buf))?
 }
 
+/// Appends `args` so the program parses them back unchanged. `Command` quotes for the MSVC
+/// runtime; an MSYS/Cygwin program reads its command line by other rules (`msys_quote`).
+fn add_args<S: AsRef<str>>(c: &mut Command, args: &[S]) {
+    #[cfg(windows)]
+    if args.iter().any(|a| msys_quote(a.as_ref()).is_some()) && msys_runtime(Path::new(c.get_program())) {
+        use std::os::windows::process::CommandExt;
+        for a in args {
+            match msys_quote(a.as_ref()) {
+                Some(q) => c.raw_arg(q),
+                None => c.arg(a.as_ref()),
+            };
+        }
+        return;
+    }
+    c.args(args.iter().map(AsRef::as_ref));
+}
+
+/// Git's `usr\bin` tools link `msys-2.0.dll`; its `bin\bash.exe` and `bin\sh.exe` are launchers
+/// that pass their command line on to `usr\bin`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn msys_runtime(exe: &Path) -> bool {
+    let Some(dir) = exe.parent() else { return false };
+    let shell = exe.file_stem().is_some_and(|s| s.eq_ignore_ascii_case("bash") || s.eq_ignore_ascii_case("sh"));
+    dir.join("msys-2.0.dll").is_file()
+        || dir.join("cygwin1.dll").is_file()
+        || (shell && dir.join(r"..\usr\bin\msys-2.0.dll").is_file())
+}
+
+/// `a` quoted for an MSYS/Cygwin program, or `None` when `Command`'s quoting already survives.
+/// Started from a Windows process, that runtime re-parses its command line: `'` quotes too,
+/// `\"` outside quotes keeps the backslash, a word holding `* ? [ { ( "` or a leading `~` is
+/// globbed (`a{2}` becomes `a2`, `\\` becomes `\`), and a leading `@` names a response file.
+/// Inside double quotes only `\\` and `\"` are escapes.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn msys_quote(a: &str) -> Option<String> {
+    const RISKY: [char; 13] = [' ', '\t', '\n', '\r', '"', '\'', '*', '?', '[', '{', '}', '(', ')'];
+    // shortcut: a drive path (`C:\a b`) keeps `Command`'s quoting, whose backslashes MSYS reads
+    // literally, so one holding `"` or ending in `\` still arrives mangled; quote it here if seen.
+    let drive = a.len() > 1 && a.as_bytes()[0].is_ascii_alphabetic() && a.as_bytes()[1] == b':';
+    if drive || !(a.starts_with(['~', '@']) || a.contains(RISKY)) {
+        return None;
+    }
+    let mut q = String::with_capacity(a.len() + 2);
+    q.push('"');
+    for ch in a.chars() {
+        if matches!(ch, '"' | '\\') {
+            q.push('\\');
+        }
+        q.push(ch);
+    }
+    q.push('"');
+    Some(q)
+}
+
 /// `cmd.exe` folds a line over ~8 KiB into "The command line is too long."
 const CMD_LINE_CAP: usize = 8_000;
 
@@ -587,7 +641,7 @@ pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
                     .to_string()
             })?;
             let mut c = Command::new(b);
-            c.args(["-c", command]);
+            add_args(&mut c, &["-c", command]);
             prepare(&mut c);
             apply_python_fast(&mut c);
             apply_child_defaults(&mut c, false);
@@ -608,25 +662,30 @@ pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
             Ok(c)
         }
         "powershell" => {
-            let mut c = Command::new("powershell.exe");
-            // The user's profile costs 300+ ms and changes output; the prelude keeps
-            // piped output UTF-8 and drops progress-bar noise. `-NonInteractive` turns a
-            // prompt into an error instead of a hang. Not `-EncodedCommand`: with captured
-            // output it writes errors as CLIXML.
-            c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
+            // The prelude keeps piped output UTF-8 and drops progress-bar noise.
             // Own line, so parse errors point at the command, not the prelude.
             // -Command folds every native exit code to 1; hand the real one back.
-            c.arg(format!(
+            Ok(powershell(format!(
                 "$ProgressPreference='SilentlyContinue';try{{[Console]::OutputEncoding=[Text.Encoding]::UTF8}}catch{{}}\n{command}\n$qxok=$?;if($LASTEXITCODE){{exit $LASTEXITCODE}};if(!$qxok){{exit 1}}"
-            ));
-            prepare(&mut c);
-            apply_python_fast(&mut c);
-            apply_child_defaults(&mut c, false);
-            Ok(c)
+            )))
         }
         "none" => Err("shell=none needs program+args".to_string()),
         other => Err(format!("unknown shell: {other}")),
     }
+}
+
+/// The user's profile costs 300+ ms and changes output. `-NonInteractive` turns a prompt into an
+/// error instead of a hang. Not `-EncodedCommand`: with captured output it writes errors as CLIXML.
+const PS_FLAGS: [&str; 4] = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"];
+
+/// The one way qx starts powershell.exe, so a parked one (see `warm`) matches a cold one.
+fn powershell(script: String) -> Command {
+    let mut c = Command::new("powershell.exe");
+    c.args(PS_FLAGS).arg(script);
+    prepare(&mut c);
+    apply_python_fast(&mut c);
+    apply_child_defaults(&mut c, false);
+    c
 }
 
 /// The one way qx starts cmd.exe. The line goes in as raw command-line text: `Command`'s own
@@ -786,8 +845,17 @@ fn cmd_quote(s: &str) -> String {
 pub(crate) const CAPTURE_CAP: usize = 16 * 1024 * 1024;
 
 pub(crate) struct Capture {
-    data: std::sync::Mutex<Vec<u8>>,
+    data: std::sync::Mutex<Buf>,
     truncated: std::sync::atomic::AtomicBool,
+}
+
+/// The first bytes up to the head budget, then a ring of the newest ones: a huge log's final error
+/// or summary is at its end, so a cut keeps both ends and drops the middle.
+#[derive(Default)]
+struct Buf {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    dropped: usize,
 }
 
 fn capture_from_cap<R: Read + Send + 'static>(
@@ -795,29 +863,31 @@ fn capture_from_cap<R: Read + Send + 'static>(
     cap: usize,
 ) -> (std::sync::Arc<Capture>, mpsc::Receiver<()>) {
     let sink = std::sync::Arc::new(Capture {
-        data: std::sync::Mutex::new(Vec::new()),
+        data: std::sync::Mutex::new(Buf::default()),
         truncated: std::sync::atomic::AtomicBool::new(false),
     });
     let shared = sink.clone();
     let (tx, rx) = mpsc::channel();
+    let tail_cap = cap / 16;
+    let head_cap = cap - tail_cap;
     std::thread::spawn(move || {
         let mut chunk = [0u8; 64 * 1024];
         loop {
             match r.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let mut data = match shared.data.lock() {
+                    let mut b = match shared.data.lock() {
                         Ok(d) => d,
                         Err(_) => break,
                     };
-                    if data.len() < cap {
-                        let take = n.min(cap - data.len());
-                        data.extend_from_slice(&chunk[..take]);
-                        if take < n {
-                            shared.truncated.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    } else {
+                    let take = n.min(head_cap.saturating_sub(b.head.len()));
+                    b.head.extend_from_slice(&chunk[..take]);
+                    if take < n {
                         shared.truncated.store(true, std::sync::atomic::Ordering::Relaxed);
+                        b.tail.extend(&chunk[take..n]);
+                        let excess = b.tail.len().saturating_sub(tail_cap);
+                        b.tail.drain(..excess);
+                        b.dropped += excess;
                     }
                 }
                 Err(_) => break,
@@ -829,10 +899,28 @@ fn capture_from_cap<R: Read + Send + 'static>(
 }
 
 fn snapshot(c: &Capture) -> (Vec<u8>, bool) {
-    let data = match c.data.lock() {
-        Ok(mut d) => std::mem::take(&mut *d),
+    let mut data = match c.data.lock() {
+        Ok(mut b) => {
+            let mut head = std::mem::take(&mut b.head);
+            let mut tail: Vec<u8> = b.tail.drain(..).collect();
+            let mut dropped = std::mem::take(&mut b.dropped);
+            if dropped > 0 && !tail.is_empty() {
+                // Resume at a line start, so the first kept line is whole.
+                if let Some(nl) = tail.iter().take(4096).position(|&x| x == b'\n') {
+                    tail.drain(..=nl);
+                    dropped += nl + 1;
+                }
+                if !head.ends_with(b"\n") {
+                    head.push(b'\n');
+                }
+                head.extend_from_slice(format!("[qx] {dropped} bytes omitted (capture limit)\n").as_bytes());
+            }
+            head.extend_from_slice(&tail);
+            head
+        }
         Err(_) => Vec::new(),
     };
+    data.shrink_to_fit();
     (
         data,
         c.truncated.load(std::sync::atomic::Ordering::Relaxed),
@@ -883,6 +971,9 @@ mod job {
     /// background process the command left running on purpose is not disturbed.
     pub struct Job(Handle);
 
+    // A job handle is a kernel handle, valid on any thread; a parked PowerShell's job moves to the caller's.
+    unsafe impl Send for Job {}
+
     impl Job {
         pub fn assign(child: &std::process::Child) -> Option<Job> {
             unsafe {
@@ -929,6 +1020,20 @@ mod job {
                 CloseHandle(self.0);
             }
         }
+    }
+}
+
+/// No job objects off Windows: the kill path falls back to the process itself.
+#[cfg(not(windows))]
+mod job {
+    pub struct Job;
+
+    impl Job {
+        pub fn assign(_: &std::process::Child) -> Option<Job> {
+            None
+        }
+        pub fn release(&self) {}
+        pub fn terminate(&self, _: u32) {}
     }
 }
 
@@ -1006,13 +1111,14 @@ fn reap(child: &mut std::process::Child, within: Duration) -> bool {
 }
 
 /// Wait for the child; past `timeout` (or once cancelled) kill its whole tree. Returns (exit code, timed out).
-fn wait_or_kill(child: &mut std::process::Child, timeout: Option<Duration>) -> std::io::Result<(i32, bool)> {
+fn wait_or_kill(
+    child: &mut std::process::Child,
+    job: Option<job::Job>,
+    timeout: Option<Duration>,
+) -> std::io::Result<(i32, bool)> {
     let start = Instant::now();
-    #[cfg(windows)]
-    let job = job::Job::assign(child);
     loop {
         if let Some(status) = child.try_wait()? {
-            #[cfg(windows)]
             if let Some(j) = &job {
                 j.release();
             }
@@ -1026,7 +1132,6 @@ fn wait_or_kill(child: &mut std::process::Child, timeout: Option<Duration>) -> s
             // TerminateJobObject kills the whole tree in one call (~2 ms). taskkill has to be
             // spawned, which costs 0.3-0.5 s with real-time scanners watching - so it is the
             // fallback for when no job object could be assigned, not the first move.
-            #[cfg(windows)]
             if let Some(j) = &job {
                 j.terminate(124);
                 let _ = child.kill();
@@ -1051,7 +1156,6 @@ fn wait_or_kill(child: &mut std::process::Child, timeout: Option<Duration>) -> s
             prepare(&mut tk);
             let _ = tk.status();
             trace(start, "taskkill done");
-            #[cfg(windows)]
             if let Some(j) = &job {
                 // Catches anything that was created after
                 // taskkill took its snapshot.
@@ -1072,15 +1176,34 @@ fn wait_or_kill(child: &mut std::process::Child, timeout: Option<Duration>) -> s
 
 /// Run with captured stdout/stderr. Necessary for compaction and MCP replies.
 pub fn run_captured(mut cmd: Command, timeout: Option<Duration>) -> std::io::Result<Outcome> {
+    let start = Instant::now();
+    #[cfg(windows)]
+    if let Some((child, job)) = warm::take(&cmd) {
+        let mut o = collect(child, job, timeout, start)?;
+        if !warm::refused(&o) {
+            warm::tidy(&mut o.stderr);
+            return Ok(o);
+        }
+        trace(start, "parked PowerShell refused the script; running it cold");
+    }
     // The CLI forwards piped input (`echo x | qx grep x`); an MCP server has none to give.
     cmd.stdin(if INHERIT_STDIN.load(std::sync::atomic::Ordering::Relaxed) { Stdio::inherit() } else { Stdio::null() });
-    let start = Instant::now();
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let job = job::Job::assign(&child);
+    collect(child, job, timeout.map(|t| t.saturating_sub(start.elapsed())), start)
+}
 
+/// Capture a spawned child's output until it exits, the timeout passes or the call is cancelled.
+fn collect(
+    mut child: std::process::Child,
+    job: Option<job::Job>,
+    timeout: Option<Duration>,
+    start: Instant,
+) -> std::io::Result<Outcome> {
     let (out_sink, out_done) = capture_from_cap(child.stdout.take().expect("stdout piped"), CAPTURE_CAP);
     let (err_sink, err_done) = capture_from_cap(child.stderr.take().expect("stderr piped"), CAPTURE_CAP);
 
-    let (code, timed_out) = wait_or_kill(&mut child, timeout)?;
+    let (code, timed_out) = wait_or_kill(&mut child, job, timeout)?;
     trace(start, "child reaped");
 
     // Grandchildren can hold the pipe open; don't block forever, but keep any
@@ -1109,6 +1232,133 @@ pub fn run_captured(mut cmd: Command, timeout: Option<Duration>) -> std::io::Res
         cut: so_cut || se_cut,
     })
 }
+
+/// One powershell.exe already past its startup (0.3 s idle, seconds on a busy machine), parked
+/// on stdin until a call hands it a script. Only a long-lived process (the MCP server) parks
+/// one. Each runs one script and exits, so no `$env:`, location or variable outlives its call.
+#[cfg(windows)]
+mod warm {
+    use super::{job, powershell, Outcome, PS_FLAGS};
+    use std::ffi::OsString;
+    use std::io::Write;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static FILLING: AtomicBool = AtomicBool::new(false);
+    static PARKED: Mutex<Option<Parked>> = Mutex::new(None);
+
+    struct Parked {
+        child: Child,
+        job: Option<job::Job>,
+        /// The environment it started with: only a call that would start the same one may use it.
+        env: Vec<(OsString, Option<OsString>)>,
+    }
+
+    /// Reads `<cwd>\n<script>\n#qx-end` as UTF-8 from stdin, then runs the script the way
+    /// `-Command` would. A missing end marker (qx died mid-write), a bad cwd or a parse error
+    /// answers `REFUSED`, and qx runs the script cold, so its error reads exactly as before.
+    /// While parked it formats one item: loading the formatting data is most of a first
+    /// call's output cost (warm `echo` 187 -> 66 ms, `Get-ChildItem` 263 -> 101 ms).
+    const BOOT: &str = "$null=Get-Item -LiteralPath $PSHOME -ErrorAction Ignore|Out-String;$qxr=New-Object IO.StreamReader([Console]::OpenStandardInput(),(New-Object Text.UTF8Encoding $false));$qxs=$qxr.ReadToEnd();$qxr.Dispose()\n\
+        if(!$qxs.EndsWith(\"`n#qx-end\")){[Console]::Error.Write('#qx-refused');exit 125}\n\
+        $qxd,$qxs=$qxs.Substring(0,$qxs.Length-8) -split \"`n\",2\n\
+        try{if($qxd){Set-Location -LiteralPath $qxd -ErrorAction Stop;[Environment]::CurrentDirectory=$qxd};$qxb=[scriptblock]::Create($qxs)}catch{[Console]::Error.Write('#qx-refused');exit 125}\n\
+        . $qxb";
+    const REFUSED: &str = "#qx-refused";
+    /// An error raised at the script's top level points at the bootstrap's last line; a cold
+    /// `-Command` prints no position there.
+    const BOOT_POSITION: &str = "At line:5 char:1\r\n+ . $qxb\r\n+ ~~~~~~\r\n";
+
+    /// `QX_PS_WARM=off` keeps every PowerShell call cold.
+    pub fn enable() {
+        if std::env::var("QX_PS_WARM").ok().as_deref() != Some("off") {
+            ENABLED.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn env_of(cmd: &Command) -> Vec<(OsString, Option<OsString>)> {
+        cmd.get_envs().map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string()))).collect()
+    }
+
+    /// The parked PowerShell, already running `cmd`'s script in `cmd`'s cwd, when `cmd` is a
+    /// plain qx PowerShell call; `None` means start it cold. Every PowerShell call refills the slot.
+    pub fn take(cmd: &Command) -> Option<(Child, Option<job::Job>)> {
+        if !ENABLED.load(Ordering::Relaxed) || super::INHERIT_STDIN.load(Ordering::Relaxed) {
+            return None;
+        }
+        let args: Vec<_> = cmd.get_args().collect();
+        if cmd.get_program() != "powershell.exe" || args.len() != 5 || args[..4] != PS_FLAGS {
+            return None;
+        }
+        let script = args[4].to_str()?;
+        let dir = match cmd.get_current_dir() {
+            None => "",
+            // A cwd that is not a directory fails to spawn cold; keep that error.
+            Some(d) if d.is_dir() => d.to_str().filter(|d| !d.contains('\n'))?,
+            Some(_) => return None,
+        };
+        let env = env_of(cmd);
+        let (parked, empty) = {
+            let mut slot = PARKED.lock().ok()?;
+            if slot.as_mut().is_some_and(|p| !matches!(p.child.try_wait(), Ok(None))) {
+                *slot = None; // died while parked
+            }
+            // A `NAME=v` prefix changes the environment: that call starts cold, the parked one waits.
+            let parked = slot.take_if(|p| p.env == env);
+            (parked, slot.is_none())
+        };
+        if empty {
+            fill();
+        }
+        let mut parked = parked?;
+        let payload = format!("{dir}\n{script}\n#qx-end");
+        let mut stdin = parked.child.stdin.take()?;
+        // On its own thread: the wait that enforces the timeout must not sit behind a full pipe.
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(payload.as_bytes());
+        });
+        Some((parked.child, parked.job))
+    }
+
+    /// Park a fresh PowerShell in the background unless one is on its way.
+    fn fill() {
+        if FILLING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        std::thread::spawn(|| {
+            let mut c = powershell(BOOT.to_string());
+            let env = env_of(&c);
+            if let Ok(child) = c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+                let job = job::Job::assign(&child);
+                if let Ok(mut slot) = PARKED.lock() {
+                    *slot = Some(Parked { child, job, env });
+                }
+            }
+            FILLING.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// The bootstrap turned the script down before running any of it.
+    pub fn refused(o: &Outcome) -> bool {
+        o.code == 125 && o.stdout.is_empty() && o.stderr == REFUSED
+    }
+
+    pub fn tidy(stderr: &mut String) {
+        if stderr.contains(BOOT_POSITION) {
+            *stderr = stderr.replace(BOOT_POSITION, "");
+        }
+    }
+
+    #[cfg(test)]
+    pub fn parked_pid() -> Option<u32> {
+        PARKED.lock().ok()?.as_ref().map(|p| p.child.id())
+    }
+}
+
+#[cfg(windows)]
+pub use warm::enable as keep_powershell_warm;
 
 /// Run one `command` through `shell`, with env prefixes, a cwd and one retry for a startup
 /// flake that is not the command's fault.
@@ -1173,7 +1423,8 @@ pub fn run_stream(cmd: &mut Command, timeout: Option<Duration>) -> std::io::Resu
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
-    Ok(wait_or_kill(&mut child, timeout)?.0)
+    let job = job::Job::assign(&child);
+    Ok(wait_or_kill(&mut child, job, timeout)?.0)
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> String {
@@ -1634,6 +1885,25 @@ mod tests {
     }
 
     #[test]
+    fn msys_tools_get_their_arguments_back_unchanged() {
+        assert_eq!(msys_quote("abc"), None);
+        assert_eq!(msys_quote(r"\d+"), None);
+        assert_eq!(msys_quote(r"C:\a b"), None);
+        assert_eq!(msys_quote(r#""n"\|x"#).as_deref(), Some(r#""\"n\"\\|x""#));
+        let printf = Path::new(r"C:\Program Files\Git\usr\bin\printf.exe");
+        if !printf.is_file() {
+            return; // no Git for Windows here
+        }
+        let args = ["[%s]\\n", "a{2}", "don't", "f*.txt", "@x", r"a\\b c", r#""n"\|x"#, "~y", "(z)"];
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let out = build_command(&printf.to_string_lossy(), &args).unwrap().output().unwrap();
+        let want: String = args[1..].iter().map(|a| format!("[{a}]\n")).collect();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+        let out = build_shell(r"printf '%s\n' a\\b", "bash").unwrap().output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "a\\b\n");
+    }
+
+    #[test]
     fn write_atomic_replaces_the_file_whole() {
         let d = std::env::temp_dir().join(format!("qx-atomic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -1650,7 +1920,25 @@ mod tests {
         let (sink, done) = capture_from_cap(std::io::Cursor::new(vec![b'x'; 100]), 10);
         done.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(sink.truncated.load(std::sync::atomic::Ordering::Relaxed));
-        assert_eq!(sink.data.lock().unwrap().len(), 10);
+        assert_eq!(sink.data.lock().unwrap().head.len(), 10);
+    }
+
+    #[test]
+    fn a_cut_stream_keeps_its_end() {
+        let mut log: Vec<u8> = (0..20_000).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
+        log.extend_from_slice(b"error: the final failure\n");
+        let (sink, done) = capture_from_cap(std::io::Cursor::new(log), 16 * 1024);
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (data, cut) = snapshot(&sink);
+        let text = String::from_utf8(data).unwrap();
+        assert!(cut);
+        assert!(text.starts_with("line 0\n"), "{text}");
+        assert!(text.ends_with("error: the final failure\n"), "{text}");
+        assert!(text.contains(" bytes omitted (capture limit)\n"), "{text}");
+        assert!(text.len() <= 16 * 1024 + 64);
+        // The kept tail starts on a whole line.
+        let after = text.split("(capture limit)\n").nth(1).unwrap();
+        assert!(after.starts_with("line "), "{after}");
     }
 
     #[test]
@@ -1660,6 +1948,61 @@ mod tests {
             assert_eq!(o.code, want, "{cmd}");
             assert!(!o.stderr.contains("CLIXML"), "{cmd}: errors must stay plain text: {}", o.stderr);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_parked_powershell_answers_like_a_cold_one() {
+        let dir = std::env::temp_dir().join(format!("qx-warm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Each script first writes `pid=<its PowerShell>;` to stderr, the same way in both runs.
+        let raw = |script: &str| {
+            let mut c = build_shell(script, "powershell").unwrap();
+            apply_cwd(&mut c, &Some(dir.clone()));
+            let o = run_captured(c, Some(Duration::from_secs(120))).unwrap();
+            (o.code, o.stdout, o.stderr)
+        };
+        let run = |script: &str| {
+            let (code, out, err) = raw(&format!("[Console]::Error.Write(\"pid=$PID;\"); {script}"));
+            let (pid, rest) = err.split_once(';').unwrap();
+            (pid[4..].parse::<u32>().unwrap(), (code, out, rest.to_string()))
+        };
+        let wait_parked = || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while warm::parked_pid().is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            warm::parked_pid()
+        };
+        // Another test may take the parked one first; it is refilled, so wait and try again.
+        let parked = |script: &str| {
+            for _ in 0..20 {
+                let pid = wait_parked();
+                let (ran_on, out) = run(script);
+                if pid == Some(ran_on) {
+                    return out;
+                }
+            }
+            panic!("never ran on the parked PowerShell");
+        };
+        let cases = [
+            "echo a; Write-Error 'e1'; echo b",
+            "Write-Output 'caf\u{e9} \u{4e2d}'; (Get-Location).Path; [Environment]::CurrentDirectory",
+            "cmd /c exit 7",
+            "throw 'boom'",
+            "$x = 1\nif ($x) {\n  'multi'\n}",
+        ];
+        let cold: Vec<_> = cases.iter().map(|c| run(c).1).collect();
+        // A parse error is refused unrun and answered by a cold start, word for word.
+        let cold_parse = raw("echo (");
+        assert!(cold_parse.2.contains("Missing closing ')'"), "{}", cold_parse.2);
+        warm::enable();
+        for (c, want) in cases.iter().zip(&cold) {
+            assert_eq!(&parked(c), want, "{c}");
+        }
+        wait_parked();
+        assert_eq!(raw("echo ("), cold_parse);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
