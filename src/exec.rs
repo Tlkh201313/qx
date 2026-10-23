@@ -669,7 +669,9 @@ fn msys_quote(a: &str) -> Option<String> {
     const RISKY: [char; 13] = [' ', '\t', '\n', '\r', '"', '\'', '*', '?', '[', '{', '}', '(', ')'];
     // shortcut: a drive path (`C:\a b`) keeps `Command`'s quoting, whose backslashes MSYS reads
     // literally, so one holding `"` or ending in `\` still arrives mangled; quote it here if seen.
-    let drive = a.len() > 1 && a.as_bytes()[0].is_ascii_alphabetic() && a.as_bytes()[1] == b':';
+    // `C:`, `C:\x`, `C:/x`; not a sed script such as `s:a{2}:b:`.
+    let b = a.as_bytes();
+    let drive = b.len() > 1 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b.get(2), None | Some(b'\\' | b'/'));
     if drive || !(a.starts_with(['~', '@']) || a.contains(RISKY)) {
         return None;
     }
@@ -722,9 +724,10 @@ pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
         "powershell" => {
             // The prelude keeps piped output UTF-8 and drops progress-bar noise.
             // Own line, so parse errors point at the command, not the prelude.
-            // -Command folds every native exit code to 1; hand the real one back.
+            // -Command folds a failing native exit code to 1; hand the real one back. Only when
+            // the last statement failed: `git diff --quiet; echo done` succeeds, as cold.
             Ok(powershell(format!(
-                "$ProgressPreference='SilentlyContinue';try{{[Console]::OutputEncoding=[Text.Encoding]::UTF8}}catch{{}}\n{command}\n$qxok=$?;if($LASTEXITCODE){{exit $LASTEXITCODE}};if(!$qxok){{exit 1}}"
+                "$ProgressPreference='SilentlyContinue';try{{[Console]::OutputEncoding=[Text.Encoding]::UTF8}}catch{{}}\n{command}\n$qxok=$?;if(!$qxok){{if($LASTEXITCODE){{exit $LASTEXITCODE}};exit 1}}"
             )))
         }
         "none" => Err("shell=none needs program+args".to_string()),
@@ -966,6 +969,19 @@ fn capture_from_cap<R: Read + Send + 'static>(
     (sink, rx)
 }
 
+/// How many bytes at the end of `b` begin a UTF-8 character that does not finish there.
+fn unfinished_char(b: &[u8]) -> usize {
+    let cont = b.iter().rev().take(3).take_while(|&&x| x & 0xC0 == 0x80).count();
+    let Some(&lead) = b.len().checked_sub(cont + 1).map(|i| &b[i]) else { return 0 };
+    let need = match lead {
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    };
+    if cont + 1 < need { cont + 1 } else { 0 }
+}
+
 fn snapshot(c: &Capture) -> (Vec<u8>, bool) {
     let mut data = match c.data.lock() {
         Ok(mut b) => {
@@ -979,6 +995,13 @@ fn snapshot(c: &Capture) -> (Vec<u8>, bool) {
                     tail.drain(..=nl);
                     dropped += nl + 1;
                 }
+                // Else cut on character boundaries: one split character makes `decode_output`
+                // read the whole line in the console page, valid UTF-8 included.
+                let lead = tail.iter().take(3).take_while(|&&x| x & 0xC0 == 0x80).count();
+                tail.drain(..lead);
+                let open = unfinished_char(&head);
+                head.truncate(head.len() - open);
+                dropped += lead + open;
                 if !head.ends_with(b"\n") {
                     head.push(b'\n');
                 }
@@ -996,7 +1019,7 @@ fn snapshot(c: &Capture) -> (Vec<u8>, bool) {
     )
 }
 
-/// A child's output. UTF-8 (and UTF-16 with a BOM) as `decode_owned`; a line that is not valid UTF-8
+/// A child's output. UTF-8 (and UTF-16 with a BOM) as `decode`; a line that is not valid UTF-8
 /// came from a tool writing in the console's code page (`dir`, `tree`, localized errors), so it is
 /// decoded in that page instead of turning into U+FFFD. Valid UTF-8 lines are never re-read.
 pub(crate) fn decode_output(bytes: Vec<u8>) -> String {
@@ -1454,6 +1477,10 @@ mod warm {
     static ENABLED: AtomicBool = AtomicBool::new(false);
     static FILLING: AtomicBool = AtomicBool::new(false);
     static PARKED: Mutex<Option<Parked>> = Mutex::new(None);
+    /// Tests share one process: only the thread that turned warm mode on takes the parked
+    /// PowerShell, or a test running alongside takes it from the test that checks it.
+    #[cfg(test)]
+    static OWNER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
 
     struct Parked {
         child: Child,
@@ -1482,6 +1509,10 @@ mod warm {
         if std::env::var("QX_PS_WARM").ok().as_deref() != Some("off") {
             ENABLED.store(true, Ordering::SeqCst);
         }
+        #[cfg(test)]
+        {
+            *OWNER.lock().unwrap() = Some(std::thread::current().id());
+        }
     }
 
     fn env_of(cmd: &Command) -> Vec<(OsString, Option<OsString>)> {
@@ -1492,6 +1523,10 @@ mod warm {
     /// plain qx PowerShell call; `None` means start it cold. Every PowerShell call refills the slot.
     pub fn take(cmd: &Command) -> Option<(Child, Option<job::Job>)> {
         if !ENABLED.load(Ordering::Relaxed) || super::INHERIT_STDIN.load(Ordering::Relaxed) {
+            return None;
+        }
+        #[cfg(test)]
+        if *OWNER.lock().ok()? != Some(std::thread::current().id()) {
             return None;
         }
         let args: Vec<_> = cmd.get_args().collect();
@@ -1508,8 +1543,13 @@ mod warm {
         let env = env_of(cmd);
         let (parked, empty) = {
             let mut slot = PARKED.lock().ok()?;
-            if slot.as_mut().is_some_and(|p| !matches!(p.child.try_wait(), Ok(None))) {
-                *slot = None; // died while parked
+            // Died while parked, or parked with an environment a plain call no longer gets (the
+            // Python stub could not be written then): drop it, or every call after starts cold.
+            let stale = |p: &mut Parked| {
+                !matches!(p.child.try_wait(), Ok(None)) || (p.env != env && p.env != env_of(&powershell(String::new())))
+            };
+            if slot.as_mut().is_some_and(stale) {
+                *slot = None;
             }
             // A `NAME=v` prefix changes the environment: that call starts cold, the parked one waits.
             let parked = slot.take_if(|p| p.env == env);
@@ -1608,8 +1648,18 @@ pub fn run_chain(cmds: Vec<Command>, timeout: Option<Duration>) -> std::io::Resu
         timed_out: false,
         cut: false,
     };
-    for cmd in cmds {
-        let o = run_captured(cmd, timeout.map(|t| t.saturating_sub(start.elapsed())))?;
+    for (i, cmd) in cmds.into_iter().enumerate() {
+        let o = match run_captured(cmd, timeout.map(|t| t.saturating_sub(start.elapsed()))) {
+            Ok(o) => o,
+            // Earlier steps already ran: report this one as failed, so no caller falls back to
+            // running the whole chain again.
+            Err(e) if i > 0 => {
+                all.stderr.push_str(&format!("[qx] failed to start: {e}\n"));
+                all.code = 1;
+                break;
+            }
+            Err(e) => return Err(e),
+        };
         all.stdout.push_str(&o.stdout);
         all.stderr.push_str(&o.stderr);
         all.code = o.code;
@@ -1652,28 +1702,15 @@ pub(crate) fn decode(bytes: &[u8]) -> String {
     if s.contains('\0') { s.replace('\0', "") } else { s.into_owned() }
 }
 
-/// `decode` for a buffer the caller owns: valid UTF-8 (the usual case) is validated in place instead of
-/// being copied. Same result as `decode`. (Process output goes through `decode_output`.)
-#[cfg(test)]
-pub(crate) fn decode_owned(bytes: Vec<u8>) -> String {
-    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
-        return decode(&bytes);
-    }
-    let mut s = String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
-    if s.contains('\0') {
-        s.retain(|c| c != '\0');
-    }
-    s
-}
-
 /// Give a child the `NAME=value` prefix of its command line. qx's own environment is never touched.
 pub fn apply_envs(cmd: &mut Command, envs: &[(String, String)]) {
     cmd.envs(envs.iter().map(|(k, v)| (k, v)));
 }
 
-/// `npm::direct` reads npm_* settings from the process env, so a prefix that sets one goes to real npm.
-pub fn sets_npm_config(envs: &[(String, String)]) -> bool {
-    envs.iter().any(|(k, _)| k.to_ascii_lowercase().starts_with("npm_"))
+/// An env prefix `npm::direct` cannot honour, so the command goes to real npm: it reads npm_*
+/// settings from the process env, and a `PATH=` would replace the PATH it builds (local bins first).
+pub fn needs_real_npm(envs: &[(String, String)]) -> bool {
+    envs.iter().any(|(k, _)| k.to_ascii_lowercase().starts_with("npm_") || k.eq_ignore_ascii_case("PATH"))
 }
 
 pub fn apply_cwd(cmd: &mut Command, cwd: &Option<PathBuf>) {
@@ -1735,10 +1772,15 @@ pub fn split_simple(s: &str) -> Option<(String, Vec<String>)> {
     let mut tokens: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut quoted = false;
+    // `""` is an empty argument (`git config user.name ""`), not nothing.
+    let mut had_quote = false;
     let mut chars = s.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
-            '"' => quoted = !quoted,
+            '"' => {
+                quoted = !quoted;
+                had_quote = true;
+            }
             // `\ `, `\'` and `\"` mean shell quoting rules; a lone `\` (C:\Users\x) is literal.
             '\\' => match chars.peek() {
                 Some(' ') | Some('\'') | Some('"') | Some('\\') => return None,
@@ -1746,9 +1788,10 @@ pub fn split_simple(s: &str) -> Option<(String, Vec<String>)> {
             },
             c if SHELL_ONLY.contains(&c) => return None,
             c if c.is_whitespace() && !quoted => {
-                if !cur.is_empty() {
+                if !cur.is_empty() || had_quote {
                     tokens.push(std::mem::take(&mut cur));
                 }
+                had_quote = false;
             }
             c => cur.push(c),
         }
@@ -1756,7 +1799,7 @@ pub fn split_simple(s: &str) -> Option<(String, Vec<String>)> {
     if quoted {
         return None;
     }
-    if !cur.is_empty() {
+    if !cur.is_empty() || had_quote {
         tokens.push(cur);
     }
     let mut tokens = tokens.into_iter();
@@ -1779,18 +1822,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_owned_matches_decode() {
-        let utf16: &[u8] = b"\xff\xfeh\0i\0";
-        for b in [&b"plain\n"[..], b"caf\xe9 x\0y", b"a\0b\xc3\xa9", utf16, b"\xfe\xff\0h", b""] {
-            assert_eq!(decode_owned(b.to_vec()), decode(b), "{b:?}");
-        }
-    }
-
-    #[test]
     fn splits_plain_commands() {
         let (p, a) = split_simple("git status --short").unwrap();
         assert_eq!(p, "git");
         assert_eq!(a, ["status", "--short"]);
+        // `""` is an argument: `git config user.name ""` clears the value, it does not read it.
+        assert_eq!(split_simple(r#"git config user.name """#).unwrap().1, ["config", "user.name", ""]);
+        assert_eq!(split_simple(r#"grep "" f"#).unwrap().1, ["", "f"]);
+        assert_eq!(split_simple(r#"echo a"" b"#).unwrap().1, ["a", "b"]);
     }
 
     #[test]
@@ -2081,8 +2120,9 @@ mod tests {
         apply_envs(&mut c, &envs);
         assert!(c.get_envs().any(|(k, v)| k == "QX_TEST_PEEL" && v.is_some_and(|v| v == "1")));
         assert!(std::env::var_os("QX_TEST_PEEL").is_none());
-        assert!(sets_npm_config(&[("NPM_CONFIG_PREFIX".into(), "x".into())]));
-        assert!(!sets_npm_config(&envs));
+        assert!(needs_real_npm(&[("NPM_CONFIG_PREFIX".into(), "x".into())]));
+        assert!(needs_real_npm(&[("Path".into(), r"C:\tools".into())]));
+        assert!(!needs_real_npm(&envs));
     }
 
     #[test]
@@ -2096,6 +2136,8 @@ mod tests {
     fn msys_tools_get_their_arguments_back_unchanged() {
         assert_eq!(msys_quote("abc"), None);
         assert_eq!(msys_quote(r"\d+"), None);
+        // A sed script that starts like a drive letter is still globbed by MSYS: quote it.
+        assert_eq!(msys_quote("s:a{2}:b:").as_deref(), Some(r#""s:a{2}:b:""#));
         assert_eq!(msys_quote(r"C:\a b"), None);
         assert_eq!(msys_quote(r#""n"\|x"#).as_deref(), Some(r#""\"n\"\\|x""#));
         let printf = Path::new(r"C:\Program Files\Git\usr\bin\printf.exe");
@@ -2150,8 +2192,32 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_single_line_stays_valid_utf8() {
+        // One 3-byte character repeated, no newline: both cuts land mid-character unless snapped.
+        for cap in [16 * 1024, 16 * 1024 + 1, 16 * 1024 + 2] {
+            let log = "\u{4e2d}".repeat(20_000).into_bytes();
+            let (sink, done) = capture_from_cap(std::io::Cursor::new(log), cap);
+            done.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (data, cut) = snapshot(&sink);
+            assert!(cut);
+            let text = String::from_utf8(data).expect("the cut must fall on character boundaries");
+            assert!(text.contains(" bytes omitted (capture limit)\n"), "{text}");
+        }
+        assert_eq!(unfinished_char(b"ab"), 0);
+        assert_eq!(unfinished_char("a\u{4e2d}".as_bytes()), 0);
+        assert_eq!(unfinished_char(&"a\u{4e2d}".as_bytes()[..3]), 2);
+        assert_eq!(unfinished_char(&"\u{1f600}".as_bytes()[..3]), 3);
+    }
+
+    #[test]
     fn powershell_hands_back_the_real_exit_code() {
-        for (cmd, want) in [("cmd /c exit 7", 7), ("Get-Item C:\\qx-no-such-zz -ErrorAction Stop", 1), ("Write-Output ok", 0)] {
+        for (cmd, want) in [
+            ("cmd /c exit 7", 7),
+            ("Get-Item C:\\qx-no-such-zz -ErrorAction Stop", 1),
+            ("Write-Output ok", 0),
+            // A native failure earlier in the script is not the script's status.
+            ("cmd /c exit 7; Write-Output ok", 0),
+        ] {
             let o = run_captured(build_shell(cmd, "powershell").unwrap(), Some(Duration::from_secs(60))).unwrap();
             assert_eq!(o.code, want, "{cmd}");
             assert!(!o.stderr.contains("CLIXML"), "{cmd}: errors must stay plain text: {}", o.stderr);
@@ -2182,7 +2248,8 @@ mod tests {
             }
             warm::parked_pid()
         };
-        // Another test may take the parked one first; it is refilled, so wait and try again.
+        // A parked one that went stale (its environment no longer matches) is dropped and
+        // refilled, so wait and try again.
         let parked = |script: &str| {
             for _ in 0..20 {
                 let pid = wait_parked();
@@ -2205,6 +2272,7 @@ mod tests {
         let cold_parse = raw("echo (");
         assert!(cold_parse.2.contains("Missing closing ')'"), "{}", cold_parse.2);
         warm::enable();
+        raw("exit 0"); // runs cold and parks the first one
         for (c, want) in cases.iter().zip(&cold) {
             assert_eq!(&parked(c), want, "{c}");
         }

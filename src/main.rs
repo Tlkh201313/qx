@@ -301,7 +301,7 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
 /// `npm run/test/start` and local-bin `npx` without npm's ~100 ms CLI startup.
 /// Strictly falls back (None) to the real tool.
 fn direct_exec(program: &str, args: &[String], envs: &[(String, String)], o: &RunOpts, label: &str) -> Option<i32> {
-    if exec::sets_npm_config(envs) {
+    if exec::needs_real_npm(envs) {
         return None;
     }
     let mut cmds = npm::direct(program, args, o.cwd.as_deref())?;

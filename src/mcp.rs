@@ -788,7 +788,7 @@ fn run_direct(
     plain: &'static str,
 ) -> Result<(exec::Outcome, &'static str), String> {
     let started = |e| format!("failed to start: {e}");
-    if !exec::sets_npm_config(envs) {
+    if !exec::needs_real_npm(envs) {
         if let Some(mut cmds) = npm::direct(program, args, cwd) {
             for c in &mut cmds {
                 exec::apply_envs(c, envs);
@@ -812,7 +812,8 @@ fn run_direct(
     };
     if let Some(b) = builtin::try_exec(program, args, cwd, envs) {
         let o: exec::Outcome = b.into();
-        return Ok((if exec::should_stop() { stopped(o) } else { o }, "builtin"));
+        // A built-in that finished its work right at the deadline did the work: report it done.
+        return Ok((if exec::should_stop() && o.code != 0 { stopped(o) } else { o }, "builtin"));
     }
     // A built-in that declined because it was stopped must not start the real tool instead.
     if exec::should_stop() {

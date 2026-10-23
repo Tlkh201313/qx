@@ -84,18 +84,10 @@ const CMD_INTERNALS: &[&str] = &[
     "set", "setlocal", "shift", "start", "time", "title", "type", "ver", "verify", "vol",
 ];
 
-/// The `node_modules\.bin` dirs from `root` upward, nearest first.
+/// The `node_modules\.bin` dirs from `root` upward, nearest first. Like npm, whether or not they
+/// exist yet: a `pretest` that runs `npm ci` creates the one `test` needs.
 fn local_bins(root: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    let mut cur = Some(root);
-    while let Some(p) = cur {
-        let bin = p.join("node_modules").join(".bin");
-        if bin.is_dir() {
-            dirs.push(bin);
-        }
-        cur = p.parent();
-    }
-    dirs
+    root.ancestors().map(|p| p.join("node_modules").join(".bin")).collect()
 }
 
 /// A plain script (no shell syntax, no cmd internal) whose program is a real executable:
