@@ -317,6 +317,15 @@ pub fn compact(text: &str, max_lines: usize, head: usize, tail: usize) -> (Strin
         return (out, similar || capped || dropped);
     }
 
+    // `--max-lines 20` with the default 80/60 window: the window shrinks to the cap, in proportion,
+    // instead of printing everything under a "0 lines omitted" marker.
+    let window = head.saturating_add(tail);
+    let (head, tail) = if window > max_lines {
+        let h = (max_lines as u128 * head as u128 / window as u128) as usize;
+        (h, max_lines - h)
+    } else {
+        (head, tail)
+    };
     let h = head.min(lines.len());
     let remaining = lines.len() - h;
     let t = tail.min(remaining);
@@ -359,9 +368,10 @@ pub fn compact(text: &str, max_lines: usize, head: usize, tail: usize) -> (Strin
             ));
         }
     }
+    // Rescued lines are printed above, so they are not among the omitted.
     out.push_str(&format!(
         "[qx] ... {} lines omitted ({} total) ...\n",
-        omitted,
+        omitted - rescued,
         lines.len()
     ));
     for l in &lines[lines.len() - t..] {
@@ -509,6 +519,16 @@ mod tests {
         assert!(s.contains("line-dv"));
         assert!(s.contains("95 lines omitted"));
         assert!(!s.contains("line-by"));
+    }
+
+    #[test]
+    fn a_cap_below_the_window_shrinks_the_window() {
+        // `--max-lines 20` with the default 80/60 split: 20 lines kept, not all 50.
+        let text: String = (0..50).map(|i| format!("line-{}\n", word(i))).collect();
+        let (s, cut) = compact(&text, 20, 80, 60);
+        assert!(cut);
+        assert!(s.contains("line-aa\n") && s.contains("line-bx\n"), "{s}");
+        assert!(s.contains("30 lines omitted (50 total)"), "{s}");
     }
 
     #[test]

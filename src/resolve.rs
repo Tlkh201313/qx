@@ -134,20 +134,23 @@ pub fn resolve_in(program: &str, first: &[PathBuf], cwd: Option<&Path>) -> Targe
 
 /// `<Git>\usr\bin\<name>.exe`, for a name in `COREUTILS` only.
 pub fn git_coreutil(name: &str) -> Option<PathBuf> {
-    let lower = name.to_ascii_lowercase();
-    if !COREUTILS.contains(&lower.as_str()) {
+    if !COREUTILS.contains(&name.to_ascii_lowercase().as_str()) {
         return None;
     }
-    let root = git_root_dir()?;
-    let exe = root.join("usr").join("bin").join(format!("{lower}.exe"));
-    exe.is_file().then_some(exe)
+    msys_exe(name)
 }
 
 /// Whether Git's MSYS `usr\bin` holds this program.
 pub fn msys_tool(name: &str) -> bool {
+    msys_exe(name).is_some()
+}
+
+/// `usr\bin\<name>.exe` under the Git for Windows root, when it is there.
+fn msys_exe(name: &str) -> Option<PathBuf> {
     let lower = name.to_ascii_lowercase();
     let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
-    git_root_dir().is_some_and(|r| r.join("usr").join("bin").join(format!("{stem}.exe")).is_file())
+    let exe = git_root_dir()?.join("usr").join("bin").join(format!("{stem}.exe"));
+    exe.is_file().then_some(exe)
 }
 
 /// The Git for Windows root: the nearest ancestor (up to three levels) of the `git`

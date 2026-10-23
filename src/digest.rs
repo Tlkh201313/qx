@@ -42,44 +42,51 @@ pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Dige
     // Progress bars redrawn with `\r` (tqdm, curl, downloaders) reach the digests as their last frame.
     let ((so, sd), (se, ed)) = (compact::settle_frames(stdout), compact::settle_frames(stderr));
     let (stdout, stderr) = (&*so, &*se);
-    let (e, ec) = keep_stderr(stderr);
+    // `None` stderr: the digest leaves it alone, so it is shown compacted. Tests and builds merge it.
     let (profile, out, err, omitted, clipped) = if is_git_status(&l) {
         let (o, n) = git_status(stdout)?;
-        ("git-status", o, e, n, ec)
+        ("git-status", o, None, n, false)
     } else if is_git_log(&l) {
         let (o, n) = git_log(stdout)?;
-        ("git-log", o, e, n, ec)
+        ("git-log", o, None, n, false)
     } else if is_diff(&l) {
         let (o, n, c) = git_diff(stdout)?;
-        ("git-diff", o, e, n, c || ec)
+        ("git-diff", o, None, n, c)
     } else if is_pathlist(&l) {
         // Searches and listings first: `rg -n jest` is a search, whatever word it searches for.
         let (o, n) = paths(stdout)?;
-        ("paths", o, e, n, ec)
+        ("paths", o, None, n, false)
     } else if is_search(&l) {
         let (o, n, c) = grep(stdout)?;
-        ("search", o, e, n, c || ec)
+        ("search", o, None, n, c)
     } else if is_test(&l) {
         if verbatim(&l, code) {
             return None;
         }
         let merged = merge(stdout, stderr);
         let (o, n, c) = diagnostic(&merged, code, false)?;
-        ("test", o, String::new(), n, c)
+        ("test", o, Some(String::new()), n, c)
     } else if is_build(&l) {
         if verbatim(&l, code) {
             return None;
         }
         let merged = merge(stdout, stderr);
         let (o, n, c) = diagnostic(&merged, code, true)?;
-        ("build", o, String::new(), n, c)
+        ("build", o, Some(String::new()), n, c)
     } else if is_runtime(&l) {
         let (o, e, n, c) = runtime_digest(stdout, stderr, code)?;
-        ("traceback", o, e, n, c)
+        ("traceback", o, Some(e), n, c)
     } else if let Some((o, n)) = json_min(&l, stdout) {
-        ("json", o, e, n, ec)
+        ("json", o, None, n, false)
     } else {
         return None;
+    };
+    let (err, clipped) = match err {
+        Some(e) => (e, clipped),
+        None => {
+            let (e, cut) = keep_stderr(stderr);
+            (e, clipped || cut)
+        }
     };
     // A digest is still a reply: a 5000-commit log or a 1 MB JSON line is held to a budget, and
     // anything cut makes it lossy, so the full text is spooled.
@@ -362,7 +369,7 @@ fn is_test(l: &str) -> bool {
     if at_front {
         return true;
     }
-    if !words(l).any(|w| w == "test") {
+    if !words(l).any(|w| w == "test" || w == "tests" || w.starts_with("test:")) {
         return false;
     }
     ["cargo ", "npm ", "pnpm ", "yarn ", "npx ", "go ", "dotnet ", "mvn ", "gradle ", "make ", "python ", "py "]
@@ -479,6 +486,8 @@ fn traceback(text: &str) -> Option<(String, usize, bool)> {
                 || t.starts_with("code:")
                 || t.starts_with('^')
                 || (i + 1 < lines.len() && lines[i + 1].trim().starts_with('^'))
+                // `/proj/app.js:3` above the source line and its caret: where the error is.
+                || (i + 2 < lines.len() && lines[i + 2].trim().starts_with('^') && ends_with_line_number(t))
                 || t.contains("caused by")
         } else {
             false
@@ -579,6 +588,11 @@ fn paths(text: &str) -> Option<(String, usize)> {
     Some((out, lines.len().saturating_sub(shown)))
 }
 
+/// `path:3`
+fn ends_with_line_number(t: &str) -> bool {
+    t.rsplit_once(':').is_some_and(|(p, n)| !p.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn is_search(l: &str) -> bool {
     if l.starts_with("git grep") {
         return true;
@@ -588,9 +602,11 @@ fn is_search(l: &str) -> bool {
     })
 }
 
+/// The entry as listed: a bare path for the common `modified:`, the kind kept for the rest
+/// (`deleted: old.rs`, `renamed: a -> b`), which a path alone would pass off as an edit.
 fn status_path(t: &str) -> Option<String> {
     if let Some(p) = t.strip_prefix("?? ") {
-        return Some(p.trim().to_string());
+        return Some(format!("untracked: {}", p.trim()));
     }
     for k in [
         "both modified:",
@@ -605,7 +621,8 @@ fn status_path(t: &str) -> Option<String> {
         "unmerged:",
     ] {
         if let Some(p) = t.strip_prefix(k) {
-            return Some(p.trim().to_string());
+            let p = p.trim();
+            return Some(if k == "modified:" { p.to_string() } else { format!("{k} {p}") });
         }
     }
     None
@@ -840,6 +857,9 @@ fn fail_line(t: &str, build: bool) -> bool {
     t.starts_with("FAILED")
         || t.starts_with("FAIL ")
         || t.starts_with("FAIL:")
+        || t.starts_with("ERROR:")
+        || t.starts_with("ERROR ")
+        || t.starts_with("Jest: ")
         || t.starts_with("---- ")
         || t.starts_with("● ")
         || t.starts_with('✕')
@@ -1388,6 +1408,13 @@ mod tests {
     }
 
     #[test]
+    fn node_keeps_the_file_and_line_above_the_caret() {
+        let raw = "/proj/app.js:3\nconst x = ;\n          ^\n\nSyntaxError: Unexpected token ';'\n    at internalCompileFunction (node:internal/vm:76:18)\n";
+        let (out, _, _) = traceback(raw).unwrap();
+        assert!(out.starts_with("/proj/app.js:3\nconst x = ;\n"), "{out}");
+    }
+
+    #[test]
     fn json_is_minified() {
         let raw = "{\n  \"a\": 1,\n  \"b\": [1, 2]\n}\n";
         let (out, _) = json_min("curl http://x", raw).unwrap();
@@ -1474,6 +1501,14 @@ mod tests {
     }
 
     #[test]
+    fn git_status_keeps_the_kind_of_change() {
+        let raw = "On branch main\nChanges to be committed:\n\tnew file:   a.rs\n\trenamed:    b.rs -> c.rs\n\nChanges not staged for commit:\n\tmodified:   d.rs\n\tdeleted:    old.rs\n";
+        let (out, _) = git_status(raw).unwrap();
+        assert!(out.contains("staged (2):\n  new file: a.rs\n  renamed: b.rs -> c.rs"), "{out}");
+        assert!(out.contains("modified (2):\n  d.rs\n  deleted: old.rs"), "{out}");
+    }
+
+    #[test]
     fn digest_replies_stay_within_the_output_budget() {
         // 1 MB of pretty JSON minifies to one huge line; 5000 commits condense to 5000 lines.
         let items: Vec<serde_json::Value> = (0..12_000).map(|i| serde_json::json!({"name": format!("pod-{i}"), "ready": true})).collect();
@@ -1537,6 +1572,15 @@ mod tests {
             }
         }
         assert!(is_test("python -m pytest -q") && is_test("npx jest") && is_test("cargo test"));
+        assert!(is_test("npm run test:unit") && is_test("make tests"));
+    }
+
+    #[test]
+    fn unittest_errors_keep_their_heading_and_frames() {
+        let raw = "E\n======================================================================\nERROR: test_x (app.tests.T)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/app/tests.py\", line 5, in test_x\n    1/0\nZeroDivisionError: division by zero\n\n----------------------------------------------------------------------\nRan 1 test in 0.001s\n\nFAILED (errors=1)\n";
+        let (out, _, _) = diagnostic(raw, 1, false).unwrap();
+        assert!(out.contains("ERROR: test_x (app.tests.T)"), "{out}");
+        assert!(out.contains("File \"/app/tests.py\", line 5"), "{out}");
     }
 
     #[test]
