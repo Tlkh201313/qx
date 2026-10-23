@@ -495,7 +495,8 @@ fn uploads_secret(name: &str, args: &[String]) -> bool {
 /// anywhere, so a script block (`ForEach-Object { Start-Process x -Verb RunAs }`) is caught
 /// and a quoted mention (`git commit -m "… -Verb RunAs"`) is not.
 fn elevates(name: &str, args: &[String]) -> bool {
-    if matches!(name, "runas" | "gsudo" | "elevate") {
+    // `sudo` on Windows is sudo.exe (Windows 11), which raises the same UAC prompt.
+    if matches!(name, "runas" | "gsudo" | "elevate" | "sudo") {
         return true;
     }
     if matches!(name, "start-process" | "saps") && args.iter().any(|a| a.to_ascii_lowercase().contains("runas")) {
@@ -2807,6 +2808,13 @@ mod tests {
         assert!(!check_shell_mode(Mode::Safe, &nested, None).allowed());
         // Ordinary depth is fine.
         assert!(!denied("env env ls"));
+    }
+
+    #[test]
+    fn windows_sudo_is_an_elevation_request() {
+        // Windows 11's sudo.exe raises a UAC prompt an agent cannot answer.
+        assert!(denied("sudo winget install x"));
+        assert!(denied("sudo --inline cmd /c echo"));
     }
 
     #[test]

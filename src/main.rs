@@ -365,7 +365,7 @@ fn emit(out: exec::Outcome, o: &RunOpts, label: &str) -> i32 {
     // raw output unless QX_REDACT=1; QX_REDACT=off disables it entirely.
     let setting = std::env::var("QX_REDACT").ok();
     let setting = setting.as_deref();
-    let do_redact = setting != Some("off") && (setting == Some("1") || !o.stream);
+    let do_redact = setting != Some("off") && (matches!(setting, Some("1" | "on")) || !o.stream);
     let mut redactions = 0usize;
     if do_redact {
         let (a, n) = redact_text(so);
@@ -686,11 +686,12 @@ SAFETY GATE
 
 BUILT-INS (no process spawn)
   pwd echo true false sleep clear cls
-  ls dir cat type head tail wc grep
-  mkdir rm del cp copy mv move touch
-  which where basename dirname realpath
+  ls dir cat type head tail wc grep sed
+  mkdir rm del erase cp copy mv move touch
+  which basename dirname realpath
   whoami hostname seq
   grep takes literal patterns, -i -n -l -r -v -q -c -A/-B/-C -F -e PAT; else the real grep.
+  sed answers sed -n 'A,Bp' line ranges; `where` is always the real where.exe.
   head -c N / tail -c N read one byte window when it is text; binary runs the real tool.
   Unknown flags fall back to the real executable.
 

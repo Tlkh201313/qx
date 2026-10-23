@@ -439,15 +439,30 @@ fn read_json_command(file: &Path, path: &[&str]) -> Option<String> {
     serde_json::from_str(&jsonc::to_strict_json(&text[range])).ok()
 }
 
+/// Whether a client is installed for this user: its config file or directory exists (pi: the
+/// `pi` command answers). Explicitly named clients are configured either way.
+fn installed(c: Client, p: &Paths) -> bool {
+    match c {
+        Client::ClaudeCode => p.home.join(".claude.json").is_file() || p.home.join(".claude").is_dir(),
+        Client::OpenCode => p.home.join(".config").join("opencode").is_dir(),
+        Client::Codex => p.codex_home.is_dir(),
+        Client::Dsh => p.dsh_home.is_dir(),
+        Client::Hermes => p.hermes_home.is_dir(),
+        Client::Pi => pi::pi_version(p).is_some(),
+        Client::Generic => false,
+    }
+}
+
 pub fn run(args: &[String]) -> i32 {
     let mut action = Action::Install;
     let mut dry = false;
+    let mut all = false;
     let mut clients: Vec<Client> = Vec::new();
     for arg in args {
         match arg.as_str() {
             "--dry-run" => dry = true,
             "--remove" => action = Action::Remove,
-            "all" => clients.extend(Client::ALL),
+            "all" => all = true,
             other if other.starts_with('-') => {
                 eprintln!("qx setup: unknown flag {other}");
                 return 2;
@@ -461,14 +476,22 @@ pub fn run(args: &[String]) -> i32 {
             },
         }
     }
-    if clients.is_empty() {
-        clients.extend(Client::ALL);
-    }
     let paths = Paths::from_env();
     if paths.home.as_os_str().is_empty() {
         // Every client config lives under the home directory; a relative path would land in the cwd.
         eprintln!("qx setup: neither USERPROFILE nor HOME is set, so the client configs cannot be found");
         return 2;
+    }
+    if all || clients.is_empty() {
+        // `all` means every client this machine has: a config for a tool that is not installed
+        // is clutter, and pi's absence is not a failure.
+        for c in Client::ALL {
+            if installed(c, &paths) {
+                clients.push(c);
+            } else {
+                println!("{}: skipped: not installed", c.key());
+            }
+        }
     }
     let exe = match crate::deploy::canonical() {
         Some(path) => path,
@@ -648,6 +671,18 @@ mod tests {
                 .expect("a removal")
                 .to_string();
             assert!(!removed.contains("qx.exe"), "{removed}");
+        }
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn only_installed_clients_count_as_installed() {
+        let p = paths("installed");
+        std::fs::create_dir_all(&p.codex_home).unwrap();
+        std::fs::write(p.home.join(".claude.json"), "{}").unwrap();
+        assert!(installed(Client::Codex, &p) && installed(Client::ClaudeCode, &p));
+        for c in [Client::OpenCode, Client::Dsh, Client::Hermes] {
+            assert!(!installed(c, &p), "{}", c.key());
         }
         let _ = std::fs::remove_dir_all(&p.home);
     }
