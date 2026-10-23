@@ -11,6 +11,10 @@ routed through `cmd.exe`/PowerShell/Git Bash and the client configs live under
 newer; Git for Windows is recommended (its `usr\bin` tools back declined
 built-ins).
 
+
+https://github.com/user-attachments/assets/801cf4e3-ecb5-4cb4-910e-4b8313615101
+
+
 **Install:**
 
 ```powershell
