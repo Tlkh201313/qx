@@ -196,11 +196,18 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
     // `start "title" prog`: the tokenizer has dropped the quotes, so a title cannot be told from the
     // program. Judge both readings; deny wins.
     if name == "start" {
-        let mut i = 0;
-        while args.get(i).is_some_and(|a| a.starts_with('/') && a.len() <= 8) {
-            i += if args[i].eq_ignore_ascii_case("/d") { 2 } else { 1 };
+        if !spend() {
+            return finalize(m, too_deep());
         }
-        for k in [i, i + 1] {
+        // Switches may come before and after the title: `start "x" /b cmd ..`.
+        let skip = |mut i: usize| {
+            while args.get(i).is_some_and(|a| a.starts_with('/') && a.len() <= 8) {
+                i += if args[i].eq_ignore_ascii_case("/d") { 2 } else { 1 };
+            }
+            i
+        };
+        let i = skip(0);
+        for k in [i, skip(i + 1)] {
             if let Some(p) = args.get(k) {
                 merge(&mut d, check_mode(m, p, &args[k + 1..], cwd));
             }
@@ -1125,51 +1132,69 @@ fn var_name_ok(n: &str) -> bool {
     !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// A command that only assigns a variable: `d=/` (POSIX), `$p = 'x'` or `$p='x'` (PowerShell),
-/// `set T=x` (cmd). Records it (name lowercased) and says so; anything else is left alone.
-fn record_assignment(w: &[String], assigned: &mut Vec<(String, String)>) -> bool {
+/// A command that only assigns variables: `d=/` or `a=/ b=x` (POSIX), `export d=/` (and `local`,
+/// `declare`, `readonly`, `typeset`), `$p = 'x'` or `$p='x'` (PowerShell), `set T=x` (cmd).
+/// Records each (name lowercased) with the variables assigned before it already substituted, so
+/// `a=/; b=$a` gives `b` the value `/`; anything else is left alone.
+fn record_assignment(w: &[String], assigned: &mut Vec<(String, String)>) {
     let mut put = |k: &str, v: &str| {
+        let v = substitute_assigned(v, assigned);
         let k = k.to_ascii_lowercase();
         assigned.retain(|(n, _)| *n != k);
-        assigned.push((k, v.to_string()));
+        assigned.push((k, v));
     };
     match w {
-        [one] if is_assignment(one) => {
-            let (k, v) = one.split_once('=').unwrap_or_default();
-            put(k, v);
-            true
+        [kw, rest @ ..] if matches!(kw.as_str(), "export" | "local" | "declare" | "readonly" | "typeset") => {
+            // Flags (`-x`, `-r`) and bare names carry no value.
+            for kv in rest.iter().filter(|t| is_assignment(t)) {
+                let (k, v) = kv.split_once('=').unwrap_or_default();
+                put(k, v);
+            }
+        }
+        _ if !w.is_empty() && w.iter().all(|t| is_assignment(t)) => {
+            for kv in w {
+                let (k, v) = kv.split_once('=').unwrap_or_default();
+                put(k, v);
+            }
         }
         [set, kv] if set.eq_ignore_ascii_case("set") && is_assignment(kv) => {
             let (k, v) = kv.split_once('=').unwrap_or_default();
             put(k, v);
-            true
         }
-        [var, eq, v] if eq == "=" && var.strip_prefix('$').is_some_and(var_name_ok) => {
-            put(&var[1..], v);
-            true
-        }
-        [one] if one.starts_with('$') => match one[1..].split_once('=') {
-            Some((k, v)) if var_name_ok(k) => {
+        [var, eq, v] if eq == "=" && var.strip_prefix('$').is_some_and(var_name_ok) => put(&var[1..], v),
+        [one] if one.starts_with('$') => {
+            if let Some((k, v)) = one[1..].split_once('=').filter(|(k, _)| var_name_ok(k)) {
                 put(k, v);
-                true
             }
-            _ => false,
-        },
-        _ => false,
+        }
+        _ => {}
     }
 }
 
-/// `$name`, `${name}`, `%name%` and `!name!` replaced by values assigned earlier on the line.
+/// `$name`, `${name}` and cmd's forms of `name` replaced by values assigned earlier on the line.
 fn substitute_assigned(word: &str, assigned: &[(String, String)]) -> String {
     if assigned.is_empty() || !word.contains(['$', '%', '!']) {
         return word.to_string();
     }
     let mut out = word.to_string();
     for (name, value) in assigned {
-        for form in [format!("${{{name}}}"), format!("%{name}%"), format!("!{name}!")] {
-            out = replace_ci(&out, &form, value);
-        }
+        out = replace_ci(&out, &format!("${{{name}}}"), value);
         out = replace_var_ci(&out, name, value);
+        out = replace_cmd_var(&out, name, value);
+    }
+    out
+}
+
+/// cmd's `%name%`, `!name!`, and `%name:~0,3%` / `%name:a=b%`, which take a part of the value
+/// and are judged as the whole of it.
+fn replace_cmd_var(s: &str, name: &str, value: &str) -> String {
+    let mut out = replace_ci(&replace_ci(s, &format!("%{name}%"), value), &format!("!{name}!"), value);
+    let edit = format!("%{name}:");
+    let mut from = 0;
+    while let Some(at) = out.to_ascii_lowercase()[from..].find(&edit).map(|r| from + r) {
+        let Some(len) = out[at + 1..].find('%') else { break };
+        out.replace_range(at..at + len + 2, value);
+        from = at + value.len();
     }
     out
 }
@@ -1190,24 +1215,30 @@ fn replace_ci(s: &str, needle: &str, value: &str) -> String {
 /// .NET deletes that no command word announces, judged like `rm` of their target.
 fn check_dotnet_delete(command: &str, cwd: Option<&Path>, d: &mut Decision) {
     let low = command.to_ascii_lowercase();
-    let mut from = 0;
-    loop {
-        let rel = match (low[from..].find(".delete("), low[from..].find("::delete(")) {
-            (Some(a), Some(b)) => a.min(b),
-            (Some(a), None) | (None, Some(a)) => a,
-            (None, None) => break,
-        };
-        let at = from + rel;
-        from = at + 1;
+    // Each needle is searched again only past its own hit, so many hits stay one linear scan.
+    let next = |needle: &str, from: usize| low[from..].find(needle).map(|r| from + r);
+    let (mut dot, mut colon) = (next(".delete(", 0), next("::delete(", 0));
+    while let Some(at) = dot.into_iter().chain(colon).min() {
+        if dot == Some(at) {
+            dot = next(".delete(", at + 1);
+        }
+        if colon == Some(at) {
+            colon = next("::delete(", at + 1);
+        }
         let before = &low[..at];
+        let first_arg = |open: usize| command[open..].split([',', ')']).next().unwrap_or("").trim().to_string();
         let target = if before.ends_with("directory]") || before.ends_with("file]") {
             // static call: the first argument
-            let open = at + low[at..].find('(').unwrap_or(0) + 1;
-            command[open..].split([',', ')']).next().unwrap_or("").trim().to_string()
+            first_arg(at + low[at..].find('(').unwrap_or(0) + 1)
         } else if before.ends_with(')') {
-            // `(Get-Item x).Delete(...)`: the last plain word of the group before it
             let Some(open) = before.rfind('(') else { continue };
-            tokenize(&command[open + 1..at - 1]).into_iter().skip(1).rfind(|t| !t.starts_with('-')).unwrap_or_default()
+            if before[..open].ends_with("::new") {
+                // `[IO.DirectoryInfo]::new(x).Delete(..)`: the constructor's first argument
+                first_arg(open + 1)
+            } else {
+                // `(Get-Item x).Delete(...)`: the last plain word of the group before it
+                tokenize(&command[open + 1..at - 1]).into_iter().skip(1).rfind(|t| !t.starts_with('-')).unwrap_or_default()
+            }
         } else {
             continue;
         };
@@ -1219,11 +1250,13 @@ fn check_dotnet_delete(command: &str, cwd: Option<&Path>, d: &mut Decision) {
 }
 
 /// A delete target that still names a variable after every expansion: its value is unknown here.
+/// `%NAME:~0,3%` names NAME too.
 fn unresolved_var(s: &str) -> bool {
     let b = s.as_bytes();
     (0..b.len()).any(|i| {
+        let pct = |j: usize| var_name_ok(s[i + 1..i + 1 + j].split(':').next().unwrap_or(""));
         (b[i] == b'$' && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, b'_' | b'{')))
-            || (b[i] == b'%' && s[i + 1..].find('%').is_some_and(|j| var_name_ok(&s[i + 1..i + 1 + j])))
+            || (b[i] == b'%' && s[i + 1..].find('%').is_some_and(pct))
     })
 }
 
@@ -1450,7 +1483,9 @@ fn check_redirection(command: &str, cwd: Option<&Path>, d: &mut Decision) {
                 let target = &command[start..j];
                 deny_if_protected(target, cwd, d);
             }
-            i = j.max(i + 1);
+            // Rescan the target: a `>` inside a string (`echo "<b>" > x`) makes a false target
+            // that would otherwise swallow the real redirect after it.
+            i = start.max(i + 1);
         } else {
             i += 1;
         }
@@ -1520,8 +1555,9 @@ fn check_sql(text: &str, d: &mut Decision) {
         if s.contains(" DELETE FROM ") && !s.contains(" WHERE ") {
             d.deny("DELETE without WHERE deletes every row");
         }
-        // `UPDATE t SET ..`, not `SELECT .. FOR UPDATE`.
-        if s.contains(" UPDATE ") && s.contains(" SET ") && !s.contains(" WHERE ") {
+        // `UPDATE t SET ..`, not `SELECT .. FOR UPDATE` or an upsert's `ON CONFLICT .. DO UPDATE SET`.
+        let update = s.match_indices(" UPDATE ").any(|(p, _)| !s[..p].ends_with(" DO") && !s[..p].ends_with(" KEY"));
+        if update && s.contains(" SET ") && !s.contains(" WHERE ") {
             d.deny("UPDATE without WHERE rewrites every row");
         }
     }
@@ -1801,7 +1837,14 @@ fn peel(raw: &str) -> &str {
 }
 
 fn absolutize(raw: &str, cwd: Option<&Path>) -> PathBuf {
-    let expanded = msys_to_windows(&expand_env(&expand_dollar_env(&expand_home(peel(raw)))));
+    let mut expanded = expand_dollar_env(&expand_home(peel(raw)));
+    // cmd's dynamic `%CD%` is the directory the line runs in; no environment holds it.
+    if std::env::var_os("CD").is_none() {
+        if let Some(here) = cwd.map(Path::to_path_buf).or_else(|| std::env::current_dir().ok()) {
+            expanded = replace_cmd_var(&expanded, "cd", &here.to_string_lossy());
+        }
+    }
+    let expanded = msys_to_windows(&expand_env(&expanded));
     let p = PathBuf::from(&expanded);
     let joined = if p.is_absolute() {
         p
@@ -2831,9 +2874,24 @@ mod tests {
             r#"psql -c "SELECT * FROM t FOR UPDATE""#,
             r#"psql -c "UPDATE t SET x=1 WHERE id=2""#,
             r#"psql -c "DELETE FROM t WHERE id = 1""#,
+            r#"psql -c "INSERT INTO t(id,x) VALUES (1,2) ON CONFLICT (id) DO UPDATE SET x=2""#,
+            r#"mysql -e "INSERT INTO t VALUES (1) ON DUPLICATE KEY UPDATE x=2""#,
         ] {
             assert!(!denied(ok), "{ok}");
         }
+    }
+
+    #[test]
+    fn start_switches_after_the_title_and_quoted_angle_brackets_hide_nothing() {
+        for bad in [
+            r#"start "x" /b cmd /c rd /s /q C:\Windows"#,
+            r#"start /min "x" /wait /b cmd /c rd /s /q C:\Windows"#,
+            r#"echo "<b>" > C:\Windows\x.txt"#,
+            r#"echo "<b>" > "C:\Windows\x.txt""#,
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        assert!(!denied(r#"echo "<b>" > index.html"#));
     }
 
     #[test]
@@ -2848,7 +2906,25 @@ mod tests {
         }
         // A variable qx cannot resolve is not silently judged as a file in the workspace.
         assert_eq!(level("rm -rf $SOMEWHERE_QX_UNSET/x"), Level::Warn);
+        assert_eq!(level("rd /s /q %QX_UNSET_VAR:~0,3%"), Level::Warn);
         assert_eq!(level("d=build; rm -rf $d"), Level::Allow);
+    }
+
+    #[test]
+    fn assignments_chain_and_export_like_words_assign() {
+        for bad in [
+            "a=/; b=$a; rm -rf $b",
+            "a=/ b=$a; rm -rf $b",
+            "export d=/; rm -rf $d",
+            "declare -x d=/; rm -rf \"$d\"",
+            r"set T=C:\Windows&& rd /s /q %T:~0%",
+            r#"[IO.DirectoryInfo]::new("C:\Windows").Delete($true)"#,
+            "rd /s /q %CD%",
+            "rd /s /q %cd:~0,3%",
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        assert_eq!(level("export d=build; rm -rf $d"), Level::Allow);
     }
 
     #[test]

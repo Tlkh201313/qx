@@ -86,6 +86,7 @@ pub fn redact(input: &str) -> (String, usize) {
     let mut out = String::with_capacity(input.len());
     let mut count = 0usize;
     let mut hidden: Option<usize> = None; // lines swallowed so far inside an open key block
+    let mut b64_key = false; // the previous line was a wrapped line of a base64-encoded key
     let mut lines = input.split('\n').peekable();
 
     while let Some(line) = lines.next() {
@@ -109,6 +110,20 @@ pub fn redact(input: &str) -> (String, usize) {
             }
             hidden = None;
             out.push_str(&format!("[qx] no END line within {KEY_BLOCK_CAP} lines; showing output again\n"));
+        }
+
+        // `base64 key.pem` wraps its output: after the line that starts with `LS0tLS1CRUdJTi`
+        // (masked below) comes bare key material, which no rule recognizes on its own.
+        if b64_key {
+            let t = line.trim();
+            if is_base64(t) {
+                out.push_str("[REDACTED]");
+                out.push_str(nl);
+                count += 1;
+                b64_key = t.len() >= B64_WRAP;
+                continue;
+            }
+            b64_key = false;
         }
 
         if has_begin {
@@ -138,8 +153,23 @@ pub fn redact(input: &str) -> (String, usize) {
         count += n1 + n2 + n3 + n4;
         out.push_str(&masked);
         out.push_str(nl);
+        b64_key = opens_base64_key(line);
     }
     (out, count)
+}
+
+/// The narrowest width wrapped base64 comes in (`base64` uses 76, `openssl base64` 64): a shorter
+/// line ends the run.
+const B64_WRAP: usize = 60;
+
+fn is_base64(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+}
+
+/// A line that ends in a full-width base64 run beginning with `-----BEGIN` encoded.
+fn opens_base64_key(line: &str) -> bool {
+    let t = line.trim_end();
+    t.rfind("LS0tLS1CRUdJTi").is_some_and(|i| t.len() - i >= B64_WRAP && is_base64(&t[i..]))
 }
 
 /// The same rules as the main loop, for the text before a private-key header.
@@ -155,7 +185,7 @@ fn mask_line(line: &str) -> (String, usize) {
 /// (whatever a dump put before it: `cat -n` numbers, `grep -n` paths, log timestamps), or the next
 /// line carries key material (base64 or a `Proc-Type:` header) after any such prefix.
 fn starts_block(line: &str, next: Option<&str>) -> bool {
-    let base64 = |s: &str| s.len() >= 16 && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='));
+    let base64 = |s: &str| s.len() >= 16 && is_base64(s);
     line.trim_end().ends_with("-----")
         || next.is_some_and(|n| {
             let n = n.trim();
@@ -703,6 +733,18 @@ mod tests {
         }
         // no password: nothing to mask
         assert_eq!(redact("ssh://git@github.com:22/org/repo").1, 0);
+    }
+
+    #[test]
+    fn wrapped_base64_of_a_key_is_hidden_to_its_last_line() {
+        let first = format!("LS0tLS1CRUdJTi{}", "A".repeat(62));
+        let text = format!("{first}\n{}\nd0VBQVFB\ndone\n", "QUFC".repeat(19));
+        let (s, n) = redact(&text);
+        assert!(!s.contains("QUFC") && !s.contains("d0VBQVFB") && !s.contains("AAAA"), "{s}");
+        assert_eq!((s.lines().last(), n), (Some("done"), 3));
+        // A key on one line (kubeconfig) does not hide the line after it unless that is base64.
+        let (s, _) = redact(&format!("client-key-data: {first}\nuser: me\n"));
+        assert!(s.ends_with("user: me\n"), "{s}");
     }
 
     #[test]
