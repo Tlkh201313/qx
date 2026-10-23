@@ -1129,6 +1129,7 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
 
     // Expand to files in the spelling grep would print: `grep -r x src` says `src/a.rs`.
     let mut files: Vec<(String, PathBuf)> = Vec::new();
+    let mut walked = false;
     for (raw, path) in &specs {
         let md = fs::metadata(path).ok()?;
         if md.is_file() {
@@ -1139,6 +1140,7 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             // `grep x dir` is an error grep words better than qx can.
             return None;
         }
+        walked = true;
         let base = raw.trim_end_matches(['/', '\\']);
         let mut full = false;
         // A walk that skipped anything (too deep, unreadable, too many files) is not an answer:
@@ -1181,8 +1183,9 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         return None;
     }
 
-    // grep prefixes the filename whenever it recurses, even for a single hit file.
-    let multiple = recursive || files.len() > 1;
+    // grep names files when given several operands or a directory to walk, even for a single hit
+    // file; `grep -r x a.txt` does not.
+    let multiple = walked || specs.len() > 1;
     let needle = if insensitive {
         pattern.to_lowercase()
     } else {
@@ -1299,9 +1302,10 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         elapsed: Duration::ZERO,
     })
 }
-/// Characters that make the pattern a regex. A literal scan must never answer these.
+/// Characters that make the pattern a regex, or (a newline) several patterns. A literal scan
+/// must never answer these.
 fn needs_regex(p: &str) -> bool {
-    p.chars().any(|c| ".[]()*+?^${}|\\".contains(c))
+    p.chars().any(|c| ".[]()*+?^${}|\\\n".contains(c))
 }
 
 /// The one `--include` shape qx can honour exactly: `*.ext`.
@@ -2481,6 +2485,8 @@ mod tests {
             vec!["-ealpha", "a.txt"],
             vec!["-ne", "gamma", "a.txt"],
             vec!["--regexp=beta", "a.txt"],
+            // A single file operand is not named, even with -r.
+            vec!["-rn", "alpha", "a.txt"],
         ];
         for case in taken {
             let mine = run("grep", &case, &d).unwrap_or_else(|| panic!("built-in declined {case:?}, a shape it claims"));
@@ -2533,6 +2539,8 @@ mod tests {
             vec!["alpha"],
             vec!["-rn", "alpha", "missing"],
             vec!["-rn", "alpha", "."],
+            // GNU reads a newline as two patterns.
+            vec!["alpha\nbeta", "a.txt"],
         ];
         for case in declined {
             assert!(run("grep", &case, &d).is_none(), "should decline {case:?}");

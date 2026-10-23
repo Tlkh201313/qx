@@ -32,6 +32,8 @@ struct RunOpts {
     max_lines: usize,
     head: usize,
     tail: usize,
+    /// --max-lines, --head or --tail was given.
+    limited: bool,
     timeout: Option<Duration>,
     cwd: Option<PathBuf>,
     shell: String,
@@ -46,6 +48,7 @@ impl Default for RunOpts {
             max_lines: 200,
             head: 80,
             tail: 60,
+            limited: false,
             timeout: None,
             cwd: None,
             shell: "auto".to_string(),
@@ -144,16 +147,19 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
             "--max-lines" => {
                 i += 1;
                 o.max_lines = parse_num(args.get(i), o.max_lines);
+                o.limited = true;
                 i += 1;
             }
             "--head" => {
                 i += 1;
                 o.head = parse_num(args.get(i), o.head);
+                o.limited = true;
                 i += 1;
             }
             "--tail" => {
                 i += 1;
                 o.tail = parse_num(args.get(i), o.tail);
+                o.limited = true;
                 i += 1;
             }
             "--timeout" => {
@@ -407,8 +413,9 @@ fn emit(out: exec::Outcome, o: &RunOpts, label: &str) -> i32 {
                 let lossy = d.lossy();
                 (d.stdout, d.stderr, lossy, d.profile)
             }
-            // Claude Code shows this much of a Bash result itself: cutting below it only hides text.
-            None if claude_shows_whole(so.len() + se.len()) => (std::mem::take(&mut so), std::mem::take(&mut se), false, ""),
+            // Claude Code shows this much of a Bash result itself: cutting below it only hides text,
+            // unless the caller asked for a cut with --max-lines, --head or --tail.
+            None if !o.limited && claude_shows_whole(so.len() + se.len()) => (std::mem::take(&mut so), std::mem::take(&mut se), false, ""),
             None => {
                 let (a, cut) = compact::compact(&so, o.max_lines, o.head, o.tail);
                 let (b, cut_err) = compact::compact(&se, o.max_lines.min(120), o.head.min(50), o.tail.min(40));

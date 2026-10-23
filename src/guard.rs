@@ -2127,6 +2127,8 @@ mod tests {
         for (prog, args) in [
             ("sudo", "rm -rf /"),
             ("sudo", "-u root rm -rf /"),
+            // Windows sudo raises a UAC prompt, whatever it runs.
+            ("sudo", "ls"),
             ("wsl", "-d Ubuntu -e rm -rf /"),
             ("wsl", "--unregister Ubuntu"),
             ("command", "rm -rf /"),
@@ -2141,7 +2143,6 @@ mod tests {
         for (prog, args) in [
             ("command", "-v rm"),
             ("wsl", "--list"),
-            ("sudo", "ls"),
             ("find", ". -name *.pyc -delete"),
             ("find", ". -name *.rs"),
             ("mv", "a.txt ."),

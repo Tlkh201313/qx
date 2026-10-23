@@ -1730,7 +1730,7 @@ pub fn split_simple(s: &str) -> Option<(String, Vec<String>)> {
         return None;
     }
     const SHELL_ONLY: &[char] = &[
-        '\'', '|', '&', '>', '<', ';', '$', '`', '(', ')', '*', '?', '%', '!', '^', '\n', '\r',
+        '\'', '|', '&', '>', '<', ';', '$', '`', '(', ')', '*', '?', '%', '!', '^', '\n', '\r', '{',
     ];
     let mut tokens: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -1882,6 +1882,7 @@ mod tests {
         assert!(split_simple("echo hi && echo bye").is_none());
         assert!(split_simple("cat x | tail -5").is_none());
         assert!(split_simple("ls *.rs").is_none());
+        assert!(split_simple("diff config.{old,new}").is_none());
         assert!(split_simple("cd ..").is_none());
         assert!(split_simple("FOO=1 git status").is_none());
         assert!(split_simple("rm a\\ b").is_none());
