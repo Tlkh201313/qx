@@ -255,6 +255,35 @@ pub fn relative_to_cwd(so: &mut String, se: &mut String, cwd: Option<&std::path:
     (*so, *se) = (a, b);
 }
 
+/// A line redrawn with lone `\r` (a progress bar) shows only its last frame on a terminal. Keep that
+/// frame and any earlier one that reports a problem, instead of one huge line whose length cap
+/// keeps the first frames and cuts the final status. CRLF becomes LF on the way. The flag says a
+/// frame was dropped, so callers spool the original (a file with lone-`\r` line ends is data).
+pub fn settle_frames(text: &str) -> (std::borrow::Cow<'_, str>, bool) {
+    if !text.contains('\r') {
+        return (std::borrow::Cow::Borrowed(text), false);
+    }
+    let mut dropped = false;
+    let mut out = String::with_capacity(text.len().min(1 << 20));
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if !line.contains('\r') {
+            out.push_str(line);
+            continue;
+        }
+        let frames: Vec<&str> = line.split('\r').filter(|f| !f.trim().is_empty()).collect();
+        let Some((last, earlier)) = frames.split_last() else { continue };
+        let mut kept: Vec<&str> = earlier.iter().copied().filter(|f| interesting(f)).collect();
+        kept.dedup();
+        kept.push(last);
+        dropped |= kept.len() < frames.len();
+        out.push_str(&kept.join("\n"));
+    }
+    (std::borrow::Cow::Owned(out), dropped)
+}
+
 /// Keep the first `head` and last `tail` lines when output exceeds `max_lines`.
 /// Diagnostic-looking lines from the omitted middle are rescued first.
 /// Returns the compacted text and whether anything was omitted.
@@ -262,11 +291,7 @@ pub fn compact(text: &str, max_lines: usize, head: usize, tail: usize) -> (Strin
     if text.is_empty() {
         return (String::new(), false);
     }
-    let normalized = if text.contains('\r') {
-        std::borrow::Cow::Owned(text.replace("\r\n", "\n"))
-    } else {
-        std::borrow::Cow::Borrowed(text)
-    };
+    let (normalized, dropped) = settle_frames(text);
     let trailing = normalized.ends_with('\n');
     let mut lines: Vec<&str> = normalized.split('\n').collect();
     if trailing {
@@ -289,7 +314,7 @@ pub fn compact(text: &str, max_lines: usize, head: usize, tail: usize) -> (Strin
         if collapsed > 0 {
             out.push_str(&format!("[qx] collapsed {collapsed} repeated line(s)\n"));
         }
-        return (out, similar || capped);
+        return (out, similar || capped || dropped);
     }
 
     let h = head.min(lines.len());
@@ -372,6 +397,29 @@ fn rescue_groups(middle: &[String], follow: usize) -> Vec<std::ops::Range<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_frames_keep_the_last_frame_and_problems() {
+        let mut bar: String = (0..3000).map(|i| format!("Downloading {i}/3000\r")).collect();
+        bar.push_str("warning: retrying mirror\rDownloading 3000/3000\rDone: installed pkg-1.0\n");
+        let (out, _) = compact(&format!("start\n{bar}end\n"), 200, 80, 60);
+        assert!(out.contains("Done: installed pkg-1.0"), "{out}");
+        assert!(out.contains("warning: retrying mirror"), "{out}");
+        assert!(!out.contains("Downloading 1/3000"), "{out}");
+        assert_eq!(out.lines().next(), Some("start"));
+        assert_eq!(out.lines().last(), Some("end"));
+    }
+
+    #[test]
+    fn dropped_frames_count_as_a_cut_and_crlf_does_not() {
+        // Classic Mac line ends: every record but the last is a dropped frame, so it must spool.
+        let (out, cut) = compact("rec 1\rrec 2\rrec 3\n", 200, 80, 60);
+        assert_eq!(out, "rec 3\n");
+        assert!(cut);
+        let (out, cut) = compact("a\r\nb\r\n", 200, 80, 60);
+        assert_eq!(out, "a\nb\n");
+        assert!(!cut);
+    }
 
     /// Filler that differs in letters, so head/tail is what gets tested.
     fn word(i: usize) -> String {

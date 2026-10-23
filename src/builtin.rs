@@ -944,9 +944,10 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut invert = false;
     let mut quiet = false;
     let mut count_only = false;
-    let mut before = 0usize;
-    let mut after = 0usize;
-    let mut around = 0usize;
+    // GNU: `-A`/`-B` win over `-C` in either order, and any of them (even `-A0`) prints `--`.
+    let mut before: Option<usize> = None;
+    let mut after: Option<usize> = None;
+    let mut around: Option<usize> = None;
     let mut include: Option<String> = None;
     let mut pattern: Option<String> = None;
     let mut i = 0;
@@ -974,9 +975,9 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                 "quiet" | "silent" => quiet = true,
                 "fixed-strings" => fixed = true,
                 "count" => count_only = true,
-                "after-context" => after = count_arg(val?)?,
-                "before-context" => before = count_arg(val?)?,
-                "context" => around = count_arg(val?)?,
+                "after-context" => after = Some(count_arg(val?)?),
+                "before-context" => before = Some(count_arg(val?)?),
+                "context" => around = Some(count_arg(val?)?),
                 "line-number" => number = true,
                 "files-with-matches" => list_only = true,
                 "recursive" => recursive = true,
@@ -988,7 +989,7 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             let body = &a[1..];
             if body.chars().all(|c| c.is_ascii_digit()) {
                 // GNU's `-3` is `-C3`.
-                around = count_arg(body)?;
+                around = Some(count_arg(body)?);
                 i += 1;
                 continue;
             }
@@ -1025,7 +1026,7 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                         } else {
                             rest.to_string()
                         };
-                        let n = count_arg(&n)?;
+                        let n = Some(count_arg(&n)?);
                         match ch {
                             'A' => after = n,
                             'B' => before = n,
@@ -1041,7 +1042,8 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         }
         i += 1;
     }
-    if (around > 0 || before > 0 || after > 0) && (count_only || list_only) {
+    let context = before.is_some() || after.is_some() || around.is_some();
+    if context && (count_only || list_only) {
         // GNU answers these with a "context is ignored" warning; qx words warnings badly.
         return None;
     }
@@ -1132,11 +1134,7 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     } else {
         pattern.to_string()
     };
-    let (bctx, actx) = if around > 0 {
-        (around, around)
-    } else {
-        (before, after)
-    };
+    let (bctx, actx) = (before.or(around).unwrap_or(0), after.or(around).unwrap_or(0));
     let mut out = String::new();
     let mut hits = 0usize;
     'files: for (disp, path) in &files {
@@ -1168,8 +1166,8 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             }
         }
         if selected.is_empty() {
-            // GNU counts every file it searched, zero included.
-            if count_only {
+            // GNU counts every file it searched, zero included; `-l` wins over `-c`.
+            if count_only && !list_only {
                 if multiple {
                     out.push_str(disp);
                     out.push(':');
@@ -1211,7 +1209,12 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             if !show[idx] {
                 continue;
             }
-            if bctx + actx > 0 && matches!(last, Some(p) if p + 1 != idx) {
+            // A file's first group follows the previous file's groups with `--` too.
+            let gap = match last {
+                Some(p) => p + 1 != idx,
+                None => !out.is_empty(),
+            };
+            if context && gap {
                 out.push_str("--\n");
             }
             last = Some(idx);
@@ -1428,8 +1431,8 @@ fn dangerous(path: &Path) -> bool {
     if s.is_empty() || (s.len() == 2 && s.ends_with(':')) {
         return true;
     }
-    if let Some(home) = std::env::var_os("USERPROFILE") {
-        if s == norm_path(Path::new(&home)) {
+    if let Some(home) = crate::resolve::home_dir() {
+        if s == norm_path(&home) {
             return true;
         }
     }
@@ -2247,14 +2250,15 @@ mod tests {
             vec!["-c", "alpha", "a.txt", "b.rs"],
             vec!["-cv", "alpha", "a.txt"],
             vec!["-rcn", "alpha", "."],
-            vec!["-cl", "alpha", "."],
+            vec!["-rcl", "alpha", "."],
+            vec!["-cl", "alpha", "a.txt", "one.txt"],
             vec!["-e", "alpha", "a.txt"],
             vec!["-ealpha", "a.txt"],
             vec!["-ne", "gamma", "a.txt"],
             vec!["--regexp=beta", "a.txt"],
         ];
         for case in taken {
-            let mine = run("grep", &case, &d).expect("built-in declined a shape it claims");
+            let mine = run("grep", &case, &d).unwrap_or_else(|| panic!("built-in declined {case:?}, a shape it claims"));
             let Some((code, theirs, why)) = real_tool_run(grep, &case, &d) else {
                 let _ = fs::remove_dir_all(&d);
                 return;
@@ -2274,13 +2278,18 @@ mod tests {
             vec!["-A1", "-B1", "gamma", "a.txt"],
             vec!["-1", "alpha", "a.txt"],
             vec!["-0", "alpha", "a.txt"],
-            vec!["-A2n", "alpha", "a.txt"],
+            vec!["-A0", "alpha", "a.txt"],
+            vec!["-B0", "-C1", "gamma", "a.txt"],
+            vec!["-C1", "-A0", "gamma", "a.txt"],
+            vec!["-nA2", "alpha", "a.txt"],
             vec!["-A1", "alpha", "a.txt", "b.rs"],
+            vec!["-A1", "gamma", "a.txt", "b.rs"],
+            vec!["-rA1", "alpha", "."],
             vec!["-A1", "nope", "a.txt"],
-            vec!["-A1v", "alpha", "a.txt"],
+            vec!["-vA1", "alpha", "a.txt"],
         ];
         for case in ordered {
-            let mine = run("grep", &case, &d).expect("built-in declined a context shape it claims");
+            let mine = run("grep", &case, &d).unwrap_or_else(|| panic!("built-in declined {case:?}, a context shape it claims"));
             let Some((code, theirs, why)) = real_tool_run(grep, &case, &d) else {
                 let _ = fs::remove_dir_all(&d);
                 return;

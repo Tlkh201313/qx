@@ -1154,8 +1154,8 @@ fn protected(path: &Path, cwd: Option<&Path>) -> Option<&'static str> {
             return Some(label);
         }
     }
-    if let Some(home) = std::env::var_os("USERPROFILE") {
-        let h = norm(Path::new(&home));
+    if let Some(home) = crate::resolve::home_dir() {
+        let h = norm(&home);
         if s == h {
             return Some("the home directory");
         }

@@ -39,15 +39,21 @@ pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Dige
         return None;
     }
     let l = core_label(&label.to_ascii_lowercase());
+    // Progress bars redrawn with `\r` (tqdm, curl, downloaders) reach the digests as their last frame.
+    let ((so, sd), (se, ed)) = (compact::settle_frames(stdout), compact::settle_frames(stderr));
+    let (stdout, stderr) = (&*so, &*se);
     let (profile, out, err, omitted, clipped) = if is_git_status(&l) {
         let (o, n) = git_status(stdout)?;
-        ("git-status", o, keep_stderr(stderr), n, false)
+        let (e, ec) = keep_stderr(stderr);
+        ("git-status", o, e, n, ec)
     } else if is_git_log(&l) {
         let (o, n) = git_log(stdout)?;
-        ("git-log", o, keep_stderr(stderr), n, false)
+        let (e, ec) = keep_stderr(stderr);
+        ("git-log", o, e, n, ec)
     } else if is_diff(&l) {
         let (o, n, c) = git_diff(stdout)?;
-        ("git-diff", o, keep_stderr(stderr), n, c)
+        let (e, ec) = keep_stderr(stderr);
+        ("git-diff", o, e, n, c || ec)
     } else if is_test(&l) {
         if verbatim(&l, code) {
             return None;
@@ -67,12 +73,15 @@ pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Dige
         ("traceback", o, e, n, c)
     } else if is_pathlist(&l) {
         let (o, n) = paths(stdout)?;
-        ("paths", o, keep_stderr(stderr), n, false)
+        let (e, ec) = keep_stderr(stderr);
+        ("paths", o, e, n, ec)
     } else if is_search(&l) {
         let (o, n, c) = grep(stdout)?;
-        ("search", o, keep_stderr(stderr), n, c)
+        let (e, ec) = keep_stderr(stderr);
+        ("search", o, e, n, c || ec)
     } else if let Some((o, n)) = json_min(&l, stdout) {
-        ("json", o, keep_stderr(stderr), n, false)
+        let (e, ec) = keep_stderr(stderr);
+        ("json", o, e, n, ec)
     } else {
         return None;
     };
@@ -87,7 +96,7 @@ pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Dige
         stderr: err,
         profile,
         omitted,
-        clipped,
+        clipped: clipped || sd || ed,
         passed: code == 0,
     })
 }
@@ -119,12 +128,13 @@ fn merge(stdout: &str, stderr: &str) -> String {
     s
 }
 
-fn keep_stderr(stderr: &str) -> String {
+/// Compacted stderr and whether lines were cut: a cut must reach `clipped`, or the full text is
+/// never spooled and the cut lines are gone for good.
+fn keep_stderr(stderr: &str) -> (String, bool) {
     if stderr.trim().is_empty() {
-        return String::new();
+        return (String::new(), false);
     }
-    let (s, _) = compact::compact(stderr, 120, 50, 40);
-    s
+    compact::compact(stderr, 120, 50, 40)
 }
 
 fn words(l: &str) -> impl Iterator<Item = &str> {
@@ -1168,6 +1178,18 @@ fn json_min(label: &str, text: &str) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cut_stderr_marks_the_digest_lossy_so_it_is_spooled() {
+        let files: String = (0..300).map(|i| format!("src/deep/dir/file{i}.rs\n")).collect();
+        let noisy: String = (0..400).map(|i| format!("find: cannot read dir{i}: Permission denied\n")).collect();
+        let d = digest("find src -name *.rs", &files, &noisy, 1).expect("the path digest fires");
+        assert_eq!(d.profile, "paths");
+        assert!(d.lossy(), "stderr was cut but the digest is not spooled");
+        // The same digest with a short stderr loses nothing, so nothing is spooled.
+        let d = digest("find src -name *.rs", &files, "find: one warning\n", 1).unwrap();
+        assert!(!d.lossy());
+    }
 
     #[test]
     fn grep_clips_long_multibyte_lines_on_a_char_boundary() {

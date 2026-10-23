@@ -516,8 +516,8 @@ fn find_package(start: &Path) -> Option<(PathBuf, Value)> {
 
 fn npmrc_overrides(root: &Path) -> bool {
     let mut files = vec![root.join(".npmrc")];
-    if let Some(home) = std::env::var_os("USERPROFILE") {
-        files.push(PathBuf::from(home).join(".npmrc"));
+    if let Some(home) = crate::resolve::home_dir() {
+        files.push(home.join(".npmrc"));
     }
     for f in files {
         let Ok(text) = std::fs::read_to_string(f) else {
