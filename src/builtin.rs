@@ -88,7 +88,7 @@ pub const NAMES: &[&str] = &[
 /// (`/tmp/x`); neither is a Windows path, so the real tool gets it.
 const PATHY: &[&str] = &[
     "ls", "dir", "cat", "type", "head", "tail", "wc", "mkdir", "rm", "del", "erase", "cp", "copy", "mv", "move",
-    "touch", "realpath", "sed",
+    "touch", "realpath", "sed", "grep",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -816,22 +816,22 @@ fn cmd_head(args: &[String], cwd: Option<&Path>, tail: bool) -> Option<BuiltinOu
 /// `-c`: a byte window, text only. A window that is binary or not valid UTF-8 is left to the
 /// real tool, because mangled bytes would be worse than a spawn.
 fn read_bytes_window(path: &Path, n: usize, tail: bool) -> std::io::Result<Option<String>> {
-    if n == 0 {
+    // GNU tail does not open a file it will print nothing of; head does, and fails on a missing one.
+    if n == 0 && tail {
         return Ok(Some(String::new()));
     }
     let mut f = File::open(path)?;
     let len = f.metadata()?.len();
-    let n = n.min(READ_CAP as usize);
-    let (start, want) = if tail {
-        let start = len.saturating_sub(n as u64);
-        (start, (len - start) as usize)
-    } else {
-        (0, (len as usize).min(n))
-    };
-    let mut buf = vec![0u8; want];
+    let want = len.min(n as u64);
+    // Past the cap the window would be cut short; the real tool prints all of it.
+    if want > READ_CAP {
+        return Ok(None);
+    }
+    let start = if tail { len - want } else { 0 };
+    let mut buf = vec![0u8; want as usize];
     f.seek(SeekFrom::Start(start))?;
     f.read_exact(&mut buf)?;
-    if buf.iter().take(8192).any(|b| *b == 0) {
+    if buf.contains(&0) {
         return Ok(None);
     }
     Ok(String::from_utf8(buf).ok())
@@ -841,10 +841,13 @@ fn read_bytes_window(path: &Path, n: usize, tail: bool) -> std::io::Result<Optio
 /// last 32 MiB instead of falling back to a binary that may not exist on
 /// Windows.
 fn read_head_tail(path: &Path, count: usize, tail: bool) -> std::io::Result<String> {
-    if count == 0 {
+    if count == 0 && tail {
         return Ok(String::new());
     }
     let mut f = File::open(path)?;
+    if count == 0 {
+        return Ok(String::new());
+    }
     let len = f.metadata()?.len();
     if !tail {
         // Stream until `count` lines instead of reading the whole 32 MiB window.
@@ -1028,8 +1031,10 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                 "files-with-matches" => list_only = true,
                 "recursive" => recursive = true,
                 "dereference-recursive" => return None,
-                // Colour is never emitted; buffering is not observable in captured output.
-                "color" | "colour" | "line-buffered" => {}
+                // Colour is never emitted (`always` would); buffering is not observable in captured
+                // output.
+                "color" | "colour" if matches!(val, None | Some("never" | "auto")) => {}
+                "line-buffered" => {}
                 _ => return None,
             }
         } else if a.len() > 1 && a.starts_with('-') {
@@ -1107,9 +1112,14 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         }
     };
     let pattern = pattern.as_str();
-    if pattern.is_empty() || pattern == "-" || (!fixed && needs_regex(pattern)) {
+    // A newline separates patterns, with `-F` too.
+    if pattern.is_empty() || pattern == "-" || pattern.contains('\n') || (!fixed && needs_regex(pattern)) {
         return None;
     }
+    // GNU applies `--include` to the files named on the command line as well as to a walk.
+    let included = |file: &Path| {
+        include.as_ref().is_none_or(|g| file.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&g[1..])))
+    };
     let mut specs: Vec<(&str, PathBuf)> = Vec::new();
     if i == args.len() {
         if !recursive {
@@ -1133,7 +1143,9 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     for (raw, path) in &specs {
         let md = fs::metadata(path).ok()?;
         if md.is_file() {
-            files.push((raw.to_string(), path.clone()));
+            if included(path) {
+                files.push((raw.to_string(), path.clone()));
+            }
             continue;
         }
         if !md.is_dir() || !recursive {
@@ -1158,14 +1170,8 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             if rel.is_empty() {
                 return true;
             }
-            if let Some(g) = &include {
-                let name = file
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                if !name.ends_with(&g[1..]) {
-                    return true;
-                }
+            if !included(file) {
+                return true;
             }
             let disp = if base.is_empty() {
                 rel
@@ -1200,8 +1206,9 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             return None;
         }
         let bytes = fs::read(path).ok()?;
-        if bytes[..bytes.len().min(8192)].contains(&0) {
-            // GNU prints "Binary file ... matches"; never guess at that.
+        // GNU prints "Binary file ... matches" for a NUL anywhere, or bytes that are not text in
+        // a UTF-8 locale; never guess at that.
+        if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
             return None;
         }
         let text = crate::exec::decode(&bytes);
@@ -2256,6 +2263,20 @@ mod tests {
         fs::create_dir_all(&deep).unwrap();
         fs::write(deep.join("x.txt"), "needle\n").unwrap();
         assert!(run("grep", &["-rn", "needle", "deep"], &d).is_none());
+        // `-F` splits on newlines too; `always` colours; a NUL past the first block, or bytes
+        // that are not UTF-8, make GNU say "Binary file".
+        assert!(run("grep", &["-F", "foo\nbar", "a.txt"], &d).is_none());
+        assert!(run("grep", &["--color=always", "foo", "a.txt"], &d).is_none());
+        assert_eq!(run("grep", &["--color=auto", "foo", "a.txt"], &d).unwrap().stdout, "foo\n");
+        fs::write(d.join("nul.txt"), format!("{}a\0b\nfoo\n", "foo x\n".repeat(2000))).unwrap();
+        assert!(run("grep", &["foo", "nul.txt"], &d).is_none());
+        fs::write(d.join("l1.txt"), b"caf\xe9 foo\n").unwrap();
+        assert!(run("grep", &["foo", "l1.txt"], &d).is_none());
+        // An MSYS path is not the Windows path qx would read.
+        assert!(run("grep", &["foo", "/tmp/a.txt"], &d).is_none());
+        // `--include` filters the files named on the line as well.
+        let r = run("grep", &["--include=*.rs", "foo", "a.txt"], &d).unwrap();
+        assert_eq!((r.code, r.stdout.as_str()), (1, ""));
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -2369,6 +2390,10 @@ mod tests {
         assert!(run("head", &["-c", "2", "bin.dat"], &d).is_none());
         fs::write(d.join("latin1.dat"), [b'h', 0xFF, 0xFE]).unwrap();
         assert!(run("head", &["-c", "3", "latin1.dat"], &d).is_none());
+        // GNU head opens the file even to print nothing of it; tail does not.
+        assert_ne!(run("head", &["-c", "0", "nofile"], &d).unwrap().code, 0);
+        assert_ne!(run("head", &["-n", "0", "nofile"], &d).unwrap().code, 0);
+        assert_eq!(run("tail", &["-c", "0", "nofile"], &d).unwrap().code, 0);
     }
 
     #[test]

@@ -347,6 +347,8 @@ impl Root {
         let parent = candidate
             .parent()
             .ok_or_else(|| FsError::arg("path must have a parent directory"))?;
+        // Before any directory is made: a refused `.git/x/y` must leave no `.git/x` behind.
+        self.check_mutable(&candidate)?;
         fs::create_dir_all(parent)
             .map_err(|e| FsError::io(format!("cannot create {}", parent.display()), e))?;
         let parent = fs::canonicalize(parent)
@@ -585,37 +587,43 @@ impl Drop for Temp {
     }
 }
 
+/// `ReplaceFileW` keeps what belongs to the file rather than its bytes: alternate data streams
+/// (a download's `Zone.Identifier`), ACLs, attributes and creation time. Where it cannot (some
+/// file systems and shares), a plain replacing move still lands the new content.
 #[cfg(windows)]
 fn replace_file(temp: &Path, target: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     extern "system" {
+        fn ReplaceFileW(
+            replaced: *const u16,
+            replacement: *const u16,
+            backup: *const u16,
+            flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
         fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
     }
+    const REPLACEFILE_IGNORE_MERGE_ERRORS: u32 = 0x2;
+    const REPLACEFILE_IGNORE_ACL_ERRORS: u32 = 0x4;
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-    let old: Vec<u16> = temp
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let new: Vec<u16> = target
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let ok = unsafe {
-        MoveFileExW(
-            old.as_ptr(),
-            new.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if ok == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
+    let wide = |p: &Path| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (old, new) = (wide(temp), wide(target));
+    let null = std::ptr::null_mut();
+    let flags = REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS;
+    // SAFETY: NUL-terminated paths; no backup file, no exclusions.
+    if unsafe { ReplaceFileW(new.as_ptr(), old.as_ptr(), std::ptr::null(), flags, null, null) } != 0 {
+        return Ok(());
     }
+    // Every failure leaves the replacement under its own name, and the target either as it was or
+    // gone; the move puts the new content in place either way.
+    // SAFETY: as above.
+    if unsafe { MoveFileExW(old.as_ptr(), new.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -911,7 +919,7 @@ fn write(root: &Root, args: &Value) -> Result<Reply, FsError> {
             Err(()) => {
                 return Err(FsError::new(
                     "FS_ENCODING",
-                    format!("\"{raw}\" is not valid UTF-8 (UTF-16 or a legacy code page); qx write would corrupt it"),
+                    format!("\"{raw}\" is not plain UTF-8 text (UTF-16, a legacy code page or NUL bytes); qx write would corrupt it"),
                 )
                 .fb("write"));
             }
@@ -1053,6 +1061,10 @@ fn carry_over_encoding(before: &[u8], content: &str) -> Result<String, ()> {
     let Ok(old) = std::str::from_utf8(before) else {
         return Err(()); // UTF-16 or a legacy code page: rewriting it as UTF-8 would corrupt it
     };
+    // `read` hides NUL bytes, so content made from what it showed would silently drop them.
+    if old.contains('\0') && !content.contains('\0') {
+        return Err(());
+    }
     let crlf = old.matches("\r\n").count();
     let lf_only = old.matches('\n').count().saturating_sub(crlf);
     let mut out = content.to_string();
@@ -2068,7 +2080,7 @@ mod tests {
             assert!(!r.is_error, "{}", r.text);
             let r = invoke(&dir, "edit", json!({"path":name,"old_string":"line2","new_string":"x"}));
             assert!(r.is_error, "{}", r.text);
-            assert_eq!(r.structured["code"], "FS_ENCODING", "{name}");
+            assert_eq!(r.structured["code"], "FS_ENCODING", "{name}: {}", r.text);
             assert_eq!(fs::read(dir.join(name)).unwrap(), bytes, "{name} must stay byte-identical");
         }
         fs::write(dir.join("n.txt"), b"a\0b\nline2\n").unwrap();
@@ -2115,7 +2127,29 @@ mod tests {
         assert!(r.is_error, "{}", r.text);
         assert_eq!(r.structured["code"], "FS_PROTECTED");
         assert!(!hooks.join("pre-commit").exists());
+        // Refused before any directory on the way is made.
+        let repo = base.join("repo");
+        let r = invoke(&repo, "write", json!({"path":".git/zzz/y.txt","content":"x"}));
+        assert_eq!(r.structured["code"], "FS_PROTECTED", "{}", r.text);
+        assert!(!repo.join(".git").join("zzz").exists());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn edit_and_write_keep_alternate_data_streams() {
+        let dir = tmp("ads");
+        fs::write(dir.join("x.txt"), "main content\n").unwrap();
+        // A neutral stream: security software watches writes to `Zone.Identifier`.
+        fs::write(dir.join("x.txt:qx.note"), "kept\n").unwrap();
+        assert!(!invoke(&dir, "read", json!({"path":"x.txt"})).is_error);
+        let r = invoke(&dir, "edit", json!({"path":"x.txt","old_string":"main","new_string":"new"}));
+        assert!(!r.is_error, "{}", r.text);
+        let r = invoke(&dir, "write", json!({"path":"x.txt","content":"replaced\n"}));
+        assert!(!r.is_error, "{}", r.text);
+        assert_eq!(fs::read_to_string(dir.join("x.txt")).unwrap(), "replaced\n");
+        assert_eq!(fs::read_to_string(dir.join("x.txt:qx.note")).unwrap(), "kept\n");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2291,12 +2325,15 @@ mod tests {
         let dir = tmp("write-encoding");
         let latin1: &[u8] = b"caf\xe9\nx\n";
         let utf16: &[u8] = b"\xff\xfeh\0i\0\n\0x\0\n\0";
-        for (name, bytes) in [("l1.txt", latin1), ("u16.txt", utf16)] {
+        // `read` refuses a NUL in the first 8 KiB only; past it, text made from what read showed
+        // would drop the NUL.
+        let nul = [b"x\n".repeat(5000), b"a\0b\n".to_vec()].concat();
+        for (name, bytes) in [("l1.txt", latin1), ("u16.txt", utf16), ("zeros.txt", &nul[..])] {
             fs::write(dir.join(name), bytes).unwrap();
             assert!(!invoke(&dir, "read", json!({"path":name})).is_error);
             let r = invoke(&dir, "write", json!({"path":name,"content":"replacement\n"}));
             assert!(r.is_error, "{name}: {}", r.text);
-            assert_eq!(r.structured["code"], "FS_ENCODING", "{name}");
+            assert_eq!(r.structured["code"], "FS_ENCODING", "{name}: {}", r.text);
             assert_eq!(fs::read(dir.join(name)).unwrap(), bytes, "{name} was rewritten");
         }
         // The model never saw the CRs or the BOM; the file must not lose them.
