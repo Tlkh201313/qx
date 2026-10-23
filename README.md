@@ -335,6 +335,29 @@ Each client editor keeps the `env` keys the existing entry already had and sets
 claude mcp add --scope user qx "C:\Users\USER\.cargo\bin\qx.exe" mcp
 ```
 
+`qx setup claude-code` also adds a `PreToolUse` hook to `~\.claude\settings.json`
+(`qx hook claude`, matcher `Bash|PowerShell`), so the commands Claude gives its own
+Bash and PowerShell tools run through qx without the model typing `qx`:
+`cd src && cargo build` becomes `cd src && qx cargo build`. A part whose output goes
+straight back to the model gets `qx` when qx resolves its program. A part that feeds a
+pipe, a file, a loop, a subshell or a group gets `qx --stream` (output passed through
+untouched), and only where qx starts the program faster than the shell: Python,
+npm/npx/pnpm scripts, rustup tools, PowerShell. `timeout N` becomes `--timeout N`, and
+`rtk proxy X`, `rtk python` and `rtk powershell`, which rtk only passes through, run on
+qx instead. Shell builtins, servers and watchers, background calls, the commands inside
+`$(...)`, and arguments Git Bash would rewrite for its own tools (`sed -n '/x/p'`) stay
+as written, and so do lines that define functions or aliases (`eval`, `source`,
+`Set-Alias`) and qx's own command names (`which`, `check`). A command a `deny` or `ask`
+rule names is left alone, so the rule still sees it. Claude Code checks `allow` rules
+against the rewritten line, so outside `bypassPermissions` a line is only rewritten when
+every allow rule answers it the same before and after: with `Bash(qx:*)` allowed,
+`git push` keeps its prompt instead of passing as `qx git push`. A settings file that is
+not valid JSON(C) turns the hook off. When the rtk hook also rewrites a line, this hook
+builds on rtk's version, since Claude Code keeps only one rewrite.
+Inside Claude Code (`CLAUDECODE=1`), output that fits the Bash tool's own limit
+(`BASH_MAX_OUTPUT_LENGTH`, 30000 characters) is never trimmed; test, build and
+status digests still apply.
+
 ### Codex
 
 `qx setup codex` writes `[mcp_servers.qx]` into `%CODEX_HOME%\config.toml`

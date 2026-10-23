@@ -143,6 +143,13 @@ pub fn git_coreutil(name: &str) -> Option<PathBuf> {
     exe.is_file().then_some(exe)
 }
 
+/// Whether Git's MSYS `usr\bin` holds this program.
+pub fn msys_tool(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    git_root_dir().is_some_and(|r| r.join("usr").join("bin").join(format!("{stem}.exe")).is_file())
+}
+
 /// The Git for Windows root: the nearest ancestor (up to three levels) of the `git`
 /// on PATH that holds `usr\bin`, else the root implied by `git_bash()`.
 fn git_root_dir() -> Option<PathBuf> {
@@ -416,7 +423,7 @@ pub fn rustup_direct(program: &str, args: &[String], cwd: Option<&Path>) -> Opti
     })
 }
 
-fn rustup_tool(program: &str) -> Option<&'static str> {
+pub(crate) fn rustup_tool(program: &str) -> Option<&'static str> {
     let file = Path::new(program).file_name()?.to_string_lossy();
     let stem = file
         .strip_suffix(".exe")
@@ -428,9 +435,11 @@ fn rustup_tool(program: &str) -> Option<&'static str> {
         .find(|t| stem.eq_ignore_ascii_case(t))
 }
 
-fn home_dir() -> Option<PathBuf> {
+/// `USERPROFILE` on Windows, `HOME` elsewhere: every home-relative path and guard rule goes through here.
+pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("HOME").filter(|h| !h.is_empty()))
         .map(PathBuf::from)
 }
 

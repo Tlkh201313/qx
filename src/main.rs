@@ -11,6 +11,7 @@ mod fsops;
 #[cfg(test)]
 mod fuzz;
 mod guard;
+mod hook;
 mod mcp;
 mod npm;
 mod python;
@@ -57,6 +58,12 @@ fn main() {
     std::process::exit(dispatch(&args));
 }
 
+/// The first words `dispatch` takes as qx's own commands: `qx which git` is not `which git`.
+pub const SUBCOMMANDS: &[&str] = &[
+    "help", "version", "doctor", "bench", "deploy", "setup", "hook", "gain", "mcp", "serve", "which", "check",
+    "policy", "audit", "proxy",
+];
+
 fn dispatch(args: &[String]) -> i32 {
     let Some(first) = args.first() else {
         print_help();
@@ -75,6 +82,7 @@ fn dispatch(args: &[String]) -> i32 {
         "doctor" | "bench" => doctor::run(),
         "deploy" => deploy::run(&args[1..]),
         "setup" => setup::run(&args[1..]),
+        "hook" => hook::run(&args[1..]),
         "gain" => gain(),
         "mcp" | "serve" => mcp::serve(),
         "which" => which(&args[1..]),
@@ -385,6 +393,8 @@ fn emit(out: exec::Outcome, o: &RunOpts, label: &str) -> i32 {
                 let lossy = d.lossy();
                 (d.stdout, d.stderr, lossy, d.profile)
             }
+            // Claude Code shows this much of a Bash result itself: cutting below it only hides text.
+            None if claude_shows_whole(so.len() + se.len()) => (std::mem::take(&mut so), std::mem::take(&mut se), false, ""),
             None => {
                 let (a, cut) = compact::compact(&so, o.max_lines, o.head, o.tail);
                 let (b, cut_err) = compact::compact(&se, o.max_lines.min(120), o.head.min(50), o.tail.min(40));
@@ -422,6 +432,13 @@ fn emit(out: exec::Outcome, o: &RunOpts, label: &str) -> i32 {
         eprintln!("[qx] {} ms, exit {}", out.elapsed.as_millis(), out.code);
     }
     out.code
+}
+
+/// Inside Claude Code's shell (`CLAUDECODE` set), whether `bytes` of output fit the Bash tool's
+/// own limit (`BASH_MAX_OUTPUT_LENGTH` characters, 30000 by default). Bytes never undercount.
+fn claude_shows_whole(bytes: usize) -> bool {
+    std::env::var_os("CLAUDECODE").is_some()
+        && bytes <= std::env::var("BASH_MAX_OUTPUT_LENGTH").ok().and_then(|v| v.parse().ok()).unwrap_or(30_000)
 }
 
 fn stats_path() -> Option<PathBuf> {
@@ -638,6 +655,7 @@ USAGE
   qx deploy [--to PATH] [--dry-run]  install this build as the canonical qx.exe
   qx setup [all|CLIENT...] [--dry-run] [--remove]
                                      register qx in each agent CLI's config
+  qx hook claude                     Claude Code PreToolUse hook (`qx setup` registers it)
   qx which <command>...              show the real binary that will run
   qx gain                            output savings (needs QX_STATS=1)
   qx check <program|command>         dry-run the safety gate

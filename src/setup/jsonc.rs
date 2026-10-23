@@ -64,10 +64,96 @@ pub fn remove_member(text: &str, path: &[&str]) -> Result<String, String> {
     let Some(index) = list.iter().position(|m| m.key == key) else {
         return Ok(text.to_string());
     };
-    let target = &list[index];
-    // Drop one adjacent comma so the remaining list stays valid JSON.
-    let mut start = target.key_start;
-    let mut end = target.value_end;
+    Ok(cut(text, parent_start, list[index].key_start, list[index].value_end, index == 0))
+}
+
+/// An array's `[` and `]` offsets, and the byte range of each element.
+type Array = (Range<usize>, Vec<Range<usize>>);
+
+/// The array at `path`, or `None` when the member is absent.
+fn array(text: &str, path: &[&str]) -> Result<Option<Array>, String> {
+    let Some(range) = member(text, path)? else { return Ok(None) };
+    let b = text.as_bytes();
+    if b.get(range.start) != Some(&b'[') {
+        return Err(format!("{}: not an array", path.join(".")));
+    }
+    let mut i = range.start + 1;
+    let mut items = Vec::new();
+    loop {
+        skip(b, &mut i);
+        if b.get(i) == Some(&b']') {
+            return Ok(Some((range.start..i, items)));
+        }
+        let start = i;
+        value(b, &mut i, true)?;
+        items.push(start..i);
+        skip(b, &mut i);
+        match b.get(i) {
+            Some(b',') => i += 1,
+            Some(b']') => return Ok(Some((range.start..i, items))),
+            _ => return Err("expected ',' or ']'".into()),
+        }
+    }
+}
+
+/// The elements of the array at `path`, parsed; empty when it is absent.
+pub fn elements(text: &str, path: &[&str]) -> Result<Vec<Value>, String> {
+    let Some((_, items)) = array(text, path)? else { return Ok(Vec::new()) };
+    items
+        .into_iter()
+        .map(|r| serde_json::from_str(&to_strict_json(&text[r])).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// Append `value` to the array at `path`, creating the array when absent.
+pub fn push_element(text: &str, path: &[&str], value: &Value) -> Result<String, String> {
+    let Some((brackets, items)) = array(text, path)? else {
+        return set_member(text, path, &Value::Array(vec![value.clone()]));
+    };
+    let close_indent = line_indent(text, brackets.end);
+    let indent = items
+        .iter()
+        .map(|r| line_indent(text, r.start))
+        .find(|indent| indent.len() > close_indent.len())
+        .unwrap_or_else(|| format!("{close_indent}  "));
+    let mut out = String::with_capacity(text.len() + 256);
+    match items.last() {
+        // After the last element, so a trailing comma or comment stays where it was.
+        Some(last) => {
+            out.push_str(&text[..last.end]);
+            out.push_str(&format!(",
+{indent}{}", reindent(value, &indent)));
+            out.push_str(&text[last.end..]);
+        }
+        None => {
+            out.push_str(&text[..brackets.start + 1]);
+            out.push_str(&format!("
+{indent}{}
+{close_indent}", reindent(value, &indent)));
+            out.push_str(&text[brackets.end..]);
+        }
+    }
+    Ok(out)
+}
+
+/// Remove every element of the array at `path` that `drop` picks.
+pub fn remove_elements(text: &str, path: &[&str], drop: impl Fn(&Value) -> bool) -> Result<String, String> {
+    let Some((brackets, items)) = array(text, path)? else { return Ok(text.to_string()) };
+    let mut out = text.to_string();
+    // Back to front, so the ranges of the elements still to visit stay valid.
+    for (index, r) in items.iter().enumerate().rev() {
+        let v: Value = serde_json::from_str(&to_strict_json(&text[r.clone()])).map_err(|e| e.to_string())?;
+        if drop(&v) {
+            out = cut(&out, brackets.start, r.start, r.end, index == 0);
+        }
+    }
+    Ok(out)
+}
+
+/// `text` without `start..end`, one member or element of the object or array opening at
+/// `open`, and one adjacent comma, so the rest stays valid JSON.
+fn cut(text: &str, open: usize, start: usize, end: usize, first: bool) -> String {
+    let (mut start, mut end) = (start, end);
     let bytes = text.as_bytes();
     let mut after = end;
     skip(bytes, &mut after);
@@ -77,10 +163,10 @@ pub fn remove_member(text: &str, path: &[&str]) -> Result<String, String> {
         let mut tail = after + 1;
         skip(bytes, &mut tail);
         end = tail;
-    } else if index > 0 {
+    } else if !first {
         // Last member: remove the comma that separated it from the previous one.
         let mut back = start;
-        while back > parent_start {
+        while back > open {
             back -= 1;
             if bytes[back] == b',' {
                 start = back;
@@ -94,7 +180,7 @@ pub fn remove_member(text: &str, path: &[&str]) -> Result<String, String> {
     let mut out = String::with_capacity(text.len());
     out.push_str(&text[..start]);
     out.push_str(&text[end..]);
-    Ok(out)
+    out
 }
 
 /// Drop comments and trailing commas: every edit's result must parse as strict JSON.
@@ -588,5 +674,26 @@ mod tests {
         let v: Value = serde_json::from_str(&strict).unwrap();
         assert_eq!(v["servers"]["qx"]["type"], "local");
         assert_eq!(v["servers"]["other"]["x"], 1);
+    }
+
+    #[test]
+    fn arrays_grow_and_shrink_in_place() {
+        let src = "{\n  \"h\": {\n    \"A\": [\n      {\"m\": \"x\"}\n    ]\n  }\n}\n";
+        let out = push_element(src, &["h", "A"], &json!(2)).unwrap();
+        assert_eq!(out, "{\n  \"h\": {\n    \"A\": [\n      {\"m\": \"x\"},\n      2\n    ]\n  }\n}\n");
+        assert_eq!(elements(&out, &["h", "A"]).unwrap(), vec![json!({"m": "x"}), json!(2)]);
+        assert_eq!(remove_elements(&out, &["h", "A"], |v| v == &json!(2)).unwrap(), src);
+        let empty = remove_elements(&out, &["h", "A"], |_| true).unwrap();
+        assert_eq!(elements(&empty, &["h", "A"]).unwrap(), Vec::<Value>::new());
+        let refilled = push_element(&empty, &["h", "A"], &json!(1)).unwrap();
+        assert_eq!(elements(&refilled, &["h", "A"]).unwrap(), vec![json!(1)]);
+
+        // An absent array is created, next to the members already there.
+        let out = push_element(src, &["h", "B"], &json!(1)).unwrap();
+        let v: Value = serde_json::from_str(&to_strict_json(&out)).unwrap();
+        assert_eq!(v["h"]["B"], json!([1]));
+        assert_eq!(v["h"]["A"][0]["m"], "x");
+        assert!(out.contains("    ]"), "{out}");
+        assert!(push_element("{\"a\": 1}", &["a"], &json!(1)).is_err());
     }
 }

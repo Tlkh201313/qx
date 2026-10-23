@@ -26,9 +26,7 @@ pub struct Paths {
 
 impl Paths {
     pub fn from_env() -> Paths {
-        let home = std::env::var_os("USERPROFILE")
-            .map(PathBuf::from)
-            .unwrap_or_default();
+        let home = crate::resolve::home_dir().unwrap_or_default();
         let local_app_data = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join("AppData").join("Local"));
@@ -70,13 +68,20 @@ pub struct Change {
 /// One entry per client; editing a file twice for one client is a bug.
 pub fn plan(c: Client, p: &Paths, exe: &Path, a: Action) -> Result<Vec<Change>, String> {
     match c {
-        Client::ClaudeCode => Ok(vec![Change {
-            client: c,
-            file: claude_file(p),
-            edit: edit_json_file(claude_file(p).as_path(), &["mcpServers", "qx"], |existing| {
-                claude_entry(exe, existing)
-            }, a),
-        }]),
+        Client::ClaudeCode => Ok(vec![
+            Change {
+                client: c,
+                file: claude_file(p),
+                edit: edit_json_file(claude_file(p).as_path(), &["mcpServers", "qx"], |existing| {
+                    claude_entry(exe, existing)
+                }, a),
+            },
+            Change {
+                client: c,
+                file: claude_settings(p),
+                edit: edit_claude_hook(&claude_settings(p), exe, a),
+            },
+        ]),
         Client::OpenCode => {
             let (file, alternative) = opencode_file(p);
             let path: &[&str] = &["mcp", "servers", "qx"];
@@ -135,6 +140,59 @@ pub fn plan(c: Client, p: &Paths, exe: &Path, a: Action) -> Result<Vec<Change>, 
 
 fn claude_file(p: &Paths) -> PathBuf {
     p.home.join(".claude.json")
+}
+
+/// The hooks live in the user settings, not next to the MCP servers in `.claude.json`.
+fn claude_settings(p: &Paths) -> PathBuf {
+    p.home.join(".claude").join("settings.json")
+}
+
+const PRE_TOOL_USE: &[&str] = &["hooks", "PreToolUse"];
+
+/// The PreToolUse group that sends Claude's own Bash and PowerShell commands through qx.
+/// The exec form (`args`) starts qx without a shell, so the hook costs one process start.
+fn claude_hook(exe: &Path) -> Value {
+    json!({
+        "matcher": "Bash|PowerShell",
+        "hooks": [{"type": "command", "command": exe.to_string_lossy(), "args": ["hook", "claude"], "timeout": 10}],
+    })
+}
+
+/// A group that holds only a `qx hook claude` entry, from this build or an older one.
+fn is_qx_hook(group: &Value) -> bool {
+    let Some([hook]) = group["hooks"].as_array().map(Vec::as_slice) else { return false };
+    let qx = Path::new(hook["command"].as_str().unwrap_or_default())
+        .file_stem()
+        .is_some_and(|s| s.eq_ignore_ascii_case("qx"));
+    qx && hook["args"] == json!(["hook", "claude"])
+}
+
+fn edit_claude_hook(file: &Path, exe: &Path, a: Action) -> Edit {
+    let current = match read_optional(file) {
+        Ok(Some(text)) => text,
+        Ok(None) if a == Action::Remove => return Edit::Unchanged,
+        Ok(None) => "{}
+".to_string(),
+        Err(e) => return Edit::Refuse(e),
+    };
+    let want = claude_hook(exe);
+    let ours: Vec<Value> = match jsonc::elements(&current, PRE_TOOL_USE) {
+        Ok(groups) => groups.into_iter().filter(is_qx_hook).collect(),
+        Err(e) => return Edit::Refuse(format!("{}: {e}", file.display())),
+    };
+    if a == Action::Install && ours == [want.clone()] {
+        return Edit::Unchanged;
+    }
+    let updated = jsonc::remove_elements(&current, PRE_TOOL_USE, is_qx_hook).and_then(|text| match a {
+        Action::Install => jsonc::push_element(&text, PRE_TOOL_USE, &want),
+        Action::Remove => Ok(text),
+    });
+    match updated {
+        Ok(text) if text == current => Edit::Unchanged,
+        Ok(text) if parse_strict(&text).is_some() => Edit::Changed(text),
+        Ok(_) => Edit::Refuse(format!("the edit would leave {} unparseable; edit it by hand", file.display())),
+        Err(e) => Edit::Refuse(format!("{}: {e}", file.display())),
+    }
 }
 
 /// Whichever OpenCode file already holds qx, else the first that exists, else `opencode.json`.
@@ -325,6 +383,13 @@ pub fn status(c: Client, p: &Paths) -> Status {
         Client::ClaudeCode => {
             let file = claude_file(p);
             let command = read_json_command(&file, &["mcpServers", "qx", "command"]);
+            let hooked = std::fs::read_to_string(claude_settings(p))
+                .ok()
+                .and_then(|text| jsonc::elements(&text, PRE_TOOL_USE).ok())
+                .is_some_and(|groups| groups.iter().any(is_qx_hook));
+            if !hooked {
+                notes.push("no `qx hook claude` PreToolUse hook: Claude's own Bash/PowerShell bypass qx".into());
+            }
             (Some(file), command)
         }
         Client::OpenCode => {
@@ -572,6 +637,46 @@ mod tests {
         std::fs::write(&file, &text).unwrap();
         let again = plan(Client::ClaudeCode, &p, exe, Action::Install).unwrap();
         assert!(matches!(again[0].edit, Edit::Unchanged));
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn claude_hook_joins_the_others_and_replaces_only_its_own() {
+        let p = paths("claude-hook");
+        let file = claude_settings(&p);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let rtk = r#"{"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk hook claude"}]}"#;
+        let stale = r#"{"matcher": "Bash", "hooks": [{"type": "command", "command": "C:/old/qx.exe", "args": ["hook", "claude"]}]}"#;
+        std::fs::write(&file, format!("{{
+  \"hooks\": {{
+    \"PreToolUse\": [
+      {rtk},
+      {stale}
+    ]
+  }},
+  \"model\": \"x\"
+}}
+")).unwrap();
+        let exe = Path::new(r"C:
+ew\qx.exe");
+        let text = changed(&edit_claude_hook(&file, exe, Action::Install)).expect("an update").to_string();
+        assert!(text.contains(rtk), "other hooks keep their bytes: {text}");
+        let groups = jsonc::elements(&text, PRE_TOOL_USE).unwrap();
+        assert_eq!(groups.len(), 2, "the stale qx hook is replaced, not duplicated");
+        assert_eq!(groups[1], claude_hook(exe));
+        assert_eq!(parse_strict(&text).unwrap()["model"], "x");
+
+        std::fs::write(&file, &text).unwrap();
+        assert!(matches!(edit_claude_hook(&file, exe, Action::Install), Edit::Unchanged));
+        let removed = changed(&edit_claude_hook(&file, exe, Action::Remove)).expect("a removal").to_string();
+        assert_eq!(jsonc::elements(&removed, PRE_TOOL_USE).unwrap().len(), 1);
+        assert!(removed.contains(rtk));
+
+        // No settings file yet: one is created holding just the hook.
+        std::fs::remove_file(&file).unwrap();
+        let fresh = changed(&edit_claude_hook(&file, exe, Action::Install)).expect("a new file").to_string();
+        assert_eq!(jsonc::elements(&fresh, PRE_TOOL_USE).unwrap(), vec![claude_hook(exe)]);
+        assert!(matches!(edit_claude_hook(&file, exe, Action::Remove), Edit::Unchanged));
         let _ = std::fs::remove_dir_all(&p.home);
     }
 
