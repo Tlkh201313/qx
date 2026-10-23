@@ -165,7 +165,10 @@ fn bash_edits(cmd: &str) -> Option<Vec<(Range<usize>, String)>> {
         let mut words = s.words.iter().map(|r| &cmd[r.clone()]);
         words.find(|w| !is_assignment(w) && !matches!(*w, "!" | "time" | "-p"))
     };
-    if stages.iter().any(|s| first(s).is_some_and(|w| SHADOWING_WORDS.contains(&w))) {
+    // `exec >log` sends the output of every later command to the file, past any per-stage view;
+    // `PATH=..` changes what the shell finds as `qx` before qx runs anything.
+    let sets_path = |s: &Stage| s.words.iter().any(|r| cmd[r.clone()].starts_with("PATH=") || cmd[r.clone()].starts_with("PATH+="));
+    if stages.iter().any(|s| first(s).is_some_and(|w| SHADOWING_WORDS.contains(&w) || w == "exec") || sets_path(s)) {
         return None;
     }
     let compound = stages.iter().any(|s| first(s).is_some_and(|w| COMPOUND_WORDS.contains(&w)));
@@ -503,7 +506,7 @@ fn plan(cmd: &str, stage: &Stage, compound: bool) -> Option<(Range<usize>, Strin
     // A `$var` or `` `cmd` `` may expand to such a path, which only the shell sees.
     let same_args = via_rtk || !msys_tool(program) || !args.iter().any(|a| msys_converts(a) || a.contains(['$', '`']));
     // Streamed output gains only where qx starts the program faster than the shell (or rtk) does.
-    let ok = accelerated(name) || ((whole || via_rtk) && plain_name(name) && known_program(name) && same_args);
+    let ok = accelerated(name) || ((whole || via_rtk) && plain_name(name) && known_program(name, false) && same_args);
     if !ok {
         return None;
     }
@@ -544,11 +547,13 @@ fn program_name(word: &str) -> Option<&str> {
     (!w.is_empty() && !w.contains(['$', '`', '*', '?', '\'', '"', '~'])).then_some(w)
 }
 
-/// A program qx runs itself: a built-in, or one it resolves the way the shell would.
-/// A name it cannot find may be a shell alias or function, which only the shell knows.
-fn known_program(name: &str) -> bool {
-    use crate::resolve::{resolve, Target};
-    crate::builtin::is_builtin(name) || matches!(resolve(name, None), Target::Direct { .. } | Target::Shim(_))
+/// A program the shell would find and qx resolves the same way. A name it cannot find may be a
+/// shell alias or function, which only the shell knows. A qx built-in alone is not enough: the
+/// shell answers "not found" for `del` in Git Bash or `head` in PowerShell, `qx del` would run.
+fn known_program(name: &str, powershell: bool) -> bool {
+    use crate::resolve::{find_on_path, resolve, Target};
+    // Git Bash has Git's coreutils on its PATH, which `resolve` falls back to.
+    (!powershell || find_on_path(name).is_some()) && matches!(resolve(name, None), Target::Direct { .. } | Target::Shim(_))
 }
 
 /// Whether qx starts this program measurably faster than the shell does, which pays for
@@ -673,7 +678,7 @@ fn rewrite_powershell(cmd: &str) -> Option<String> {
     }
     for stmt in stmts {
         let text = &cmd[stmt.clone()];
-        if powershell_target(text).is_some_and(known_program) {
+        if powershell_target(text).is_some_and(|p| known_program(p, true)) {
             let at = stmt.start + (text.len() - text.trim_start().len());
             out.push_str(&cmd[last..at]);
             out.push_str("qx ");
@@ -827,38 +832,66 @@ struct Rules {
 }
 
 impl Rules {
-    /// `None` when a settings file cannot be read as JSON: it may hold a deny rule.
+    /// `None` when a settings file or policy exists but cannot be read as JSON: it may hold a
+    /// deny rule.
     fn load(cwd: Option<&Path>) -> Option<Rules> {
-        let mut files: Vec<PathBuf> = Vec::new();
-        if let Some(home) = crate::resolve::home_dir() {
-            files.push(home.join(".claude"));
-        }
-        // The settings Claude Code itself reads, wherever the command later `cd`s to.
         let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-        files.extend(var("CLAUDE_CONFIG_DIR"));
-        files.extend(var("CLAUDE_PROJECT_DIR").map(|p| p.join(".claude")));
-        // Project settings sit at the project root, which may be any ancestor of the cwd.
-        files.extend(cwd.into_iter().flat_map(Path::ancestors).map(|d| d.join(".claude")));
-        if let Some(pf) = std::env::var_os("ProgramFiles") {
-            files.push(Path::new(&pf).join("ClaudeCode"));
+        let home = crate::resolve::home_dir().map(|h| h.join(".claude"));
+        let project = var("CLAUDE_PROJECT_DIR").map(|p| p.join(".claude"));
+        // Allow rules only from the files Claude Code reads for this session: a rule it does
+        // not read would approve `qx git push` where Claude Code itself still asks.
+        let mut trusted: Vec<PathBuf> = Vec::new();
+        trusted.extend(var("CLAUDE_CONFIG_DIR").or(home.clone()).map(|d| d.join("settings.json")));
+        if let Some(p) = &project {
+            trusted.extend([p.join("settings.json"), p.join("settings.local.json")]);
         }
-        files.sort();
-        files.dedup();
+        if let Some(dir) = managed_dir() {
+            trusted.push(dir.join("managed-settings.json"));
+            let drop_ins = std::fs::read_dir(dir.join("managed-settings.d")).into_iter().flatten();
+            let mut drop_ins: Vec<PathBuf> = drop_ins.filter_map(|e| Some(e.ok()?.path())).collect();
+            drop_ins.retain(|p| {
+                p.extension().is_some_and(|e| e == "json") && !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'))
+            });
+            trusted.extend(drop_ins);
+        }
+        // Deny and ask rules from anywhere they may be: an extra one only leaves a line as written.
+        let mut extra: Vec<PathBuf> = Vec::new();
+        let dirs = home.into_iter().chain(var("CLAUDE_CONFIG_DIR"));
+        // Wherever the command later `cd`s to, and whichever ancestor is the project root.
+        let dirs = dirs.chain(cwd.into_iter().flat_map(Path::ancestors).map(|d| d.join(".claude")));
+        for d in dirs {
+            extra.extend([d.join("settings.json"), d.join("settings.local.json")]);
+        }
+        extra.retain(|f| !trusted.contains(f));
+        extra.sort();
+        extra.dedup();
+
         let mut rules = Rules { patterns: Vec::new(), allow: Vec::new(), rtk: false };
-        for dir in files {
-            for name in ["settings.json", "settings.local.json", "managed-settings.json"] {
-                let Ok(text) = std::fs::read_to_string(dir.join(name)) else { continue };
-                rules.rtk |= text.contains("rtk hook claude") || text.contains("rtk-rewrite");
-                let strict = crate::setup::jsonc::to_strict_json(&text);
-                let v = serde_json::from_str::<Value>(&strict).ok()?;
-                let list = |key: &str| {
-                    let list = v["permissions"][key].as_array().into_iter().flatten();
-                    list.filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>()
-                };
-                rules.patterns.extend(list("deny"));
-                rules.patterns.extend(list("ask"));
+        let texts = trusted.iter().map(|f| (true, f)).chain(extra.iter().map(|f| (false, f)));
+        let mut add = |text: &str, allow: bool| -> Option<()> {
+            rules.rtk |= text.contains("rtk hook claude") || text.contains("rtk-rewrite");
+            let v = serde_json::from_str::<Value>(&crate::setup::jsonc::to_strict_json(text)).ok()?;
+            let list = |key: &str| {
+                let list = v["permissions"][key].as_array().into_iter().flatten();
+                list.filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>()
+            };
+            rules.patterns.extend(list("deny"));
+            rules.patterns.extend(list("ask"));
+            if allow {
                 rules.allow.extend(list("allow"));
             }
+            Some(())
+        };
+        for (allow, file) in texts {
+            match std::fs::read(file) {
+                // Lossy, as Claude Code reads it: a stray cp1252 byte must not hide the file's rules.
+                Ok(bytes) => add(&String::from_utf8_lossy(&bytes), allow)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+        }
+        for policy in registry_policies()? {
+            add(&policy, false)?;
         }
         Some(rules)
     }
@@ -873,17 +906,20 @@ impl Rules {
         a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| self.allows(tool, x) && self.allows(tool, y))
     }
 
-    /// `Tool`, `Tool(exact)`, `Tool(prefix:*)` and `Tool(glob *)` allow rules.
+    /// `Tool`, `Tool(exact)`, `Tool(prefix:*)` and `Tool(glob *)` allow rules, matched the way
+    /// Claude Code matches them: `x:*` is `x *`, which also takes a bare `x` but not `xy`.
+    /// PowerShell rules ignore case.
     fn allows(&self, tool: &str, command: &str) -> bool {
+        let fold = |s: &str| if tool == "PowerShell" { s.to_ascii_lowercase() } else { s.to_string() };
+        let command = fold(command);
         self.allow.iter().any(|rule| {
             let Some(rest) = rule.strip_prefix(tool) else { return false };
             let Some(pat) = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')')) else {
                 return rest.is_empty();
             };
-            match pat.strip_suffix(":*") {
-                Some(prefix) => glob(&format!("{prefix}*"), command),
-                None => glob(pat, command),
-            }
+            let pat = fold(&pat.strip_suffix(":*").map_or(pat.to_string(), |p| format!("{p} *")));
+            let bare = pat.strip_suffix(" *").filter(|p| !p.contains('*'));
+            bare == Some(command.as_str()) || glob(&pat, &command)
         })
     }
 
@@ -891,10 +927,14 @@ impl Rules {
     /// command as Claude wrote it: after a rewrite Claude Code would match `qx ...` instead.
     /// Over-matching is harmless, it only leaves the command unwrapped, so a rule matches
     /// anywhere in the line (`cd x && git push` still meets `Bash(git push:*)`).
+    /// Case is ignored too: PowerShell rules do, and `GIT push` runs git all the same.
     fn restricts(&self, tool: &str, command: &str) -> bool {
+        let command = command.to_ascii_lowercase();
         self.patterns.iter().any(|rule| {
             // Claude Code also holds `cat .env` to a `Read(./.env)` rule; `qx cat .env` escapes it.
-            if ["Read", "Edit", "Write"].iter().any(|t| rule.split('(').next() == Some(*t)) {
+            let name = rule.split('(').next().unwrap_or(rule);
+            // A tool-name glob (`*`, `B*`) may name this tool.
+            if ["Read", "Edit", "Write"].contains(&name) || (name.contains('*') && glob(name, tool)) {
                 return true;
             }
             let Some(rest) = rule.strip_prefix(tool) else { return false };
@@ -905,9 +945,77 @@ impl Rules {
                 return false;
             };
             let pat = pat.strip_suffix(":*").unwrap_or(pat).trim_end_matches('*').trim_end();
-            glob(&format!("*{pat}*"), command)
+            glob(&format!("*{}*", pat.to_ascii_lowercase()), &command)
         })
     }
+}
+
+/// The system directory Claude Code reads managed settings files from.
+fn managed_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("ProgramFiles").map(|pf| Path::new(&pf).join("ClaudeCode"))
+    } else if cfg!(target_os = "macos") {
+        Some(PathBuf::from("/Library/Application Support/ClaudeCode"))
+    } else {
+        Some(PathBuf::from("/etc/claude-code"))
+    }
+}
+
+/// The JSON policies in `SOFTWARE\Policies\ClaudeCode\Settings` under `HKLM` and `HKCU`, which
+/// Claude Code reads as managed settings; `None` when one exists but cannot be read.
+#[cfg(windows)]
+fn registry_policies() -> Option<Vec<String>> {
+    use std::ffi::c_void;
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            key: isize,
+            sub_key: *const u16,
+            value: *const u16,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut c_void,
+            len: *mut u32,
+        ) -> i32;
+    }
+    const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
+    const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
+    // REG_SZ or REG_EXPAND_SZ, as written: expanding needs nothing a rule could hide in.
+    const FLAGS: u32 = 0x2 | 0x4 | 0x1000_0000;
+    const NOT_FOUND: [i32; 2] = [2, 3];
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (sub, value) = (wide(r"SOFTWARE\Policies\ClaudeCode"), wide("Settings"));
+    let mut out = Vec::new();
+    for root in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
+        let null = std::ptr::null_mut();
+        let mut len = 0u32;
+        // SAFETY: NUL-terminated names; a null buffer asks only for the size.
+        let rc = unsafe { RegGetValueW(root, sub.as_ptr(), value.as_ptr(), FLAGS, null, null.cast(), &mut len) };
+        if NOT_FOUND.contains(&rc) {
+            continue;
+        }
+        if rc != 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; (len as usize).div_ceil(2)];
+        // SAFETY: `buf` holds `len` bytes.
+        let rc = unsafe { RegGetValueW(root, sub.as_ptr(), value.as_ptr(), FLAGS, null, buf.as_mut_ptr().cast(), &mut len) };
+        if rc != 0 {
+            return None;
+        }
+        buf.truncate(len as usize / 2);
+        let text = String::from_utf16_lossy(&buf);
+        let text = text.trim_end_matches('\0');
+        if !text.trim().is_empty() {
+            out.push(text.to_string());
+        }
+    }
+    Some(out)
+}
+
+#[cfg(not(windows))]
+fn registry_policies() -> Option<Vec<String>> {
+    Some(Vec::new())
 }
 
 /// The texts `Rules::allows_both` checks: the whole line, then per command its text from the
@@ -958,7 +1066,7 @@ mod tests {
     #[test]
     fn bash_wraps_plain_commands() {
         for (cmd, want) in [
-            // Built-ins, so the cases do not depend on what this machine has on PATH.
+            // Git's coreutils, which every Git Bash has.
             ("cat x.py", Some("qx cat x.py")),
             ("cd src && wc -l a.rs", Some("cd src && qx wc -l a.rs")),
             ("FOO=1 head a.js", Some("FOO=1 qx head a.js")),
@@ -1030,6 +1138,14 @@ mod tests {
             ("function head { :; }; head a", None),
             ("eval \"$X\"; head a", None),
             ("source env.sh && head a", None),
+            // cmd.exe names are qx built-ins, but Git Bash answers "command not found".
+            ("del a.txt", None),
+            ("copy a b", None),
+            // The shell would look for `qx` itself on the new PATH.
+            ("PATH=/usr/bin head a", None),
+            ("export PATH=/x:$PATH; head a", None),
+            // Every later command's output goes to the file.
+            ("exec >log; head a", None),
         ] {
             assert_eq!(rewrite_bash(cmd).as_deref(), want, "{cmd}");
         }
@@ -1157,6 +1273,12 @@ mod tests {
         assert!(all.allows_both("Bash", "git push", "qx git push"));
         let ps = Rules { patterns: vec![], allow: vec!["PowerShell(qx:*)".into()], rtk: false };
         assert!(!ps.allows_both("PowerShell", "cd x; git push", "cd x; qx git push"));
+        // `x:*` ends at a word: `git:*` takes `git` and `git log`, not `git-lfs`.
+        let git = Rules { patterns: vec![], allow: vec!["Bash(git:*)".into(), "PowerShell(git status:*)".into()], rtk: false };
+        assert!(git.allows("Bash", "git") && git.allows("Bash", "git log -5"));
+        assert!(!git.allows("Bash", "git-lfs pull") && !git.allows("Bash", "gitk"));
+        assert!(git.allows("PowerShell", "GIT Status -s"));
+        assert!(!git.allows("Bash", "GIT status"));
     }
 
     #[test]
@@ -1179,6 +1301,11 @@ mod tests {
         // `cat .env` is held to Read rules; `qx cat .env` would not be.
         let read = Rules { patterns: vec!["Read(./.env)".into()], allow: vec![], rtk: false };
         assert!(read.restricts("Bash", "cat notes.txt"));
+        // Windows finds `GIT` as git; a tool glob names every tool it matches.
+        let ps = Rules { patterns: vec!["PowerShell(git push:*)".into()], allow: vec![], rtk: false };
+        assert!(ps.restricts("PowerShell", "GIT Push origin"));
+        let any = Rules { patterns: vec!["*".into()], allow: vec![], rtk: false };
+        assert!(any.restricts("Bash", "ls"));
     }
 
     /// Replays real commands (`QX_HOOK_CORPUS`: a JSON list of `{"tool", "command"}`) and writes

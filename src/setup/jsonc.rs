@@ -223,9 +223,13 @@ pub fn to_strict_json(text: &str) -> String {
                 }
                 i += 1;
             }
-            other => {
-                out.push(other as char);
-                i += 1;
+            _ => {
+                // Whole characters: a byte-wise copy turns a BOM into `ï»¿`, which no parser takes.
+                let ch = text[i..].chars().next().unwrap_or('\0');
+                if ch != '\u{feff}' {
+                    out.push(ch);
+                }
+                i += ch.len_utf8();
             }
         }
     }
@@ -683,6 +687,9 @@ mod tests {
         // A //-comment inside a string is not a comment.
         let v: Value = serde_json::from_str(&to_strict_json(r#"{"u":"http://x"}"#)).unwrap();
         assert_eq!(v["u"], "http://x");
+        // A BOM (Notepad writes one) and non-ASCII outside strings survive as characters.
+        let v: Value = serde_json::from_str(&to_strict_json("\u{feff}{\"a\": \"caf\u{e9}\" /* \u{4e2d} */}")).unwrap();
+        assert_eq!(v["a"], "caf\u{e9}");
     }
 
     #[test]
