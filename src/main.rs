@@ -12,12 +12,14 @@ mod fsops;
 mod fuzz;
 mod guard;
 mod hook;
+mod index;
 mod mcp;
 mod npm;
 mod python;
 mod redact;
 mod resolve;
 mod setup;
+mod warmup;
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;

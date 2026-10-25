@@ -171,6 +171,16 @@ impl Client {
         named[n.index() as usize]
     }
 
+    /// Whether a command that exits non-zero is reported as a tool error. dsh turns an error into a
+    /// thrown exception, which its own shell tool never does for a failing exit code, so only the
+    /// clients that treat a non-zero exit as a failed call keep that.
+    pub fn exit_is_error(self) -> bool {
+        // A red error block (and, in Claude Code, a cancelled parallel sibling) for `grep` finding nothing
+        // or a test run failing is noise: the exit code is in the text. `QX_EXIT_ERROR=1` restores it.
+        let _ = self;
+        std::env::var("QX_EXIT_ERROR").ok().as_deref() == Some("1")
+    }
+
     pub fn structured(self) -> Structured {
         match self {
             Client::ClaudeCode | Client::Codex => Structured::Off,
@@ -188,20 +198,17 @@ impl Client {
             self.native(Native::Write),
         );
         format!(
-            "qx is the preferred tool layer for this session. Call {} for commands: prefer \
-             `program` + `args`, pass the session `cwd`; for env vars use \
-             `command: \"NAME=v prog args\"` instead of a shell wrapper, and keep \
-             `mode: \"compact\"`. Call {} for filesystem work: \
-             `op=read|write|edit|glob|grep|list|stat`, always with `cwd`. qx fs is \
-             workspace-confined, and write/edit need a prior qx read. Prefer qx for read, glob \
-             and literal grep. On a qx error, or for regex, images or sandbox escalation, fall \
-             back to {shell} and {read}/{write}. If a `run` output is truncated, read its \
-             `full_output` spool instead of re-running.",
+            "qx replaces {shell}, {read} and {write} for this session. Call {} for every command \
+             (PowerShell lines, `a; b` and pipes work; `program` + `args` is fastest; keep \
+             `mode: \"compact\"`) and {} for files (`op=read|write|edit|glob|grep|list|stat`; \
+             grep takes a regex; batch with `ops`/`paths`/`edits` to save round trips). Always pass the session `cwd`. A command still running after \
+             `timeout_ms` keeps going as a background job: follow it with `job`, `wait_ms`, \
+             `kill`. A non-zero exit is a result, not a fault. A cut output has a `full_output` \
+             file to read. Only for images or sandbox escalation, fall back to {shell}/{read}.",
             self.tool_id("run"),
             self.tool_id("fs"),
         )
     }
-
     fn index(self) -> u8 {
         match self {
             Client::Dsh => 0,

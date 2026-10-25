@@ -128,6 +128,19 @@ fn collapse(lines: &[&str]) -> (Vec<String>, usize) {
     (out, collapsed)
 }
 
+/// A line that ends in a file name or holds a path: a listing (`img_001.png` ... `img_260.png`) is data the
+/// reader needs entry by entry, unlike a progress counter.
+fn names_a_file(line: &str) -> bool {
+    let last = line.split_whitespace().last().unwrap_or("");
+    if last.contains(['/', '\\']) {
+        return true;
+    }
+    match last.rsplit_once('.') {
+        Some((stem, ext)) => !stem.is_empty() && (1..=5).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()) && ext.chars().any(|c| c.is_ascii_alphabetic()),
+        None => false,
+    }
+}
+
 /// Runs of 8+ lines that differ only in their digits (progress counters,
 /// timestamps) keep the first and last line plus a count. Only used over budget,
 /// where head/tail would drop them anyway; diagnostics are never collapsed.
@@ -158,7 +171,7 @@ fn collapse_similar(lines: Vec<String>) -> (Vec<String>, bool) {
         while j < keys.len() && keys[j] == keys[i] {
             j += 1;
         }
-        if j - i >= 8 && keys[i].contains('#') && !interesting(&lines[i]) {
+        if j - i >= 8 && keys[i].contains('#') && !interesting(&lines[i]) && !names_a_file(&lines[i]) {
             out.push(lines[i].clone());
             out.push(format!("[qx] ... {} similar lines (only digits differ) ...", j - i - 2));
             out.push(lines[j - 1].clone());
@@ -228,6 +241,48 @@ pub fn spool(stdout: &str, stderr: &str) -> Option<std::path::PathBuf> {
     }
     std::fs::write(&path, body).ok()?;
     Some(path)
+}
+
+/// Cargo build-script chatter: the `cargo:rerun-if-*` directives and the `NAME = None` lines that follow
+/// them print when a build script panics, dozens of lines saying nothing about why. Dropped only when
+/// there are four or more, with a count; returns how many lines went.
+pub fn drop_build_noise(text: &mut String) -> usize {
+    let is_directive = |l: &str| {
+        let l = l.trim_start();
+        l.starts_with("cargo:rerun-if-") || l.starts_with("cargo::rerun-if-")
+    };
+    let is_env_value = |l: &str| {
+        let Some((name, value)) = l.trim().split_once(" = ") else { return false };
+        !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            && (value == "None" || (value.starts_with("Some(") && value.ends_with(')')))
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let directives = lines.iter().filter(|l| is_directive(l)).count();
+    if directives < 4 {
+        return 0;
+    }
+    let mut kept = String::with_capacity(text.len());
+    let mut dropped = 0;
+    let mut prev_dropped = false;
+    for l in &lines {
+        if is_directive(l) {
+            dropped += 1;
+            prev_dropped = true;
+            continue;
+        }
+        if prev_dropped && is_env_value(l) {
+            dropped += 1;
+            prev_dropped = false;
+            continue;
+        }
+        prev_dropped = false;
+        kept.push_str(l);
+        kept.push('\n');
+    }
+    kept.push_str(&format!("[qx] {dropped} cargo build-script lines omitted\n"));
+    *text = kept;
+    dropped
 }
 
 /// `relative_paths` on both streams of a digested build/test/traceback, with a
@@ -580,4 +635,18 @@ mod tests {
         assert!(cut && out.contains("...[+1000 chars]"), "{out}");
         assert!(!compact("short\n", 200, 80, 60).1);
     }
-}
+
+    #[test]
+    fn build_script_chatter_goes_but_the_panic_stays() {
+        let mut s = String::new();
+        for i in 0..6 {
+            s.push_str(&format!("  cargo:rerun-if-env-changed=V{i}\n  V{i} = None\n"));
+        }
+        s.push_str("  Y = Some(\"x\")\nthread 'main' panicked at b.rs:1:1:\nUnable to find libclang\n");
+        let n = drop_build_noise(&mut s);
+        assert_eq!(n, 12);
+        assert!(s.contains("Unable to find libclang") && s.contains("Y = Some"), "{s}");
+        assert!(!s.contains("rerun-if") && s.contains("12 cargo build-script lines omitted"), "{s}");
+        let mut few = "cargo:rerun-if-changed=a\nV = None\n".to_string();
+        assert_eq!(drop_build_noise(&mut few), 0);
+    }}

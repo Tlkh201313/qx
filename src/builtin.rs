@@ -36,7 +36,16 @@ pub fn try_exec(program: &str, args: &[String], cwd: Option<&Path>, envs: &[(Str
     }
 
     let start = Instant::now();
-    let name = program.to_ascii_lowercase();
+    let mut name = program.to_ascii_lowercase();
+    // PowerShell cmdlets with a POSIX twin run as that twin: no 50-90 ms for a shell to read a file.
+    let translated = ps_cmdlet(&name, args);
+    let args: &[String] = match &translated {
+        Some((n, a)) => {
+            name = (*n).to_string();
+            a
+        }
+        None => args,
+    };
     if PATHY.contains(&name.as_str()) && args.iter().any(|a| a.starts_with('/')) {
         return None;
     }
@@ -71,6 +80,15 @@ pub fn try_exec(program: &str, args: &[String], cwd: Option<&Path>, envs: &[(Str
         "seq" => cmd_seq(args),
         "sleep" => cmd_sleep(args),
         "clear" | "cls" => Some(ok("\x1b[2J\x1b[H".to_string())),
+        "test-path" => cmd_test_path(args, cwd),
+        "write-output" | "write-host" => {
+            if args.iter().any(|a| a.starts_with('-')) {
+                None
+            } else {
+                let sep = if name == "write-host" { " " } else { "\n" };
+                Some(ok(format!("{}\n", args.join(sep))))
+            }
+        }
         _ => None,
     }?;
     out.elapsed = start.elapsed();
@@ -81,8 +99,81 @@ pub fn try_exec(program: &str, args: &[String], cwd: Option<&Path>, envs: &[(Str
 pub const NAMES: &[&str] = &[
     "pwd", "echo", "true", "false", "ls", "dir", "cat", "type", "head", "tail", "wc", "mkdir", "rm",
     "del", "erase", "cp", "copy", "mv", "move", "touch", "which", "basename", "dirname", "realpath",
-    "whoami", "hostname", "seq", "sleep", "clear", "cls", "grep", "sed",
+    "whoami", "hostname", "seq", "sleep", "clear", "cls", "grep", "sed", "start-sleep", "get-content", "gc",
+    "test-path", "write-output", "write-host",
 ];
+
+/// `Start-Sleep` and `Get-Content` spelled as the built-in that does the same. Any parameter that is
+/// not understood returns None, and the real cmdlet runs.
+fn ps_cmdlet(name: &str, args: &[String]) -> Option<(&'static str, Vec<String>)> {
+    let mut it = args.iter();
+    match name {
+        "start-sleep" => {
+            let mut secs: Option<f64> = None;
+            while let Some(a) = it.next() {
+                let low = a.to_ascii_lowercase();
+                let ms = matches!(low.as_str(), "-m" | "-ms" | "-milliseconds");
+                if ms || matches!(low.as_str(), "-s" | "-seconds") {
+                    let v: f64 = it.next()?.parse().ok()?;
+                    secs = Some(if ms { v / 1000.0 } else { v });
+                } else if secs.is_none() && !a.starts_with('-') {
+                    secs = Some(a.parse().ok()?);
+                } else {
+                    return None;
+                }
+            }
+            Some(("sleep", vec![secs?.to_string()]))
+        }
+        "get-content" | "gc" => {
+            let (mut path, mut head, mut tail) = (None, None, None);
+            let mut args_it = args.iter();
+            while let Some(a) = args_it.next() {
+                let low = a.to_ascii_lowercase();
+                match low.as_str() {
+                    "-path" | "-literalpath" | "-lp" => path = Some(args_it.next()?.clone()),
+                    "-totalcount" | "-head" | "-first" => head = Some(args_it.next()?.clone()),
+                    "-tail" | "-last" => tail = Some(args_it.next()?.clone()),
+                    "-raw" => {}
+                    _ if a.starts_with('-') || path.is_some() => return None,
+                    _ => path = Some(a.clone()),
+                }
+            }
+            let path = path?;
+            match (head, tail) {
+                (Some(n), None) => Some(("head", vec!["-n".into(), n, path])),
+                (None, Some(n)) => Some(("tail", vec!["-n".into(), n, path])),
+                (None, None) => Some(("cat", vec![path])),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn cmd_test_path(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
+    let (mut path, mut kind) = (None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.to_ascii_lowercase().as_str() {
+            "-path" | "-literalpath" | "-lp" => path = Some(it.next()?.clone()),
+            "-pathtype" => kind = Some(it.next()?.to_ascii_lowercase()),
+            _ if a.starts_with('-') || path.is_some() => return None,
+            _ => path = Some(a.clone()),
+        }
+    }
+    let path = path?;
+    if wildcard(&path) || path.contains('[') {
+        return None;
+    }
+    let p = path_of(cwd, &path);
+    let yes = match kind.as_deref() {
+        None | Some("any") => p.exists(),
+        Some("leaf") => p.is_file(),
+        Some("container") => p.is_dir(),
+        _ => return None,
+    };
+    Some(ok(format!("{}\n", if yes { "True" } else { "False" })))
+}
 
 /// Names that take file paths. A `/x` argument is a cmd.exe switch (`dir /b`) or an MSYS path
 /// (`/tmp/x`); neither is a Windows path, so the real tool gets it.
@@ -2701,4 +2792,18 @@ mod tests {
         oracle_missing(&format!("the real tool could not start here ({})", last.2.trim()));
         None
     }
-}
+
+    #[test]
+    fn powershell_cmdlets_run_as_their_posix_twins() {
+        let (n, a) = ps_cmdlet("get-content", &["-Path".into(), "f.txt".into(), "-TotalCount".into(), "3".into()]).unwrap();
+        assert_eq!((n, a), ("head", vec!["-n".to_string(), "3".into(), "f.txt".into()]));
+        assert_eq!(ps_cmdlet("get-content", &["f".into()]).unwrap().0, "cat");
+        assert!(ps_cmdlet("get-content", &["f".into(), "-Encoding".into(), "UTF8".into()]).is_none());
+        assert_eq!(ps_cmdlet("start-sleep", &["-Milliseconds".into(), "500".into()]).unwrap().1, vec!["0.5".to_string()]);
+        assert!(ps_cmdlet("start-sleep", &["-Foo".into()]).is_none());
+        let here = Path::new(".");
+        assert_eq!(try_exec("Test-Path", &["Cargo.toml".into()], Some(here), &[]).unwrap().stdout, "True\n");
+        assert_eq!(try_exec("test-path", &["nope".into(), "-PathType".into(), "Leaf".into()], Some(here), &[]).unwrap().stdout, "False\n");
+        assert_eq!(try_exec("Write-Output", &["a".into(), "b".into()], None, &[]).unwrap().stdout, "a\nb\n");
+        assert!(try_exec("Write-Host", &["-NoNewline".into(), "a".into()], None, &[]).is_none());
+    }}

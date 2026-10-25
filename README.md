@@ -175,20 +175,21 @@ unrelated project. To build from a clone, see [Build & install](#build--install)
    command. Noise-only digests (`git status`, grouped path lists) are not spooled.
    `--raw` / MCP `mode: "full"` always returns the untouched text.
 6. **MCP server** - `qx mcp` speaks MCP over stdio and exposes `run` (commands)
-   plus `fs` (read, write, edit, glob, literal grep, list, stat). Claude Code
+   plus `fs` (read, write, edit, glob, regex grep, list, stat). Claude Code
    starts it once and never spawns anything per built-in command. Results carry
    structured fields (`exit_code`, `duration_ms`, `truncated`, `full_output`,
    `redactions`, `guard_warning`, `profile`, `omitted_lines`); a field at its
    default (`truncated: false`, `redactions: 0`, `full_output: null`, empty
    `stderr`, ...) is left out, while `exit_code` and `stdout` are always there.
-   Up to 4 tool calls execute in parallel (`QX_MCP_WORKERS`), so independent
+A non-zero exit is a result, not a tool error, for every client (Claude Code would show a red error and cancel parallel siblings for a grep with no match); QX_EXIT_ERROR=1 restores the error flag.
+   Up to 8 processes run in parallel (`QX_MCP_WORKERS`); `fs` calls and in-process built-ins never wait for a process slot, so independent
    commands do not queue behind each other. `fs` greps scan files across
    `QX_FS_THREADS` workers (default CPUs/2, capped at 8). Notifications
    (no `id`) are never answered or run;
    `notifications/cancelled` stops the matching running call (it reports as
    timed out), also while the call still waits for a worker slot; ping and
    cancel are answered even when every slot is busy. `args` must be an array of strings (anything else is an error,
-   not a different command) and `timeout_ms` is clamped to 1 s-1 h.
+   not a different command) and `timeout_ms` (also as `"5000"`) is clamped to 1 s-1 h. dsh's own names `workdir` and `timeoutMs` are accepted too. A command still running when `timeout_ms` (at most 270 s, below dsh's 300 s tool limit) ends is **not killed**: it becomes a background job and the reply names its id (`run {job:"j1", wait_ms:60000}` waits, `{job:"j1", kill:true}` stops it, `{job:"list"}` lists; `background:true` starts one at once; `kill_on_timeout:true` or `QX_PROMOTE=off` restore kill-on-timeout). A non-zero exit is a result, not a tool error, except for Claude Code and Codex. Omitting `cwd` uses the last one the session named, and the reply says so.
 7. **Diagnostics** - `qx doctor` measures process-creation latency and names the
    antivirus products fighting over every spawn. `QX_TRACE=1` prints the phase
    timings of a run (spawn, wait, kill window, taskkill, reap) to stderr, so
@@ -250,15 +251,15 @@ a directory is an error rather than silently ignored. The MCP server answers
 malformed input (bad JSON, invalid UTF-8, batches) and survives a panicking
 handler.
 
-**qx `fs` mutations are workspace-confined**: every path is resolved against
+**qx `fs` mutations are workspace-confined** (reads, globs, greps and listings may go anywhere, like the dsh read tool): every path is resolved against
 the required `cwd`, symlink/junction escapes are refused, `.git`/`.hg`/`.svn`
-metadata is read-only, and write/edit require a prior qx read of the same
+metadata is read-only, and `write` over an existing file requires a prior qx read of the same
 version. Existing files are replaced through a temporary file in the same
 directory followed by an atomic rename (and an fsync, matching dsh's local
 backend); new files use a no-replace publication. qx cannot enforce dsh's
 sandbox modes, so the native dsh `read`/`write`/`edit` tools remain
 authoritative for sandbox escalation, images, and any path outside `cwd`. qx
-grep is literal-only; native grep owns regex.
+grep takes a regex (the `regex` crate; a pattern that is not valid regex is searched as text and the reply says so); `literal:true` forces text. `edit` needs no prior read: its exact, unique match is the safety check. **Batching saves model round trips** (each is a full LLM turn, far costlier than the 2 ms the tool takes): `fs {ops:[{op,...},...]}` runs up to 32 operations in order with a shared `cwd` (a failed write/edit stops the rest; reads keep going), `{op:"read", paths:[...]}` reads or stats many files, and `{op:"edit", path, edits:[{old_string,new_string,replace_all?},...]}` applies several edits to one file atomically. Plain PowerShell `Get-Content`, `Test-Path`, `Start-Sleep` (≤10 s) and `Write-Output/Write-Host` lines run in-process in about 1 ms instead of 50-90 ms; any parameter qx does not know falls through to the real cmdlet.
 
 **Credential egress** is scoped to actual network clients and inline network
 code. A commit message that merely mentions `.env` or `curl` is not blocked;
@@ -454,8 +455,8 @@ Doing it by hand looks like this:
 
 The model sees `mcp__qx__run` and `mcp__qx__fs`. qx also sends MCP server
 instructions, so dsh injects the routing rule into the system prompt
-automatically: qx first for commands, read/glob/literal grep and guarded
-mutations; native dsh tools on any qx error, for regex/images, or for sandbox
+automatically: qx first for commands, read/glob/grep and guarded
+mutations; native dsh tools only for images or for sandbox
 escalation. Restart dsh after changing the `command` path.
 
 ### Hermes
@@ -509,7 +510,8 @@ real server and prints `pi bridge ok`.
 | `command` | full shell line for pipes / redirects / `&&` |
 | `shell` | `auto` (default), `cmd`, `bash` |
 | `cwd` | working directory |
-| `timeout_ms` | default 120000 |
+| `timeout_ms` | default 120000, max 270000 (100000 under Claude Code, which would otherwise move the call into a task of its own at 120 s): then a running command becomes a background job |
+| `background` / `job` / `wait_ms` / `kill` | start in the background; follow up, wait for, or stop a job by id |
 | `mode` | `compact` (default) or `full` |
 
 `fs` (always pass `cwd`):
@@ -518,9 +520,9 @@ real server and prints `pi bridge ok`.
 |---|---|---|
 | `read` | `path` (or `file_path`), `offset?`, `limit?` | line-numbered UTF-8 window; 50 KiB / 2000 lines; observes the file for a later qx write/edit |
 | `write` | `path`, `content` | create, or replace after a qx read; parents created; atomic |
-| `edit` | `path`, `old_string`, `new_string`, `replace_all?` | literal replace after a qx read; unique unless `replace_all`; UTF-8 only (UTF-16 / legacy code pages get `FS_ENCODING` and are left untouched) |
+| `edit` | `path`, `old_string`, `new_string`, `replace_all?` | literal replace, no prior read needed; unique unless `replace_all`; UTF-8 only (UTF-16 / legacy code pages get `FS_ENCODING` and are left untouched) |
 | `glob` | `pattern`, `path?` | `*`, `**`, `?`, `[class]`, `{a,b}`; newest first; generated dirs skipped |
-| `grep` | `pattern`, `path?`, `include?`, `ignore_case?` | literal; `path:line: text`; scans files in parallel |
+| `grep` | `pattern`, `path?`, `include?`, `ignore_case?` | regex (`literal?` for text), grouped by file as `N: text`; `all?` also searches node_modules/target/build/dist/vendor (the reply names what it skipped); scans files in parallel |
 | `list` / `stat` | `path?` | directory entries / one path's type, size, mtime |
 
 Agents should prefer `program` + `args` for commands. It removes one process
@@ -532,7 +534,7 @@ the native dsh tool.
 
 ### Limits and shutdown
 
-The server runs at most 4 commands at once (`QX_MCP_WORKERS`, clamped 1–16) and
+The server runs at most 8 processes at once (`QX_MCP_WORKERS`, clamped 1–32; in-process work does not count) and
 queues at most 64 more beyond that (`QX_MCP_QUEUE`, clamped 0–1024). A call past
 the limit is refused immediately with `qx busy: N calls already running or
 queued (limit 4+64); retry shortly`, so a runaway client cannot queue unbounded
@@ -562,7 +564,9 @@ qx writes its messages for the client it is talking to. Detection order is
 
 The server instructions name the tools with that client's ids (`mcp__qx__run`, or
 `qx_run` on OpenCode) and stay under 1 KiB, because Codex reads only the first
-512 bytes of them. Set `QX_CLIENT` in the server environment when a client's
+512 bytes of them. For Claude Code, both tools carry
+`_meta: {"anthropic/alwaysLoad": true}`, so its tool search never hides them
+behind a lookup; `"alwaysLoad": false` on the server entry turns that off. Set `QX_CLIENT` in the server environment when a client's
 self-report is ambiguous; that is the only reliable way to reach the Hermes
 profile.
 

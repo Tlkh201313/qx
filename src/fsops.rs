@@ -14,8 +14,8 @@ use std::collections::{BinaryHeap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_READ_BYTES: u64 = 32 * 1024 * 1024;
@@ -27,7 +27,9 @@ fn native(n: Native) -> &'static str {
 const MAX_WRITE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EDIT_BYTES: usize = 1024 * 1024;
 const MAX_GREP_FILE_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_WALK_FILES: usize = 200_000;
+/// Past this a file is skipped (and said so); between the two it is streamed.
+const MAX_GREP_STREAM_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_WALK_FILES: usize = 200_000;
 const MAX_WALK_DEPTH: usize = 64;
 const DEFAULT_READ_LINES: usize = 2_000;
 const MAX_READ_LINES: usize = 2_000;
@@ -97,17 +99,87 @@ impl FsError {
     }
 }
 
+/// The last `cwd` a call named. dsh gives the server no workspace of its own, so a call that omits
+/// `cwd` most likely means the one the session has been using; the reply says which it used.
+static LAST_CWD: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+pub(crate) fn last_cwd() -> Option<PathBuf> {
+    LAST_CWD.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+pub(crate) fn note_cwd(dir: &Path) {
+    *LAST_CWD.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.to_path_buf());
+    #[cfg(not(test))]
+    prime(dir);
+}
+
+/// Pull a workspace into the OS file cache in the background the first time it is named, so the first
+/// glob or grep over it is not a cold disk walk. Bounded in entries and bytes; never blocks a call.
+pub(crate) fn prime(dir: &Path) {
+    static SEEN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() >= 8 || seen.iter().any(|d| d == dir) {
+            return;
+        }
+        seen.push(dir.to_path_buf());
+    }
+    let dir = dir.to_path_buf();
+    let _ = std::thread::Builder::new().name("qx-prime".into()).spawn(move || {
+        crate::index::ensure(&dir);
+        const MAX_ENTRIES: usize = 60_000;
+        const MAX_BYTES: u64 = 64 << 20;
+        const MAX_FILE: u64 = 256 << 10;
+        let (mut entries, mut bytes) = (0usize, 0u64);
+        let mut stack = vec![dir];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                entries += 1;
+                if entries > MAX_ENTRIES || bytes > MAX_BYTES {
+                    return;
+                }
+                let Ok(ft) = e.file_type() else { continue };
+                let name = e.file_name().to_string_lossy().into_owned();
+                if ft.is_dir() {
+                    if !is_vcs_dir(&name) && !skip_dir(&name, false) {
+                        stack.push(e.path());
+                    }
+                } else if ft.is_file() {
+                    if let Ok(md) = e.metadata() {
+                        if md.len() <= MAX_FILE {
+                            bytes += md.len();
+                            let _ = fs::read(e.path());
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 pub fn call(args: &Value) -> Reply {
     let started = Instant::now();
+    let defaulted = matches!(args.get("cwd"), None | Some(Value::Null));
     let op = args
         .get("op")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let mut reply = match dispatch(&op, args) {
-        Ok(r) => r,
-        Err(e) => e.reply(&op),
+    let mut reply = match batch_items(args, &op) {
+        Some(Ok(items)) => run_batch(&items),
+        Some(Err(e)) => e.reply("batch"),
+        None => match dispatch(&op, args) {
+            Ok(r) => r,
+            Err(e) => e.reply(&op),
+        },
     };
+    if defaulted && !reply.is_error {
+        let used = last_cwd().or_else(|| std::env::current_dir().ok());
+        if let Some(d) = used {
+            reply.text.push_str(&format!("\n[qx] no cwd given: used {}", d.display()));
+        }
+    }
     if let Value::Object(map) = &mut reply.structured {
         map.insert(
             "duration_ms".to_string(),
@@ -115,6 +187,99 @@ pub fn call(args: &Value) -> Reply {
         );
     }
     reply
+}
+
+const MAX_BATCH: usize = 32;
+/// Past this much combined text a batch stops running further operations: the model asks again for the rest.
+const MAX_BATCH_BYTES: usize = 256 * 1024;
+
+/// `ops: [{op, ...}]` runs several operations in one round trip; `paths: [..]` is the same for
+/// many `read`s or `stat`s. Each item inherits the call's other arguments (cwd above all).
+fn batch_items(args: &Value, op: &str) -> Option<Result<Vec<Value>, FsError>> {
+    let inherit = |item: &Value| -> Value {
+        let mut m = item.as_object().cloned().unwrap_or_default();
+        if let Some(outer) = args.as_object() {
+            for (k, v) in outer {
+                if !matches!(k.as_str(), "ops" | "paths" | "op" | "path" | "file_path") && !m.contains_key(k) {
+                    m.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        Value::Object(m)
+    };
+    if let Some(ops) = args.get("ops").filter(|v| !v.is_null()) {
+        let Some(list) = ops.as_array().filter(|a| !a.is_empty() && a.iter().all(Value::is_object)) else {
+            return Some(Err(FsError::arg("ops must be a non-empty array of {op, ...} objects")));
+        };
+        if list.len() > MAX_BATCH {
+            return Some(Err(FsError::arg(format!("ops is capped at {MAX_BATCH} per call"))));
+        }
+        if list.iter().any(|i| i.get("ops").is_some() || i.get("paths").is_some()) {
+            return Some(Err(FsError::arg("ops cannot nest")));
+        }
+        return Some(Ok(list.iter().map(inherit).collect()));
+    }
+    if matches!(op, "read" | "stat") {
+        if let Some(paths) = args.get("paths").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+            if paths.len() > MAX_BATCH {
+                return Some(Err(FsError::arg(format!("paths is capped at {MAX_BATCH} per call"))));
+            }
+            let own = json!({ "op": op });
+            return Some(Ok(paths
+                .iter()
+                .map(|p| {
+                    let mut item = inherit(&own);
+                    item["path"] = p.clone();
+                    item
+                })
+                .collect()));
+        }
+    }
+    None
+}
+
+fn run_batch(items: &[Value]) -> Reply {
+    let n = items.len();
+    let mut text = String::new();
+    let mut results = Vec::with_capacity(n);
+    let (mut failed, mut stopped) = (0usize, false);
+    for (i, item) in items.iter().enumerate() {
+        let op = item.get("op").and_then(Value::as_str).unwrap_or("").to_string();
+        let what = path_arg(item)
+            .or_else(|| opt_str(item, "pattern"))
+            .unwrap_or("")
+            .to_string();
+        text.push_str(&format!("== {}/{} {} {} ==\n", i + 1, n, op, what));
+        let mutates = matches!(op.as_str(), "write" | "edit");
+        if stopped {
+            text.push_str("skipped: an earlier write or edit in this batch failed\n\n");
+            results.push(json!({ "op": op, "path": what, "ok": false, "skipped": true }));
+            failed += 1;
+            continue;
+        }
+        if text.len() > MAX_BATCH_BYTES {
+            text.push_str("skipped: batch output cap reached; ask for the rest in another call\n\n");
+            results.push(json!({ "op": op, "path": what, "ok": false, "skipped": true }));
+            failed += 1;
+            continue;
+        }
+        let r = match dispatch(&op, item) {
+            Ok(r) => r,
+            Err(e) => e.reply(&op),
+        };
+        if r.is_error {
+            failed += 1;
+            stopped = mutates;
+        }
+        results.push(json!({ "op": op, "path": what, "ok": !r.is_error }));
+        text.push_str(r.text.trim_end());
+        text.push_str("\n\n");
+    }
+    Reply {
+        text: text.trim_end().to_string(),
+        structured: json!({ "op": "batch", "count": n, "failed": failed, "results": results }),
+        is_error: failed == n,
+    }
 }
 
 fn dispatch(op: &str, args: &Value) -> Result<Reply, FsError> {
@@ -162,6 +327,8 @@ fn req_path(args: &Value) -> Result<&str, FsError> {
     }
 }
 
+/// Models send `60`, `"60"` or `60.0` and often a value just outside the range: take what can only
+/// mean a number and clamp it. A hard error here costs a whole round trip for no gain.
 fn usize_arg(
     args: &Value,
     key: &str,
@@ -174,18 +341,19 @@ fn usize_arg(
         Some(v) => v
             .as_u64()
             .map(|n| n as usize)
+            .or_else(|| v.as_f64().filter(|f| *f >= 0.0).map(|f| f as usize))
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<usize>().ok()))
             .ok_or_else(|| FsError::arg(format!("{key} must be an integer")))?,
     };
-    if !(min..=max).contains(&n) {
-        return Err(FsError::arg(format!(
-            "{key} must be between {min} and {max}"
-        )));
-    }
-    Ok(n)
+    Ok(n.clamp(min, max))
 }
-
 fn bool_arg(args: &Value, key: &str, default: bool) -> bool {
-    args.get(key).and_then(Value::as_bool).unwrap_or(default)
+    match args.get(key) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("true") => true,
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("false") => false,
+        _ => default,
+    }
 }
 
 // --------------------------------------------------------------------- root
@@ -222,9 +390,10 @@ impl Root {
         // Omitting `cwd` means "where the server was started", like the CLI. Every fs call
         // otherwise fails on a field the model has no reason to know.
         let p = match args.get("cwd") {
-            None | Some(Value::Null) => {
-                std::env::current_dir().map_err(|e| FsError::io("cannot resolve cwd", e))?
-            }
+            None | Some(Value::Null) => match last_cwd() {
+                Some(d) => d,
+                None => std::env::current_dir().map_err(|e| FsError::io("cannot resolve cwd", e))?,
+            },
             Some(Value::String(s)) if !s.trim().is_empty() => PathBuf::from(s),
             Some(_) => {
                 return Err(FsError::arg("cwd must be a non-empty string").fb("tool"));
@@ -244,11 +413,24 @@ impl Root {
                 format!("cwd is not a directory: {}", cwd.display()),
             ));
         }
+        if matches!(args.get("cwd"), Some(Value::String(_))) {
+            note_cwd(&p);
+        }
         Ok(Self { cwd })
     }
 
     fn candidate(&self, raw: &str) -> PathBuf {
-        let p = PathBuf::from(raw);
+        let raw = raw.trim();
+        // A path pasted with its quotes, or `~/x`: say what was meant instead of failing.
+        let raw = raw
+            .strip_prefix('"').and_then(|r| r.strip_suffix('"'))
+            .or_else(|| raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
+            .unwrap_or(raw);
+        let home = if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") { crate::resolve::home_dir() } else { None };
+        let p = match home {
+            Some(h) => h.join(raw[1..].trim_start_matches(['/', '\\'])),
+            None => PathBuf::from(raw),
+        };
         if p.is_absolute() {
             p
         } else {
@@ -259,6 +441,7 @@ impl Root {
     fn display(&self, path: &Path) -> String {
         let rel = path.strip_prefix(&self.cwd).unwrap_or(path);
         let s = rel.to_string_lossy().replace('\\', "/");
+        let s = s.strip_prefix("//?/").map(str::to_string).unwrap_or(s);
         if s.is_empty() {
             ".".to_string()
         } else {
@@ -294,6 +477,19 @@ impl Root {
         Ok(canonical)
     }
 
+    /// Reads (read, glob, grep, list, stat) may look anywhere the user can: the dsh read tool is not
+    /// confined to the workspace, and a fallback for every path outside `cwd` costs a round trip.
+    /// Only mutations stay inside `cwd`.
+    fn resolve_read(&self, raw: &str) -> Result<PathBuf, FsError> {
+        let candidate = self.candidate(raw);
+        fs::canonicalize(&candidate).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                FsError::new("FS_NOT_FOUND", format!("cannot access \"{raw}\": not found"))
+            }
+            _ => FsError::io(format!("cannot access \"{raw}\""), e),
+        })
+    }
+
     /// Resolve a file for creation or replacement. Existing parent directories
     /// may be created, but every existing ancestor is canonicalized and checked
     /// first, so a symlink or junction cannot walk the write outside the root.
@@ -306,11 +502,19 @@ impl Root {
         }) {
             return Err(FsError::arg(format!("\"{raw}\": {bad}")).fb("write"));
         }
+        if raw.ends_with(['/', '\\']) {
+            return Err(FsError::arg(format!("\"{raw}\" ends with a separator: it names a directory, not a file")).fb("write"));
+        }
         let candidate = self.candidate(raw);
+        // A path on another machine would be probed over the network (tens of seconds when it is down) just to be refused.
+        if let Some(share) = unc_share(&candidate) {
+            if unc_share(&self.cwd) != Some(share) {
+                self.ensure_inside(&candidate).map_err(|e| e.fb("write"))?;
+            }
+        }
         let name = candidate
             .file_name()
-            .ok_or_else(|| FsError::arg("path must name a file"))?
-            .to_os_string();
+            .ok_or_else(|| FsError::arg("path must name a file"))?;
 
         let nearest = nearest_existing(&candidate).ok_or_else(|| {
             FsError::new(
@@ -318,6 +522,7 @@ impl Root {
                 format!("no existing ancestor for {}", candidate.display()),
             )
         })?;
+        let exact = nearest == candidate;
         let nearest = fs::canonicalize(&nearest)
             .map_err(|e| FsError::io("cannot resolve path ancestor", e))?;
         self.ensure_inside(&nearest)?;
@@ -338,8 +543,12 @@ impl Root {
                     format!("cannot modify \"{raw}\": not a regular file"),
                 ));
             }
-            let canonical = fs::canonicalize(&candidate)
-                .map_err(|e| FsError::io(format!("cannot resolve \"{raw}\""), e))?;
+            // `nearest` is this very file, canonicalized a moment ago: resolving it again gives the same path.
+            let canonical = if exact {
+                nearest
+            } else {
+                fs::canonicalize(&candidate).map_err(|e| FsError::io(format!("cannot resolve \"{raw}\""), e))?
+            };
             self.ensure_inside(&canonical)?;
             return Ok((canonical, true));
         }
@@ -393,6 +602,20 @@ impl Root {
     }
 }
 
+/// `(server, share)` of a network path, in either spelling (`\\s\x` or `\\?\UNC\s\x`), compared without case.
+fn unc_share(p: &Path) -> Option<(String, String)> {
+    use std::path::Prefix;
+    let Some(Component::Prefix(prefix)) = p.components().next() else {
+        return None;
+    };
+    match prefix.kind() {
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+            Some((server.to_string_lossy().to_lowercase(), share.to_string_lossy().to_lowercase()))
+        }
+        _ => None,
+    }
+}
+
 /// Why Windows cannot hold a file or directory with this name, if it cannot.
 fn win_name_problem(name: &str) -> Option<&'static str> {
     if name.contains(':') {
@@ -438,28 +661,22 @@ impl Version {
     }
 }
 
-/// A cheap content fingerprint: full FNV for small files, first+last 8 KiB for
-/// large ones. Length and mtime are also compared, so a same-size, same-time
-/// middle-only edit is the only case this can miss.
+/// A content fingerprint over every byte, so a same-size edit anywhere in the file is seen (the clock is
+/// not compared: a `touch` is no conflict). Eight bytes a step (the multiply is odd, so each step is a
+/// bijection and one changed word always changes the hash); it only ever meets hashes made by this
+/// same function, always of the whole file.
 fn hash_bytes(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = FNV_OFFSET;
-    for &b in bytes.iter().take(8192) {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    let mut words = bytes.chunks_exact(8);
+    for w in &mut words {
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(w.try_into().unwrap_or_default())).wrapping_mul(K);
     }
-    if bytes.len() > 1_048_576 {
-        let start = bytes.len().saturating_sub(8192);
-        for &b in &bytes[start..] {
-            h ^= b as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-    } else {
-        for &b in bytes.iter().skip(8192) {
-            h ^= b as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
+    let rest = words.remainder();
+    if !rest.is_empty() {
+        let mut last = [0u8; 8];
+        last[..rest.len()].copy_from_slice(rest);
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(last)).wrapping_mul(K);
     }
     h
 }
@@ -471,24 +688,26 @@ fn observations() -> &'static Mutex<HashMap<ObsKey, Version>> {
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn remember(cwd: &Path, path: &Path, version: Version) {
+/// Keyed by the file alone: the same file reached through another `cwd` is the same file.
+fn remember(_cwd: &Path, path: &Path, version: Version) {
     observations()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert((cwd.to_path_buf(), path.to_path_buf()), version);
+        .insert((PathBuf::new(), path.to_path_buf()), version);
 }
 
-fn check_observed(cwd: &Path, path: &Path, current: Version, display: &str) -> Result<(), FsError> {
+fn check_observed(_cwd: &Path, path: &Path, current: Version, display: &str) -> Result<(), FsError> {
     let map = observations().lock().unwrap_or_else(|e| e.into_inner());
-    match map.get(&(cwd.to_path_buf(), path.to_path_buf())) {
+    match map.get(&(PathBuf::new(), path.to_path_buf())) {
         None => Err(FsError::new(
             "FS_NOT_OBSERVED",
             format!(
-                "cannot modify \"{display}\": file has not been read — read it with qx fs op=read first, or use the native {} tool",
+                "cannot modify \"{display}\": read it first (op=read; a partial read counts), then write; or use the native {} tool",
                 native(Native::Write)
             ),
         )),
-        Some(v) if *v != current => Err(FsError::new(
+        // Content decides, not the clock: a `touch` or a save without changes is not a conflict.
+        Some(v) if v.len != current.len || v.hash != current.hash => Err(FsError::new(
             "FS_STALE",
             format!(
                 "cannot modify \"{display}\": file changed since it was read — re-read it, or use the native {} tool",
@@ -502,6 +721,74 @@ fn check_observed(cwd: &Path, path: &Path, current: Version, display: &str) -> R
 fn mutation_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Held from the check that a file is as it was read until the new content is in place. Other qx
+/// servers (another session, another agent) edit the same tree, so on Windows the lock is a named
+/// mutex the system also releases if its owner dies; past `MUTATION_WAIT_MS` the call goes on
+/// without it rather than hang.
+struct MutationGuard {
+    _local: std::sync::MutexGuard<'static, ()>,
+    #[cfg(windows)]
+    held: bool,
+}
+
+const MUTATION_WAIT_MS: u32 = 5000;
+
+fn lock_mutation() -> MutationGuard {
+    let local = mutation_lock().lock().unwrap_or_else(|e| e.into_inner());
+    MutationGuard {
+        _local: local,
+        #[cfg(windows)]
+        held: os_mutex::acquire(MUTATION_WAIT_MS),
+    }
+}
+
+impl Drop for MutationGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.held {
+            os_mutex::release();
+        }
+    }
+}
+
+#[cfg(windows)]
+mod os_mutex {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateMutexW(attributes: *mut c_void, initial_owner: i32, name: *const u16) -> *mut c_void;
+        fn WaitForSingleObject(handle: *mut c_void, millis: u32) -> u32;
+        fn ReleaseMutex(handle: *mut c_void) -> i32;
+    }
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_ABANDONED: u32 = 0x80;
+
+    /// One handle for the life of the process (null when the system refused one); kept as an
+    /// address because a raw pointer cannot sit in a static.
+    fn handle() -> *mut c_void {
+        static HANDLE: OnceLock<usize> = OnceLock::new();
+        *HANDLE.get_or_init(|| {
+            let name: Vec<u16> = "Local\\qx-fs-mutation\0".encode_utf16().collect();
+            // SAFETY: a NUL-terminated name and default security.
+            unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) as usize }
+        }) as *mut c_void
+    }
+
+    /// True when this thread now owns the mutex (an abandoned one counts: its owner died).
+    pub fn acquire(millis: u32) -> bool {
+        let h = handle();
+        // SAFETY: `h` is a live handle for the whole process.
+        !h.is_null() && matches!(unsafe { WaitForSingleObject(h, millis) }, WAIT_OBJECT_0 | WAIT_ABANDONED)
+    }
+
+    pub fn release() {
+        // SAFETY: only called by the thread that acquired it.
+        unsafe { ReleaseMutex(handle()) };
+    }
 }
 
 // ---------------------------------------------------------------------- I/O
@@ -654,9 +941,18 @@ fn atomic_replace(path: &Path, bytes: &[u8], expected: Version) -> Result<(), Fs
             ),
         ));
     }
-    replace_file(&temp.path, path)
-        .map_err(|e| FsError::io(format!("cannot replace \"{}\"", path.display()), e))?;
-    Ok(())
+    // An editor, indexer or virus scanner may hold the file for a moment without delete sharing.
+    let mut attempt = 0;
+    loop {
+        match replace_file(&temp.path, path) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < 5 && matches!(e.raw_os_error(), Some(5 | 32 | 33)) => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(40 * attempt));
+            }
+            Err(e) => return Err(FsError::io(format!("cannot replace \"{}\"", path.display()), e)),
+        }
+    }
 }
 
 fn create_noreplace(path: &Path, bytes: &[u8]) -> Result<(), FsError> {
@@ -707,7 +1003,15 @@ fn read(root: &Root, args: &Value) -> Result<Reply, FsError> {
         80,
         MAX_READ_LINE_CHARS,
     )?;
-    let path = root.resolve_existing(raw).map_err(|e| e.fb("read"))?;
+    let path = root.resolve_read(raw).map_err(|e| e.fb("read"))?;
+    let md = fs::metadata(&path).ok();
+    if md.as_ref().is_some_and(|m| m.is_file() && m.len() > MAX_READ_BYTES) {
+        return read_large(root, &path, raw, offset, limit, max_line_chars);
+    }
+    if md.as_ref().is_some_and(|m| m.is_dir()) {
+        // A directory is a listing: the same answer `list` gives, in one call instead of an error and a retry.
+        return list(root, &json!({ "path": raw }));
+    }
     let (bytes, version) = read_file(&path, "read")?;
     if bytes
         .iter()
@@ -721,8 +1025,9 @@ fn read(root: &Root, args: &Value) -> Result<Reply, FsError> {
         .fb("read"));
     }
     let text = decode_text(&bytes);
+    let display = root.display(&path);
     let out = render_read(
-        &root.display(&path),
+        &display,
         &text,
         offset,
         limit,
@@ -734,13 +1039,71 @@ fn read(root: &Root, args: &Value) -> Result<Reply, FsError> {
         text: out.text,
         structured: json!({
             "op": "read",
-            "path": root.display(&path),
+            "path": display,
             "lines": out.lines,
             "total_lines": out.total,
             "end_line": out.end_line,
             "truncated": out.truncated,
             "bytes": bytes.len(),
         }),
+        is_error: false,
+    })
+}
+
+/// A file too big to load: stream it to the requested window. Not observed, so it cannot be
+/// written back whole; `edit` still works on files under its own size cap.
+fn read_large(root: &Root, path: &Path, raw: &str, offset: usize, limit: usize, max_line_chars: usize) -> Result<Reply, FsError> {
+    use std::io::{BufRead, BufReader};
+    let f = fs::File::open(path).map_err(|e| FsError::io(format!("cannot read \"{raw}\""), e).fb("read"))?;
+    let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut r = BufReader::with_capacity(1 << 20, f);
+    let head = r.fill_buf().map_err(|e| FsError::io(format!("cannot read \"{raw}\""), e).fb("read"))?;
+    if head.iter().take(8192).any(|&b| b == 0) {
+        return Err(FsError::new("FS_BINARY", format!("cannot read \"{raw}\" as text: binary data")).fb("read"));
+    }
+    let (mut buf, mut body) = (Vec::new(), String::new());
+    let (mut n, mut shown, mut more) = (0usize, 0usize, false);
+    let mut end_line = offset.saturating_sub(1);
+    loop {
+        buf.clear();
+        let got = r.read_until(b'\n', &mut buf).map_err(|e| FsError::io(format!("cannot read \"{raw}\""), e).fb("read"))?;
+        if got == 0 {
+            break;
+        }
+        n += 1;
+        if n < offset {
+            continue;
+        }
+        if shown >= limit {
+            more = true;
+            break;
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim_end_matches(['\n', '\r']);
+        let mut one = String::new();
+        push_usize(&mut one, n);
+        one.push_str(": ");
+        push_clipped(&mut one, line, max_line_chars);
+        if body.len() + one.len() + 1 > DEFAULT_READ_BYTES {
+            more = true;
+            break;
+        }
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&one);
+        shown += 1;
+        end_line = n;
+    }
+    let display = root.display(path);
+    let footer = if more {
+        format!("(Showing lines {offset}-{end_line} of a {size}-byte file. Use offset={} to continue.)", end_line + 1)
+    } else {
+        format!("(End of file - total {n} lines)")
+    };
+    Ok(Reply {
+        text: format!("<path>{display}</path>\n<type>file</type>\n<content>\n{body}\n\n{footer}\n</content>"),
+        structured: json!({ "op": "read", "path": display, "lines": shown, "end_line": end_line, "truncated": more, "bytes": size }),
         is_error: false,
     })
 }
@@ -761,12 +1124,15 @@ fn render_read(
     max_line_chars: usize,
     max_bytes: usize,
 ) -> Result<ReadWindow, FsError> {
-    let total = count_lines(text);
+    let total = count_lines(text.as_bytes());
     if offset > total && !(total == 0 && offset == 1) {
-        return Err(FsError::new(
-            "FS_OFFSET",
-            format!("offset {offset} is out of range for \"{display}\" ({total} lines)"),
-        ));
+        return Ok(ReadWindow {
+            text: format!("<path>{display}</path>\n<type>file</type>\n<content>\n(offset {offset} is past the end: the file has {total} lines)\n</content>"),
+            lines: 0,
+            total,
+            end_line: total,
+            truncated: false,
+        });
     }
 
     let mut body = String::with_capacity(max_bytes.min(text.len() + 128));
@@ -834,12 +1200,9 @@ fn render_read(
     })
 }
 
-fn count_lines(text: &str) -> usize {
-    if text.is_empty() {
-        0
-    } else {
-        text.bytes().filter(|&b| b == b'\n').count() + usize::from(!text.ends_with('\n'))
-    }
+/// Lines in `text`: a last one without its `\n` counts too.
+fn count_lines(text: &[u8]) -> usize {
+    text.iter().filter(|&&b| b == b'\n').count() + usize::from(text.last().is_some_and(|&b| b != b'\n'))
 }
 
 fn decode_text(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
@@ -847,6 +1210,10 @@ fn decode_text(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
         return std::borrow::Cow::Owned(crate::exec::decode(bytes));
     }
     let s = String::from_utf8_lossy(bytes);
+    // A UTF-8 BOM is not part of the first line; write keeps it (see `carry_over_encoding`).
+    if let Some(rest) = s.strip_prefix('\u{feff}') {
+        return std::borrow::Cow::Owned(rest.replace('\0', ""));
+    }
     if s.contains('\0') {
         std::borrow::Cow::Owned(s.replace('\0', ""))
     } else {
@@ -904,18 +1271,19 @@ fn write(root: &Root, args: &Value) -> Result<Reply, FsError> {
         )
         .fb("write"));
     }
-    let _guard = mutation_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let guard = lock_mutation();
     let (path, existed) = root.resolve_for_write(raw).map_err(|e| e.fb("write"))?;
     root.check_mutable(&path).map_err(|e| e.fb("write"))?;
+    let display = root.display(&path);
 
     let mut written = std::borrow::Cow::Borrowed(content);
+    let mut before = Vec::new();
     if existed {
-        let (before, current) = read_file(&path, "write")?;
-        check_observed(&root.cwd, &path, current, &root.display(&path))
-            .map_err(|e| e.fb("write"))?;
+        let (bytes, current) = read_file(&path, "write")?;
+        check_observed(&root.cwd, &path, current, &display).map_err(|e| e.fb("write"))?;
         // `read` showed lossy, LF-only text: writing it back must not re-encode or flatten the file.
-        match carry_over_encoding(&before, content) {
-            Ok(text) => written = std::borrow::Cow::Owned(text),
+        match carry_over_encoding(&bytes, content) {
+            Ok(text) => written = text,
             Err(()) => {
                 return Err(FsError::new(
                     "FS_ENCODING",
@@ -925,25 +1293,30 @@ fn write(root: &Root, args: &Value) -> Result<Reply, FsError> {
             }
         }
         atomic_replace(&path, written.as_bytes(), current).map_err(|e| e.fb("write"))?;
+        before = bytes;
     } else {
         create_noreplace(&path, content.as_bytes()).map_err(|e| e.fb("write"))?;
     }
     let content = written.as_ref();
     let version = version_after(&path, content.as_bytes()).map_err(|e| e.fb("write"))?;
     remember(&root.cwd, &path, version);
-    let display = root.display(&path);
+    // Only the reply is left to do, and the line count is not part of the change: not under the lock.
+    drop(guard);
+    let delta = line_delta(&before, content.as_bytes());
     let verb = if existed {
         "Updated file"
     } else {
         "Created file"
     };
     Ok(Reply {
-        text: format!("<path>{display}</path>\n<type>file</type>\n<content>\n{verb}\n</content>"),
+        text: format!("<path>{display}</path>\n<type>file</type>\n<content>\n{verb} {}\n</content>", lines_note(!existed, delta)),
         structured: json!({
             "op": "write",
             "path": display,
             "created": !existed,
             "bytes": content.len(),
+            "added": delta.0,
+            "removed": delta.1,
         }),
         is_error: false,
     })
@@ -951,32 +1324,203 @@ fn write(root: &Root, args: &Value) -> Result<Reply, FsError> {
 
 // --------------------------------------------------------------------- edit
 
-fn edit(root: &Root, args: &Value) -> Result<Reply, FsError> {
-    let raw = req_path(args)?;
-    let old = match args.get("old_string").and_then(Value::as_str) {
+/// What a reply says about the lines a write or edit changed.
+fn lines_note(created: bool, (added, removed): (usize, usize)) -> String {
+    match (added, removed) {
+        (0, 0) if created => "(empty)".to_string(),
+        (0, 0) => "(no changes)".to_string(),
+        _ => format!("(+{added} -{removed} lines)"),
+    }
+}
+
+/// Past this many added plus removed lines, `line_delta` stops looking for the smallest diff.
+const DIFF_CAP: usize = 512;
+
+/// Length of the common prefix of `a` and `b`; 64 bytes a step while they match (a vectorised compare).
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + 64 <= n && a[i..i + 64] == b[i..i + 64] {
+        i += 64;
+    }
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+/// Length of the common suffix of `a` and `b`.
+fn common_suffix(a: &[u8], b: &[u8]) -> usize {
+    let (n, la, lb) = (a.len().min(b.len()), a.len(), b.len());
+    let mut i = 0;
+    while i + 64 <= n && a[la - i - 64..la - i] == b[lb - i - 64..lb - i] {
+        i += 64;
+    }
+    while i < n && a[la - 1 - i] == b[lb - 1 - i] {
+        i += 1;
+    }
+    i
+}
+
+/// Bytes at the start of `a` and `b` that make up whole lines both have (a line keeps its `\n`).
+fn shared_head(a: &[u8], b: &[u8]) -> usize {
+    let n = common_prefix(a, b);
+    if n == a.len() && n == b.len() {
+        return n; // the same text, a last line without `\n` included
+    }
+    a[..n].iter().rposition(|&c| c == b'\n').map_or(0, |i| i + 1)
+}
+
+/// Bytes at the end of `a` and `b` that make up whole lines both have. Both texts start at a line start.
+fn shared_tail(a: &[u8], b: &[u8]) -> usize {
+    let n = common_suffix(a, b);
+    let (sa, sb) = (a.len() - n, b.len() - n);
+    let starts = |t: &[u8], s: usize| s == 0 || t[s - 1] == b'\n';
+    if starts(a, sa) && starts(b, sb) {
+        return n;
+    }
+    // The first shared line is cut short on one side: the shared lines begin after its end.
+    a[sa..].iter().position(|&c| c == b'\n').map_or(0, |i| n - i - 1)
+}
+
+/// Lines `(added, removed)` going from `old` to `new`. A line includes its terminator, so a change of
+/// line ending or of the final newline counts. The smallest diff: the lines outside a longest common
+/// subsequence. Done on bytes, with no table of lines: the shared head and tail are trimmed, the lines
+/// of what is left are counted, and Myers' greedy search finds only the edit distance D from which the
+/// two counts follow (its points are byte offsets of line starts).
+fn line_delta(old: &[u8], new: &[u8]) -> (usize, usize) {
+    let head = shared_head(old, new);
+    let (old, new) = (&old[head..], &new[head..]);
+    let tail = shared_tail(old, new);
+    let (old, new) = (&old[..old.len() - tail], &new[..new.len() - tail]);
+    let (n, m) = (count_lines(old), count_lines(new));
+    if n == 0 || m == 0 {
+        return (m, n);
+    }
+    const NONE: usize = usize::MAX;
+    let end = |t: &[u8], at: usize| t[at..].iter().position(|&c| c == b'\n').map_or(t.len(), |i| at + i + 1);
+    let max = (n + m).min(DIFF_CAP);
+    let mid = max + 1;
+    // The furthest point reached on each diagonal (old lines taken minus new lines taken), as byte offsets.
+    let mut far = vec![(NONE, 0usize); 2 * max + 3];
+    for d in 0..=max {
+        for k in (0..=d).map(|j| 2 * j as isize - d as isize) {
+            let at = (mid as isize + k) as usize;
+            let (left, above) = (far[at - 1], far[at + 1]);
+            let start = if d == 0 {
+                (0, 0)
+            } else {
+                // From diagonal k-1 by dropping an old line, or from k+1 by adding a new one: the further one.
+                let del = (left.0 < old.len()).then(|| (end(old, left.0), left.1));
+                let ins = (above.0 != NONE && above.1 < new.len()).then(|| (above.0, end(new, above.1)));
+                match (del, ins) {
+                    (Some(a), Some(b)) => if b.0 >= a.0 { b } else { a },
+                    (a, b) => a.or(b).unwrap_or((NONE, 0)),
+                }
+            };
+            if start.0 == NONE {
+                far[at] = start;
+                continue;
+            }
+            let run = shared_head(&old[start.0..], &new[start.1..]);
+            let reached = (start.0 + run, start.1 + run);
+            if reached == (old.len(), new.len()) {
+                return ((d + m - n) / 2, (d + n - m) / 2);
+            }
+            far[at] = reached;
+        }
+    }
+    // shortcut: beyond DIFF_CAP edits the whole middle counts as replaced (an upper bound), raise the cap if exact counts of big rewrites matter
+    (m, n)
+}
+
+/// One `{old_string, new_string, replace_all?}` replacement, applied to `text` in memory.
+fn apply_edit(text: &str, raw: &str, e: &Value, label: &str) -> Result<(String, usize), FsError> {
+    let old = match e.get("old_string").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s,
-        _ => return Err(FsError::arg("old_string must be a non-empty string")),
+        _ => return Err(FsError::arg(format!("{label}old_string must be a non-empty string"))),
     };
-    let new = match args.get("new_string").and_then(Value::as_str) {
+    let new = match e.get("new_string").and_then(Value::as_str) {
         Some(s) => s,
-        None => return Err(FsError::arg("new_string must be a string")),
+        None => return Err(FsError::arg(format!("{label}new_string must be a string"))),
     };
     if old == new {
-        return Err(FsError::arg("old_string and new_string must differ"));
+        return Err(FsError::arg(format!("{label}old_string and new_string must differ")));
     }
     if old.len() > MAX_EDIT_BYTES || new.len() > MAX_EDIT_BYTES {
         return Err(FsError::new(
             "FS_TOO_LARGE",
-            format!("edit strings are capped at {MAX_EDIT_BYTES} bytes"),
+            format!("{label}edit strings are capped at {MAX_EDIT_BYTES} bytes"),
         )
         .fb("edit"));
     }
-    let replace_all = bool_arg(args, "replace_all", false);
-    let _guard = mutation_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let replace_all = bool_arg(e, "replace_all", false);
+    let (old, new) = match_line_endings(text, old, new);
+    // One pass finds the matches and builds the result; a second hit without `replace_all` is an
+    // error, so the scan stops there and the total is counted only for the message.
+    let mut updated = String::with_capacity(text.len() + new.len().saturating_sub(old.len()));
+    // `replace_all` multiplies `new` by the match count; stop before that outgrows memory.
+    let cap = MAX_WRITE_BYTES.max(text.len().saturating_mul(2));
+    let (mut done, mut count) = (0, 0);
+    for (at, hit) in text.match_indices(&old) {
+        count += 1;
+        if count > 1 && !replace_all {
+            break;
+        }
+        updated.push_str(&text[done..at]);
+        updated.push_str(&new);
+        done = at + hit.len();
+        if updated.len() > cap {
+            return Err(FsError::new(
+                "FS_TOO_LARGE",
+                format!("{label}the edited file would pass {cap} bytes; use the native {} tool", native(Native::Edit)),
+            )
+            .fb("edit"));
+        }
+    }
+    if count == 0 {
+        // Say where the closest thing is: usually an indentation or a stale line, found in one step.
+        let first = old.lines().map(str::trim).find(|l| l.len() > 3).unwrap_or("");
+        let hint = text
+            .lines()
+            .position(|l| !first.is_empty() && l.contains(first))
+            .map(|i| format!("; its first line appears at line {} (whitespace or later lines differ)", i + 1))
+            .unwrap_or_default();
+        return Err(FsError::new(
+            "FS_NO_MATCH",
+            format!("{label}old_string was not found in \"{raw}\"{hint}"),
+        )
+        .fb("edit"));
+    }
+    if count > 1 && !replace_all {
+        let count = text.matches(&old).count();
+        return Err(FsError::new(
+            "FS_AMBIGUOUS",
+            format!("{label}old_string occurs {count} times in \"{raw}\"; include more context or set replace_all"),
+        )
+        .fb("edit"));
+    }
+    updated.push_str(&text[done..]);
+    Ok((updated, count))
+}
+
+fn edit(root: &Root, args: &Value) -> Result<Reply, FsError> {
+    let raw = req_path(args)?;
+    // `edits` is a batch on one file: applied in order to the text as the earlier ones left it, written
+    // once, and all-or-nothing, so a model fixes five places in one round trip instead of five.
+    let batch: Option<&Vec<Value>> = args.get("edits").and_then(Value::as_array).filter(|a| !a.is_empty());
+    if batch.is_none() && args.get("edits").is_some_and(|v| !v.is_null()) {
+        return Err(FsError::arg("edits must be a non-empty array of {old_string, new_string, replace_all?}"));
+    }
+    if batch.is_some_and(|b| b.len() > 64) {
+        return Err(FsError::arg("edits is capped at 64 per call"));
+    }
+    let guard = lock_mutation();
     let path = root.resolve_existing(raw).map_err(|e| e.fb("edit"))?;
     root.check_mutable(&path).map_err(|e| e.fb("edit"))?;
     let (bytes, current) = read_file(&path, "edit")?;
-    check_observed(&root.cwd, &path, current, &root.display(&path)).map_err(|e| e.fb("edit"))?;
+    // No prior read is required: `old_string` must match the current text exactly once, which is a
+    // stronger check than "was read", and `atomic_replace` still refuses a file that changed meanwhile.
 
     // Strict: a lossy decode would rewrite UTF-16/Latin-1 files as UTF-8 and drop NULs on save.
     // The UTF-16 BOMs are never valid UTF-8, so this one check covers them too.
@@ -987,57 +1531,59 @@ fn edit(root: &Root, args: &Value) -> Result<Reply, FsError> {
         )
         .fb("edit"));
     };
-    let (old, new) = match_line_endings(text, old, new);
-    let count = text.matches(&old).count();
-    if count == 0 {
-        return Err(FsError::new(
-            "FS_NO_MATCH",
-            format!("old_string was not found in \"{raw}\""),
-        )
-        .fb("edit"));
-    }
-    if count > 1 && !replace_all {
-        return Err(FsError::new(
-            "FS_AMBIGUOUS",
-            format!(
-                "old_string occurs {count} times in \"{raw}\"; include more context or set replace_all"
-            ),
-        )
-        .fb("edit"));
-    }
-    let updated = if replace_all {
-        text.replace(&old, &new)
-    } else {
-        text.replacen(&old, &new, 1)
+    let (updated, replacements) = match batch {
+        Some(list) => {
+            let mut cur = String::new();
+            let mut total = 0;
+            for (i, e) in list.iter().enumerate() {
+                let label = format!("edits[{i}]: ");
+                // The first edit reads the file's own text; no copy of it is made.
+                let (next, n) = apply_edit(if i == 0 { text } else { cur.as_str() }, raw, e, &label)?;
+                cur = next;
+                total += n;
+            }
+            (cur, total)
+        }
+        None => apply_edit(text, raw, args, "")?,
     };
+    let replace_all = batch.is_none() && bool_arg(args, "replace_all", false);
     atomic_replace(&path, updated.as_bytes(), current).map_err(|e| e.fb("edit"))?;
     let version = version_after(&path, updated.as_bytes()).map_err(|e| e.fb("edit"))?;
     remember(&root.cwd, &path, version);
+    // Only the reply is left to do, and the line count is not part of the change: not under the lock.
+    drop(guard);
+    let delta = line_delta(&bytes, updated.as_bytes());
     let display = root.display(&path);
-    let suffix = if replace_all {
-        " All occurrences were successfully replaced."
-    } else {
-        ""
+    let suffix = match (batch, replace_all) {
+        (Some(b), _) => format!(" {} edits applied.", b.len()),
+        (None, true) => " All occurrences were successfully replaced.".to_string(),
+        _ => String::new(),
     };
     Ok(Reply {
-        text: format!("The file {display} has been updated successfully.{suffix}"),
+        text: format!("The file {display} has been updated successfully.{suffix} {}", lines_note(false, delta)),
         structured: json!({
             "op": "edit",
             "path": display,
-            "replacements": if replace_all { count } else { 1 },
+            "replacements": replacements,
+            "added": delta.0,
+            "removed": delta.1,
             "bytes": updated.len(),
         }),
         is_error: false,
     })
 }
-
 /// The model sees LF-only text (`read` strips the CRs), so `old` and `new` arrive with LF. Try `old`
 /// verbatim first (it may sit in the LF part of a mixed file); only when it is absent, spell it in the
 /// file's other ending. `new` then takes the ending of the text it replaces, whether or not `old` itself
 /// held a line break.
 fn match_line_endings(text: &str, old: &str, new: &str) -> (String, String) {
-    let crlf = text.matches("\r\n").count();
-    let lf_only = text.matches('\n').count().saturating_sub(crlf);
+    // Without a CR there is no CRLF to count (and `crlf > lf_only` cannot hold): skip two scans of the file.
+    let (crlf, lf_only) = if text.contains('\r') {
+        let crlf = text.matches("\r\n").count();
+        (crlf, text.matches('\n').count().saturating_sub(crlf))
+    } else {
+        (0, 0)
+    };
     let mut old = old.to_string();
     if !text.contains(&old) {
         if crlf > 0 && old.contains('\n') && !old.contains("\r\n") {
@@ -1057,7 +1603,8 @@ fn match_line_endings(text: &str, old: &str, new: &str) -> (String, String) {
 }
 
 /// What `write` must keep of the file it replaces: the model read LF-only text without the BOM.
-fn carry_over_encoding(before: &[u8], content: &str) -> Result<String, ()> {
+fn carry_over_encoding<'a>(before: &[u8], content: &'a str) -> Result<std::borrow::Cow<'a, str>, ()> {
+    use std::borrow::Cow;
     let Ok(old) = std::str::from_utf8(before) else {
         return Err(()); // UTF-16 or a legacy code page: rewriting it as UTF-8 would corrupt it
     };
@@ -1065,14 +1612,18 @@ fn carry_over_encoding(before: &[u8], content: &str) -> Result<String, ()> {
     if old.contains('\0') && !content.contains('\0') {
         return Err(());
     }
-    let crlf = old.matches("\r\n").count();
-    let lf_only = old.matches('\n').count().saturating_sub(crlf);
-    let mut out = content.to_string();
-    if crlf > lf_only && !out.contains('\r') {
-        out = out.replace('\n', "\r\n");
+    // Mostly CRLF: only a file with a CR can be, so the counts are for those alone.
+    let crlf_file = old.contains('\r') && {
+        let crlf = old.matches("\r\n").count();
+        crlf > old.matches('\n').count().saturating_sub(crlf)
+    };
+    // The common case, an LF file without a BOM, writes `content` as it is: no copy.
+    let mut out = Cow::Borrowed(content);
+    if crlf_file && !content.contains('\r') {
+        out = Cow::Owned(content.replace('\n', "\r\n"));
     }
     if old.starts_with('\u{feff}') && !out.starts_with('\u{feff}') {
-        out.insert(0, '\u{feff}');
+        out.to_mut().insert(0, '\u{feff}');
     }
     Ok(out)
 }
@@ -1093,7 +1644,7 @@ fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
     }
     let patterns = expand_braces(&pattern.replace('\\', "/"));
     let raw_path = path_arg(args).unwrap_or(".");
-    let root_path = root.resolve_existing(raw_path).map_err(|e| e.fb("glob"))?;
+    let root_path = root.resolve_read(raw_path).map_err(|e| e.fb("glob"))?;
     let max_results = usize_arg(
         args,
         "max_results",
@@ -1102,18 +1653,11 @@ fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
         MAX_GLOB_RESULTS,
     )?;
     let ignore_case = bool_arg(args, "ignore_case", false);
+    // Asking for a generated directory by name (`node_modules/**`) is asking to look inside it.
+    let all = bool_arg(args, "all", false) || patterns.iter().any(|p| names_skipped_dir(p)) || names_skipped_dir(raw_path);
+    let mut skipped: Vec<String> = Vec::new();
 
-    // The `max_results` newest hits, kept as a min-heap whose top is the worst one kept, so memory
-    // stays bounded and a late, newer file still displaces an older one.
-    let mut hits: BinaryHeap<Reverse<(SystemTime, Reverse<PathBuf>)>> = BinaryHeap::new();
-    let keep = |hits: &mut BinaryHeap<Reverse<(SystemTime, Reverse<PathBuf>)>>, modified: SystemTime, p: &Path| {
-        if hits.len() < max_results || hits.peek().is_some_and(|Reverse((t, _))| modified >= *t) {
-            hits.push(Reverse((modified, Reverse(p.to_path_buf()))));
-            if hits.len() > max_results {
-                hits.pop();
-            }
-        }
-    };
+    let mut hits = Newest::new();
     let mut count = 0usize;
     let scanned: usize;
     let mut scan_capped = false;
@@ -1128,14 +1672,30 @@ fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
             .unwrap_or_default();
         if matches_any(&patterns, &rel, &rel, ignore_case) {
             count = 1;
-            keep(&mut hits, md.modified().unwrap_or(UNIX_EPOCH), &root_path);
+            keep_newest(&mut hits, max_results, md.modified().unwrap_or(UNIX_EPOCH), &root_path);
         }
     } else {
         // Match inside the walk: only hits are stored, and a hit's mtime comes from the directory entry
-        // (free on Windows) instead of a second stat.
-        let mut walked = 0usize;
-        walk_files(&root_path, |p, entry| {
-            walked += 1;
+        // (free on Windows) instead of a second stat. Each walker thread keeps its own newest hits;
+        // the newest `max_results` of all of them are the newest overall, whatever order they arrive in.
+        // Patterns with a directory part (`src/**/*.rs`) can only match below it: read just that range.
+        let mut hints: Vec<String> = Vec::new();
+        if !ignore_case && patterns.iter().all(|p| p.contains('/') && !literal_dir(p).is_empty()) {
+            let mut dirs: Vec<String> = patterns.iter().map(|p| literal_dir(p)).collect();
+            // By path component, not by string: `src-x` sorts before `src/a`, which would hide that `src` covers it.
+            dirs.sort_by(|a, b| a.split('/').cmp(b.split('/')));
+            // Exact case on every platform: the matcher is case-sensitive, so `Src` and `src/deep` are different ranges.
+            dirs.dedup_by(|b, a| b == a || b.strip_prefix(a.as_str()).is_some_and(|rest| rest.starts_with('/')));
+            hints = dirs;
+        }
+        // No `**` and a `/` in every pattern: a match lies as many directories down as the pattern has.
+        let max_depth = if patterns.iter().all(|p| p.contains('/') && !p.contains("**")) {
+            patterns.iter().map(|p| p.split('/').count() - 1).max()
+        } else {
+            None
+        };
+        let (parts, skipped_dirs) = walk_bounded(&root_path, all, &hints, max_depth, GlobPart::default, |part, p, meta| {
+            part.walked += 1;
             let rel = p
                 .strip_prefix(&root_path)
                 .unwrap_or(p)
@@ -1146,14 +1706,19 @@ fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
                 .map(|s| s.to_string_lossy())
                 .unwrap_or_default();
             if matches_any(&patterns, &rel, &base, ignore_case) {
-                count += 1;
-                let modified = entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(UNIX_EPOCH);
-                keep(&mut hits, modified, p);
+                part.count += 1;
+                keep_newest(&mut part.hits, max_results, meta.modified(), p);
             }
         });
+        skipped = skipped_dirs;
+        let mut walked = 0usize;
+        for part in parts {
+            walked += part.walked;
+            count += part.count;
+            for Reverse((modified, Reverse(p))) in part.hits {
+                keep_newest(&mut hits, max_results, modified, &p);
+            }
+        }
         scan_capped = walked >= MAX_WALK_FILES;
         scanned = walked;
     }
@@ -1179,6 +1744,9 @@ fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
     if scan_capped {
         out.push_str("[qx] scan stopped at the file budget; results may be incomplete.\n");
     }
+    if !skipped.is_empty() {
+        out.push_str(&skip_note(&skipped));
+    }
     Ok(Reply {
         text: out,
         structured: json!({
@@ -1194,6 +1762,27 @@ fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
     })
 }
 
+/// The newest hits of a glob, as a min-heap whose top is the worst one kept: memory stays
+/// bounded and a late, newer file still displaces an older one.
+type Newest = BinaryHeap<Reverse<(SystemTime, Reverse<PathBuf>)>>;
+
+/// What one walker thread found.
+#[derive(Default)]
+struct GlobPart {
+    hits: Newest,
+    count: usize,
+    walked: usize,
+}
+
+fn keep_newest(hits: &mut Newest, max_results: usize, modified: SystemTime, p: &Path) {
+    if hits.len() < max_results || hits.peek().is_some_and(|Reverse((t, _))| modified >= *t) {
+        hits.push(Reverse((modified, Reverse(p.to_path_buf()))));
+        if hits.len() > max_results {
+            hits.pop();
+        }
+    }
+}
+
 fn matches_any(patterns: &[String], rel: &str, base: &str, ignore_case: bool) -> bool {
     patterns.iter().any(|p| {
         let text = if p.contains('/') { rel } else { base };
@@ -1203,17 +1792,29 @@ fn matches_any(patterns: &[String], rel: &str, base: &str, ignore_case: bool) ->
 
 // --------------------------------------------------------------------- grep
 
+/// How one `grep` call matches a line: a regex (what the dsh grep tool takes) or plain text.
+enum Matcher {
+    Re(regex::Regex),
+    Lit { needle: String, ci: bool },
+}
+
+impl Matcher {
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            Matcher::Re(re) => re.is_match(line),
+            Matcher::Lit { needle, ci: false } => line.contains(needle.as_str()),
+            Matcher::Lit { needle, ci: true } => contains_ascii_ci(line, needle),
+        }
+    }
+}
+
 fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     let needle = req_str(args, "pattern")?;
     let raw_path = path_arg(args).unwrap_or(".");
-    let root_path = root.resolve_existing(raw_path).map_err(|e| e.fb("grep"))?;
+    let root_path = root.resolve_read(raw_path).map_err(|e| e.fb("grep"))?;
     if needle.contains(['\n', '\r']) {
-        return Err(FsError::new(
-            "FS_UNSUPPORTED",
-            format!(
-                "qx grep matches single lines; a pattern with a line break never matches (use the native {} tool)",
-                native(Native::Grep)
-            ),
+        return Err(FsError::arg(
+            "pattern is matched line by line: remove the line break (match one line, or one line at a time)",
         )
         .fb("grep"));
     }
@@ -1221,25 +1822,24 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     if let Some(inc) = include {
         // A comma inside braces (`*.{ts,tsx}`) is one glob; only a top-level comma is a list.
         if split_top_level(inc).len() > 1 {
-            return Err(FsError::arg(format!(
-                "include takes one glob; comma-separated lists are not supported (use *.{{a,b}} or the native {} tool)",
-                native(Native::Grep)
-            ))
+            return Err(FsError::arg(
+                "include takes one glob; comma-separated lists are not supported (use *.{a,b})",
+            )
             .fb("grep"));
         }
         if inc.starts_with('!') {
             return Err(FsError::new(
                 "FS_UNSUPPORTED",
-                format!(
-                    "negated include globs are not supported by qx; use the native {} tool",
-                    native(Native::Grep)
-                ),
+                "negated include globs are not supported; search with a narrower include",
             )
             .fb("grep"));
         }
     }
     let include_patterns = include.map(|s| expand_braces(&s.replace('\\', "/")));
     let ignore_case = bool_arg(args, "ignore_case", false);
+    let all = bool_arg(args, "all", false)
+        || names_skipped_dir(raw_path)
+        || include_patterns.as_ref().is_some_and(|ps| ps.iter().any(|p| names_skipped_dir(p)));
     let max_matches = usize_arg(
         args,
         "max_matches",
@@ -1251,23 +1851,54 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
         args,
         "max_line_chars",
         DEFAULT_GREP_LINE_CHARS,
-        80,
+        20,
         MAX_READ_LINE_CHARS,
     )?;
 
-    let mut files: Vec<PathBuf> = Vec::new();
+    // Regex by default, like the dsh grep tool. A pattern that is not a valid regex (`foo(`, a lone `[`)
+    // is searched as plain text instead of failing, and the reply says so.
+    let mut literal_fallback = false;
+    let matcher = if bool_arg(args, "literal", false) {
+        Matcher::Lit {
+            needle: if ignore_case { needle.to_ascii_lowercase() } else { needle.to_string() },
+            ci: ignore_case,
+        }
+    } else {
+        match regex::RegexBuilder::new(needle)
+            .case_insensitive(ignore_case)
+            .size_limit(32 * 1024 * 1024)
+            .build()
+        {
+            Ok(re) => Matcher::Re(re),
+            Err(_) => {
+                literal_fallback = true;
+                Matcher::Lit {
+                    needle: if ignore_case { needle.to_ascii_lowercase() } else { needle.to_string() },
+                    ci: ignore_case,
+                }
+            }
+        }
+    };
+
+    // With the file's mtime when the index supplied the list: that is what makes its cached text usable.
+    let mut files: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
     let md = fs::metadata(&root_path)
         .map_err(|e| FsError::io(format!("cannot stat \"{raw_path}\""), e).fb("grep"))?;
     let mut scan_capped = false;
+    let mut skipped_dirs: Vec<String> = Vec::new();
     if md.is_file() {
-        files.push(root_path.clone());
+        files.push((root_path.clone(), None));
     } else {
-        walk_files(&root_path, |p, _| files.push(p.to_path_buf()));
+        let (parts, skipped) = walk_files(&root_path, all, Vec::new, |found: &mut Vec<(PathBuf, Option<SystemTime>)>, p, meta| {
+            found.push((p.to_path_buf(), meta.indexed_mtime()))
+        });
+        skipped_dirs = skipped;
+        files = parts.into_iter().flatten().collect();
         scan_capped = files.len() >= MAX_WALK_FILES;
     }
     // No sort here: matching files are sorted by path below, which fixes the output order.
     if let Some(patterns) = &include_patterns {
-        files.retain(|p| {
+        files.retain(|(p, _)| {
             let rel = p
                 .strip_prefix(&root_path)
                 .unwrap_or(p)
@@ -1281,37 +1912,52 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
         });
     }
 
-    let threads = fs_threads().min(files.len().max(1));
-    let chunk = (files.len() + threads - 1) / threads.max(1);
+    let trace = std::env::var_os("QX_FS_TRACE").is_some();
+    let t_scan = Instant::now();
     let panicked = AtomicBool::new(false);
-    let mut scans: Vec<ScanFile> = if threads <= 1 || files.len() < 24 {
+    let fast = fast_regex(&matcher, needle, bool_arg(args, "literal", false), ignore_case);
+    let fast = fast.as_ref();
+    let matcher = &matcher;
+    // Threads cost ~60 us each to start: only as many as the work is worth. A file whose text is
+    // cached takes ~10 us; one that must be opened and read, ~150 us.
+    let cold = files.iter().filter(|(p, m)| m.map_or(true, |m| content_get(p, m).is_none())).count();
+    let work_us = cold * 150 + (files.len() - cold) * 10;
+    let threads = fs_threads().min(files.len().max(1)).min(work_us / 400 + 1);
+    let mut scans: Vec<ScanFile> = if threads <= 1 {
         files
             .iter()
-            .map(|p| scan_file(p, needle, ignore_case, max_line_chars, max_matches))
+            .map(|(p, m)| scan_file(p, *m, matcher, fast, max_line_chars, max_matches))
             .collect()
     } else {
+        // Each thread takes the next unread file, so one big file does not leave the others idle.
+        let next = AtomicUsize::new(0);
         std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for part in files.chunks(chunk) {
-                handles.push(scope.spawn(move || {
-                    part.iter()
-                        .map(|p| scan_file(p, needle, ignore_case, max_line_chars, max_matches))
-                        .collect::<Vec<_>>()
-                }));
-            }
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut mine = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some((p, m)) = files.get(i) else { break };
+                            mine.push(scan_file(p, *m, matcher, fast, max_line_chars, max_matches));
+                        }
+                        mine
+                    })
+                })
+                .collect();
             let mut out = Vec::with_capacity(files.len());
             for h in handles {
-                match h.join() {
-                    Ok(v) => out.extend(v),
-                    Err(_) => {
-                        panicked.store(true, Ordering::Relaxed);
-                    }
+                if let Ok(v) = h.join() {
+                    out.extend(v);
                 }
             }
             out
         })
     };
-
+    if trace {
+        let big = scans.iter().filter(|s| s.large).count();
+        eprintln!("[grep] files {} cold {} threads {} scan {:?} large {} fast {}", files.len(), cold, threads, t_scan.elapsed(), big, fast.is_some());
+    }
     let total: usize = scans.iter().map(|s| s.total).sum();
     let skipped_binary: usize = scans.iter().filter(|s| s.binary).count();
     let skipped_large: usize = scans.iter().filter(|s| s.large).count();
@@ -1320,58 +1966,57 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     scans.sort_by(|a, b| a.path.cmp(&b.path));
     let with_matches = scans.len();
 
+    // Grouped by file, like the dsh grep tool: the path is said once per file, not once per match.
     let mut out = String::new();
     let mut shown = 0usize;
+    if total > 0 {
+        out.push_str(&format!(
+            "Found {total} match{} in {with_matches} file{}\n",
+            if total == 1 { "" } else { "es" },
+            if with_matches == 1 { "" } else { "s" }
+        ));
+    }
     'files: for sf in &scans {
+        if shown >= max_matches {
+            break;
+        }
+        out.push('\n');
+        out.push_str(&root.display(&sf.path));
         for m in &sf.matches {
             if shown >= max_matches {
                 break 'files;
             }
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(&format!(
-                "{}:{}: {}",
-                root.display(&sf.path),
-                m.line,
-                m.text
-            ));
+            out.push('\n');
+            push_usize(&mut out, m.line);
+            out.push_str(": ");
+            out.push_str(&m.text);
             shown += 1;
         }
     }
     if total == 0 {
         out.push_str("No matches found.\n");
-        // `TODO|FIXME`, `fn\s+main`: a model often means a regex; say this search was literal.
-        if needle.contains(['|', '\\', '*', '[', '(', '^', '$', '+']) {
-            out.push_str(&format!(
-                "[qx] the pattern was searched as literal text; for a regex use the native {} tool\n",
-                native(Native::Grep)
-            ));
-        }
     } else if total > shown {
         out.push_str(&format!(
-            "\n[qx] showing {shown} of {total} matches; narrow the search or use the native {} tool.\n",
-            native(Native::Grep)
+            "\n[qx] showing {shown} of {total} matches; narrow the pattern, path or include.\n"
         ));
+    } else {
+        out.push('\n');
+    }
+    if literal_fallback {
+        out.push_str("[qx] the pattern is not a valid regex; it was searched as plain text.\n");
     }
     if skipped_binary > 0 || skipped_large > 0 || read_errors > 0 {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
         out.push_str(&format!(
             "[qx] skipped {skipped_binary} binary, {skipped_large} large, {read_errors} unreadable file(s).\n"
         ));
     }
+    if !skipped_dirs.is_empty() {
+        out.push_str(&skip_note(&skipped_dirs));
+    }
     if scan_capped {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
         out.push_str("[qx] scan stopped at the file budget; results may be incomplete.\n");
     }
     if panicked.load(Ordering::Relaxed) {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
         out.push_str("[qx] a scan worker failed; results may be incomplete.\n");
     }
     Ok(Reply {
@@ -1407,13 +2052,58 @@ struct ScanFile {
     error: bool,
 }
 
-fn scan_file(
-    path: &Path,
-    needle: &str,
-    ignore_case: bool,
-    max_line_chars: usize,
-    max_store: usize,
-) -> ScanFile {
+/// What a search found in a file the last time it read it, valid while the index still reports the
+/// same mtime. Opening and reading a file costs 100-200 us on Windows even when it is cached by the OS;
+/// a search over a settled workspace is then pure memory.
+enum Cached {
+    Text(std::sync::Arc<str>),
+    Binary,
+}
+
+static CONTENT: std::sync::RwLock<Option<HashMap<PathBuf, (SystemTime, Cached)>>> = std::sync::RwLock::new(None);
+static CONTENT_BYTES: AtomicUsize = AtomicUsize::new(0);
+const MAX_CONTENT_BYTES: usize = 128 << 20;
+const MAX_CACHED_FILE: usize = 256 << 10;
+/// A file written less than this long ago is read fresh: its writer may still be going.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn content_get(path: &Path, mtime: SystemTime) -> Option<Cached> {
+    let guard = CONTENT.read().ok()?;
+    let (m, c) = guard.as_ref()?.get(path)?;
+    if *m != mtime {
+        return None;
+    }
+    Some(match c {
+        Cached::Text(t) => Cached::Text(t.clone()),
+        Cached::Binary => Cached::Binary,
+    })
+}
+
+fn content_put(path: &Path, mtime: SystemTime, what: Cached) {
+    if SystemTime::now().duration_since(mtime).map_or(true, |age| age < SETTLE) {
+        return;
+    }
+    let size = match &what {
+        Cached::Text(t) => t.len() + 128,
+        Cached::Binary => 128,
+    };
+    if CONTENT_BYTES.load(Ordering::Relaxed) + size > MAX_CONTENT_BYTES {
+        return;
+    }
+    if let Ok(mut guard) = CONTENT.write() {
+        let map = guard.get_or_insert_with(HashMap::new);
+        if let Some((_, old)) = map.insert(path.to_path_buf(), (mtime, what)) {
+            let old_size = match old {
+                Cached::Text(t) => t.len() + 128,
+                Cached::Binary => 128,
+            };
+            CONTENT_BYTES.fetch_sub(old_size.min(CONTENT_BYTES.load(Ordering::Relaxed)), Ordering::Relaxed);
+        }
+        CONTENT_BYTES.fetch_add(size, Ordering::Relaxed);
+    }
+}
+
+fn scan_file(path: &Path, indexed: Option<SystemTime>, matcher: &Matcher, fast: Option<&regex::Regex>, max_line_chars: usize, max_store: usize) -> ScanFile {
     let mut sf = ScanFile {
         path: path.to_path_buf(),
         matches: Vec::new(),
@@ -1422,6 +2112,19 @@ fn scan_file(
         large: false,
         error: false,
     };
+    if let Some(m) = indexed {
+        match content_get(path, m) {
+            Some(Cached::Binary) => {
+                sf.binary = true;
+                return sf;
+            }
+            Some(Cached::Text(text)) => {
+                scan_text(&text, matcher, fast, max_line_chars, max_store, &mut sf);
+                return sf;
+            }
+            None => {}
+        }
+    }
     let md = match fs::metadata(path) {
         Ok(m) => m,
         Err(_) => {
@@ -1433,45 +2136,197 @@ fn scan_file(
         return sf;
     }
     if md.len() > MAX_GREP_FILE_BYTES {
-        sf.large = true;
+        if md.len() > MAX_GREP_STREAM_BYTES {
+            sf.large = true;
+            return sf;
+        }
+        scan_stream(path, matcher, fast, max_line_chars, max_store, &mut sf);
         return sf;
     }
-    let bytes = match fs::read(path) {
-        Ok(b) => b,
+    let bytes = match read_unless_binary(path, md.len()) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            sf.binary = true;
+            if let Some(m) = indexed {
+                content_put(path, m, Cached::Binary);
+            }
+            return sf;
+        }
         Err(_) => {
             sf.error = true;
             return sf;
         }
     };
-    if bytes.iter().take(8192).any(|&b| b == 0) {
-        sf.binary = true;
-        return sf;
-    }
     let text = crate::exec::decode(&bytes);
-    let needle_lower = if ignore_case {
-        needle.to_ascii_lowercase()
-    } else {
-        String::new()
+    if let Some(m) = indexed {
+        if bytes.len() <= MAX_CACHED_FILE {
+            content_put(path, m, Cached::Text(std::sync::Arc::from(&*text)));
+        }
+    }
+    scan_text(&text, matcher, fast, max_line_chars, max_store, &mut sf);
+    sf
+}
+
+/// The file's bytes, or `None` when its first 8 KB hold a NUL (a binary: the rest is never read).
+fn read_unless_binary(path: &Path, len: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut f = fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(len as usize + 1);
+    Read::by_ref(&mut f).take(8192).read_to_end(&mut bytes)?;
+    let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
+    if !utf16 && bytes.contains(&0) {
+        return Ok(None);
+    }
+    f.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+fn scan_text(text: &str, matcher: &Matcher, fast: Option<&regex::Regex>, max_line_chars: usize, max_store: usize, sf: &mut ScanFile) {
+    match fast {
+        Some(re) => scan_buffer(text, 1, re, matcher, max_line_chars, max_store, sf),
+        None => {
+            for (idx, line) in text.split('\n').enumerate() {
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                if !matcher.is_match(line) {
+                    continue;
+                }
+                sf.total += 1;
+                if sf.matches.len() < max_store {
+                    sf.matches.push(Match { line: idx + 1, text: clip_line(line, max_line_chars) });
+                }
+            }
+        }
+    }
+}
+
+/// Search the whole text at once and look only at the lines the search lands on. `re` is a
+/// multi-line version of the pattern that finds a superset of the matching lines; each line it
+/// names is then judged by the exact per-line `matcher`, so the answer is the same as testing
+/// every line, without testing the lines that cannot match.
+fn scan_buffer(text: &str, first_line: usize, re: &regex::Regex, matcher: &Matcher, max_line_chars: usize, max_store: usize, sf: &mut ScanFile) {
+    let bytes = text.as_bytes();
+    let (mut cursor, mut counted_to, mut line_no) = (0usize, 0usize, first_line);
+    while cursor <= text.len() {
+        let Some(m) = re.find_at(text, cursor) else { break };
+        let s = m.start();
+        let ls = bytes[..s].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let le = bytes[s..].iter().position(|&b| b == b'\n').map_or(text.len(), |i| s + i);
+        let line = text[ls..le].strip_suffix('\r').unwrap_or(&text[ls..le]);
+        cursor = le + 1;
+        if !matcher.is_match(line) {
+            continue;
+        }
+        line_no += bytes[counted_to..ls].iter().filter(|&&b| b == b'\n').count();
+        counted_to = ls;
+        sf.total += 1;
+        if sf.matches.len() < max_store {
+            sf.matches.push(Match { line: line_no, text: clip_line(line, max_line_chars) });
+        }
+    }
+}
+
+/// The multi-line search expression for `scan_buffer`, when it is certain to find every line the
+/// per-line matcher would accept: a pattern with no anchors or flags that mean something different
+/// on a whole text than on one line.
+fn fast_regex(matcher: &Matcher, pattern: &str, literal: bool, ignore_case: bool) -> Option<regex::Regex> {
+    let source = match matcher {
+        Matcher::Lit { needle, ci } if literal || !pattern.is_empty() => {
+            let _ = ci;
+            if needle.is_empty() {
+                return None;
+            }
+            format!("{}{}", if *ci { "(?i)" } else { "" }, regex::escape(needle))
+        }
+        Matcher::Re(_) => {
+            let p = pattern;
+            if p.is_empty() || p.contains("\\A") || p.contains("\\z") || p.contains("\\Z") || p.contains("\\n") || p.contains("\\r") {
+                return None;
+            }
+            // Only plain groups and `(?i)`: any other flag could change what `^`, `$` or `.` mean.
+            let mut rest = p;
+            while let Some(i) = rest.find("(?") {
+                let after = &rest[i + 2..];
+                if !(after.starts_with(':') || after.starts_with("i)") || after.starts_with("P<") || after.starts_with('<')) {
+                    return None;
+                }
+                rest = after;
+            }
+            format!("(?mR){}{p}", if ignore_case { "(?i)" } else { "" })
+        }
+        _ => return None,
     };
-    for (idx, line) in text.split('\n').enumerate() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        let hit = if ignore_case {
-            contains_ascii_ci(line, &needle_lower)
-        } else {
-            line.contains(needle)
-        };
-        if !hit {
+    regex::RegexBuilder::new(&source).size_limit(32 * 1024 * 1024).build().ok()
+}
+
+/// A file too big to load whole is searched line by line.
+fn scan_stream(path: &Path, matcher: &Matcher, fast: Option<&regex::Regex>, max_line_chars: usize, max_store: usize, sf: &mut ScanFile) {
+    use std::io::{BufRead, BufReader, Read};
+    let Ok(f) = fs::File::open(path) else {
+        sf.error = true;
+        return;
+    };
+    let mut r = BufReader::with_capacity(1 << 20, f);
+    match r.fill_buf() {
+        Ok(head) if head.iter().take(8192).any(|&b| b == 0) => {
+            sf.binary = true;
+            return;
+        }
+        Err(_) => {
+            sf.error = true;
+            return;
+        }
+        _ => {}
+    }
+    if let Some(re) = fast {
+        // 4 MB at a time, cut at the last line break: the whole-buffer search at memory speed.
+        const CHUNK: usize = 4 << 20;
+        let mut carry: Vec<u8> = Vec::new();
+        let mut first_line = 1usize;
+        let mut block = vec![0u8; CHUNK];
+        loop {
+            let n = match r.read(&mut block) {
+                Ok(n) => n,
+                Err(_) => {
+                    sf.error = true;
+                    return;
+                }
+            };
+            carry.extend_from_slice(&block[..n]);
+            let cut = if n == 0 { carry.len() } else { carry.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1) };
+            if cut > 0 {
+                let text = String::from_utf8_lossy(&carry[..cut]);
+                scan_buffer(&text, first_line, re, matcher, max_line_chars, max_store, sf);
+                first_line += carry[..cut].iter().filter(|&&b| b == b'\n').count();
+                carry.drain(..cut);
+            }
+            if n == 0 {
+                return;
+            }
+        }
+    }
+    let mut buf = Vec::new();
+    let mut idx = 0usize;
+    loop {
+        buf.clear();
+        match r.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => {
+                sf.error = true;
+                break;
+            }
+        }
+        idx += 1;
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim_end_matches(['\n', '\r']);
+        if !matcher.is_match(line) {
             continue;
         }
         sf.total += 1;
         if sf.matches.len() < max_store {
-            sf.matches.push(Match {
-                line: idx + 1,
-                text: clip_line(line, max_line_chars),
-            });
+            sf.matches.push(Match { line: idx, text: clip_line(line, max_line_chars) });
         }
     }
-    sf
 }
 
 fn contains_ascii_ci(hay: &str, needle_lower: &str) -> bool {
@@ -1487,11 +2342,16 @@ fn contains_ascii_ci(hay: &str, needle_lower: &str) -> bool {
         .any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b))
 }
 
+/// What a search left out on purpose, so "no matches" is never mistaken for "searched everywhere".
+fn skip_note(skipped: &[String]) -> String {
+    format!("[qx] not searched: {} (all=true includes them)\n", skipped.join(", "))
+}
+
 // --------------------------------------------------------------------- list
 
 fn list(root: &Root, args: &Value) -> Result<Reply, FsError> {
     let raw = path_arg(args).unwrap_or(".");
-    let path = root.resolve_existing(raw).map_err(|e| e.fb("list"))?;
+    let path = root.resolve_read(raw).map_err(|e| e.fb("list"))?;
     let md = fs::metadata(&path)
         .map_err(|e| FsError::io(format!("cannot stat \"{raw}\""), e).fb("list"))?;
     let mut rows: Vec<(u8, String, u64, String)> = Vec::new();
@@ -1533,6 +2393,9 @@ fn list(root: &Root, args: &Value) -> Result<Reply, FsError> {
 
     let shown = rows.len().min(MAX_LIST_ENTRIES);
     let mut out = String::new();
+    if rows.is_empty() {
+        out.push_str("(empty)\n");
+    }
     for (kind, name, size, extra) in rows.iter().take(shown) {
         match kind {
             0 => out.push_str(&format!("d {name}/\n")),
@@ -1562,7 +2425,7 @@ fn list(root: &Root, args: &Value) -> Result<Reply, FsError> {
 
 fn stat(root: &Root, args: &Value) -> Result<Reply, FsError> {
     let raw = req_path(args)?;
-    let path = root.resolve_existing(raw).map_err(|e| e.fb("stat"))?;
+    let path = root.resolve_read(raw).map_err(|e| e.fb("stat"))?;
     let md = fs::metadata(&path)
         .map_err(|e| FsError::io(format!("cannot stat \"{raw}\""), e).fb("stat"))?;
     let kind = if md.is_dir() {
@@ -1643,46 +2506,305 @@ pub(crate) fn walk_every_file<F: FnMut(&Path) -> bool>(root: &Path, mut visit: F
     whole
 }
 
-pub(crate) fn walk_files<F: FnMut(&Path, &fs::DirEntry)>(root: &Path, mut visit: F) {
-    let mut files = 0usize;
-    walk_dir(root, root, 0, &mut files, &mut visit);
+/// What a walk knows about a file it visits: the directory entry of a live walk, or the mtime the
+/// index holds.
+pub(crate) enum FileMeta<'a> {
+    Live(&'a fs::DirEntry),
+    Cached(SystemTime),
 }
 
-fn walk_dir<F: FnMut(&Path, &fs::DirEntry)>(
-    root: &Path,
-    dir: &Path,
-    depth: usize,
-    files: &mut usize,
-    visit: &mut F,
-) {
-    if depth > MAX_WALK_DEPTH || *files >= MAX_WALK_FILES {
-        return;
+impl FileMeta<'_> {
+    /// The mtime when it came from the index (the one a cached copy of the content is keyed by).
+    pub(crate) fn indexed_mtime(&self) -> Option<SystemTime> {
+        match self {
+            FileMeta::Live(_) => None,
+            FileMeta::Cached(t) => Some(*t),
+        }
     }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+
+    pub(crate) fn modified(&self) -> SystemTime {
+        match self {
+            FileMeta::Live(e) => e.metadata().and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH),
+            FileMeta::Cached(t) => *t,
+        }
+    }
+}
+
+pub(crate) fn skip_dir_name(name: &str) -> bool {
+    skip_dir(name, false)
+}
+
+pub(crate) fn vcs_dir_name(name: &str) -> bool {
+    is_vcs_dir(name)
+}
+
+pub(crate) fn walk_files<S, I, F>(root: &Path, all: bool, init: I, visit: F) -> (Vec<S>, Vec<String>)
+where
+    S: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, &Path, &FileMeta) + Sync,
+{
+    walk_hinted(root, all, &[], init, visit)
+}
+
+/// `walk_files` that may start from the workspace index. `hints` are directories below `root`
+/// (`/`-separated) that hold every file the caller can match; an empty list means all of `root`.
+pub(crate) fn walk_hinted<S, I, F>(root: &Path, all: bool, hints: &[String], init: I, visit: F) -> (Vec<S>, Vec<String>)
+where
+    S: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, &Path, &FileMeta) + Sync,
+{
+    walk_bounded(root, all, hints, None, init, visit)
+}
+
+/// `walk_hinted` that also knows how deep a match can lie: `max_depth` is the number of directory
+/// levels below `root` whose files can match (`src/*.rs` -> 1). Without an index the live walk then
+/// starts in the hinted directories and never descends past that depth, instead of reading the tree.
+pub(crate) fn walk_bounded<S, I, F>(
+    root: &Path,
+    all: bool,
+    hints: &[String],
+    max_depth: Option<usize>,
+    init: I,
+    visit: F,
+) -> (Vec<S>, Vec<String>)
+where
+    S: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, &Path, &FileMeta) + Sync,
+{
+    if !all {
+        if let Some((snap, prefix)) = crate::index::snapshot(root) {
+            return walk_snapshot(&snap, &prefix, hints, init, visit);
+        }
+    }
+    // A hint that steps out of the root (`..`) or is not a plain directory name falls back to the root.
+    let usable = !hints.is_empty()
+        && hints.iter().all(|h| !h.is_empty() && h.split('/').all(|s| !s.is_empty() && s != "." && s != ".." && !s.contains(':')));
+    let starts: Vec<(PathBuf, usize)> = if usable {
+        hints.iter().map(|h| (root.join(h), h.split('/').count())).collect()
+    } else {
+        vec![(root.to_path_buf(), 0)]
     };
-    for entry in entries.flatten() {
-        if *files >= MAX_WALK_FILES {
+    walk_from(root, all, starts, max_depth.unwrap_or(MAX_WALK_DEPTH).min(MAX_WALK_DEPTH), init, visit)
+}
+
+fn walk_snapshot<S, I, F>(snap: &crate::index::Snapshot, prefix: &str, hints: &[String], init: I, visit: F) -> (Vec<S>, Vec<String>)
+where
+    S: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, &Path, &FileMeta) + Sync,
+{
+    let join = |h: &str| if prefix.is_empty() { h.to_string() } else if h.is_empty() { prefix.to_string() } else { format!("{prefix}/{h}") };
+    let mut ranges: Vec<&[crate::index::Entry]> = Vec::new();
+    if hints.is_empty() {
+        ranges.push(snap.range(prefix));
+    } else {
+        for h in hints {
+            ranges.push(snap.range(&join(h)));
+        }
+    }
+    let total: usize = ranges.iter().map(|r| r.len()).sum();
+    let all: Vec<&crate::index::Entry> = ranges.into_iter().flatten().collect();
+    let skipped: Vec<String> = snap.skipped.iter().cloned().collect();
+    const CHUNK: usize = 1024;
+    let threads = fs_threads().min(total / CHUNK + 1);
+    let next = AtomicUsize::new(0);
+    let run = || {
+        let mut part = init();
+        loop {
+            let start = next.fetch_add(CHUNK, Ordering::Relaxed);
+            if start >= all.len() {
+                break;
+            }
+            for e in &all[start..(start + CHUNK).min(all.len())] {
+                visit(&mut part, e.path.as_path(), &FileMeta::Cached(e.modified));
+            }
+        }
+        part
+    };
+    let parts = if threads <= 1 {
+        vec![run()]
+    } else {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (1..threads).map(|_| scope.spawn(run)).collect();
+            let mut parts = vec![run()];
+            for h in handles {
+                match h.join() {
+                    Ok(part) => parts.push(part),
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            }
+            parts
+        })
+    };
+    (parts, skipped)
+}
+
+/// The directory every file matching `pattern` lies under, without a wildcard in it.
+fn literal_dir(pattern: &str) -> String {
+    let segs: Vec<&str> = pattern.split('/').collect();
+    let mut keep = Vec::new();
+    for (i, s) in segs.iter().enumerate() {
+        if i + 1 == segs.len() || s.contains(['*', '?', '[', '{', '\\']) {
+            break;
+        }
+        keep.push(*s);
+    }
+    keep.join("/")
+}
+
+/// Visit every file below `root`, skipping the generated directories of `skip_dir`, on up to
+/// `fs_threads()` threads. Each thread gets its own `init()` state and `visit` sees only that, so
+/// no locking sits on the hot path; the states come back in no particular order. Symlinks are not
+/// followed, and the walk stops visiting at `MAX_WALK_FILES` files (which ones is then up to
+/// timing).
+pub(crate) fn walk_live<S, I, F>(root: &Path, all: bool, init: I, visit: F) -> (Vec<S>, Vec<String>)
+where
+    S: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, &Path, &FileMeta) + Sync,
+{
+    walk_from(root, all, vec![(root.to_path_buf(), 0)], MAX_WALK_DEPTH, init, visit)
+}
+
+fn walk_from<S, I, F>(root: &Path, all: bool, starts: Vec<(PathBuf, usize)>, limit: usize, init: I, visit: F) -> (Vec<S>, Vec<String>)
+where
+    S: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, &Path, &FileMeta) + Sync,
+{
+    let starts: Vec<(PathBuf, usize)> = starts.into_iter().filter(|(p, d)| *d <= limit && p.is_dir()).collect();
+    if starts.is_empty() {
+        return (vec![init()], Vec::new());
+    }
+    let walk = Walk {
+        root,
+        all,
+        limit,
+        skipped: Mutex::new(std::collections::BTreeSet::new()),
+        state: Mutex::new(WalkState {
+            pending: starts.len(),
+            dirs: starts,
+        }),
+        wake: Condvar::new(),
+        files: AtomicUsize::new(0),
+    };
+    let run = || {
+        let mut part = init();
+        walk.work(&mut part, &visit);
+        part
+    };
+    let helpers = fs_threads() - 1;
+    let parts = if helpers == 0 {
+        vec![run()]
+    } else {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..helpers).map(|_| scope.spawn(run)).collect();
+            let mut parts = vec![run()];
+            for h in handles {
+                match h.join() {
+                    Ok(part) => parts.push(part),
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            }
+            parts
+        })
+    };
+    let skipped = walk.skipped.into_inner().unwrap_or_else(|e| e.into_inner()).into_iter().collect();
+    (parts, skipped)
+}
+
+struct Walk<'a> {
+    root: &'a Path,
+    /// Also enter the generated directories of `skip_dir` (never VCS metadata).
+    all: bool,
+    /// Deepest directory level whose files are visited (the root is level 0).
+    limit: usize,
+    /// Generated directories left out, so a reply can say what it did not search.
+    skipped: Mutex<std::collections::BTreeSet<String>>,
+    state: Mutex<WalkState>,
+    wake: Condvar,
+    files: AtomicUsize,
+}
+
+struct WalkState {
+    dirs: Vec<(PathBuf, usize)>,
+    /// Directories queued or being read; the walk is over when it reaches zero.
+    pending: usize,
+}
+
+/// Marks one directory as read, even when `visit` panics, so no thread waits on it forever.
+struct DirDone<'a>(&'a Walk<'a>);
+
+impl Drop for DirDone<'_> {
+    fn drop(&mut self) {
+        let mut st = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.pending -= 1;
+        if st.pending == 0 {
+            self.0.wake.notify_all();
+        }
+    }
+}
+
+impl Walk<'_> {
+    fn work<S, F: Fn(&mut S, &Path, &FileMeta)>(&self, part: &mut S, visit: &F) {
+        loop {
+            let (dir, depth) = {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(next) = st.dirs.pop() {
+                        break next;
+                    }
+                    if st.pending == 0 {
+                        return;
+                    }
+                    st = self.wake.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            let _done = DirDone(self);
+            self.read(&dir, depth, part, visit);
+        }
+    }
+
+    fn read<S, F: Fn(&mut S, &Path, &FileMeta)>(&self, dir: &Path, depth: usize, part: &mut S, visit: &F) {
+        if depth > self.limit || self.files.load(Ordering::Relaxed) >= MAX_WALK_FILES {
             return;
         }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Ok(ft) = entry.file_type() else {
-            continue;
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
         };
-        if ft.is_symlink() {
-            continue;
-        }
-        if ft.is_dir() {
-            if skip_dir(&name) {
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
                 continue;
             }
-            if let Some(child) = child_dir(&entry, root) {
-                walk_dir(root, &child, depth + 1, files, visit);
+            if ft.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if skip_dir(&name, self.all) {
+                    if !is_vcs_dir(&name) {
+                        self.skipped.lock().unwrap_or_else(|e| e.into_inner()).insert(name);
+                    }
+                    continue;
+                }
+                if depth >= self.limit {
+                    continue;
+                }
+                if let Some(child) = child_dir(&entry, self.root) {
+                    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    st.dirs.push((child, depth + 1));
+                    st.pending += 1;
+                    self.wake.notify_one();
+                }
+            } else if ft.is_file() {
+                if self.files.fetch_add(1, Ordering::Relaxed) >= MAX_WALK_FILES {
+                    return;
+                }
+                visit(part, &entry.path(), &FileMeta::Live(&entry));
             }
-        } else if ft.is_file() {
-            *files += 1;
-            visit(&entry.path(), &entry);
         }
     }
 }
@@ -1705,11 +2827,23 @@ fn child_dir(entry: &fs::DirEntry, root: &Path) -> Option<PathBuf> {
     canonical.starts_with(root).then_some(canonical)
 }
 
-fn skip_dir(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if matches!(lower.as_str(), ".git" | ".hg" | ".svn") {
+fn is_vcs_dir(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), ".git" | ".hg" | ".svn")
+}
+
+/// Whether a path or glob has a segment that is one of the skipped generated directories.
+fn names_skipped_dir(s: &str) -> bool {
+    s.split(['/', '\\']).any(|seg| !is_vcs_dir(seg) && skip_dir(seg, false))
+}
+
+fn skip_dir(name: &str, all: bool) -> bool {
+    if is_vcs_dir(name) {
         return true;
     }
+    if all {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
     matches!(
         lower.as_str(),
         "node_modules"
@@ -2010,7 +3144,7 @@ mod tests {
 
         let r = invoke(&dir, "write", json!({"path":"a.txt","content":"changed\n"}));
         assert!(!r.is_error, "{}", r.text);
-        assert!(r.text.contains("Updated file"));
+        assert!(r.text.contains("Updated file (+1 -3 lines)"), "{}", r.text);
         assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "changed\n");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2037,6 +3171,23 @@ mod tests {
     }
 
     #[test]
+    fn replace_all_stops_before_the_result_outgrows_the_cap() {
+        let dir = tmp("edit_cap");
+        let r = invoke(&dir, "write", json!({"path":"a.txt","content":"a\n".repeat(100)}));
+        assert!(!r.is_error, "{}", r.text);
+        let big = "b".repeat(MAX_EDIT_BYTES);
+        let r = invoke(
+            &dir,
+            "edit",
+            json!({"path":"a.txt","old_string":"a","new_string":big,"replace_all":true}),
+        );
+        assert!(r.is_error);
+        assert_eq!(r.structured["code"], "FS_TOO_LARGE", "{}", r.text);
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "a\n".repeat(100));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn write_new_file_and_edit_replace_all() {
         let dir = tmp("edit");
         let r = invoke(
@@ -2045,7 +3196,7 @@ mod tests {
             json!({"path":"src/a.rs","content":"let x = 1;\nlet x = 2;\n"}),
         );
         assert!(!r.is_error, "{}", r.text);
-        assert!(r.text.contains("Created file"));
+        assert!(r.text.contains("Created file (+2 -0 lines)"), "{}", r.text);
         let r = invoke(
             &dir,
             "edit",
@@ -2106,14 +3257,34 @@ mod tests {
     }
 
     #[test]
+    fn a_same_size_edit_in_the_middle_of_a_big_file_is_stale() {
+        let dir = tmp("stale-big");
+        let mut bytes = "0123456789012345678901234567890123456789\n".repeat(80_000).into_bytes(); // 3 MiB+
+        fs::write(dir.join("big.txt"), &bytes).unwrap();
+        assert!(!invoke(&dir, "read", json!({"path":"big.txt","limit":1})).is_error);
+        let mid = bytes.len() / 2;
+        bytes[mid] = b'X';
+        fs::write(dir.join("big.txt"), &bytes).unwrap();
+        let r = invoke(&dir, "write", json!({"path":"big.txt","content":"gone\n"}));
+        assert!(r.is_error, "{}", r.text);
+        assert_eq!(r.structured["code"], "FS_STALE");
+        assert_eq!(fs::read(dir.join("big.txt")).unwrap(), bytes);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn read_refuses_a_path_outside_cwd() {
         let base = tmp("outside");
         let cwd = base.join("work");
         fs::create_dir_all(&cwd).unwrap();
         fs::write(base.join("secret.txt"), "nope\n").unwrap();
+        // Reads may go anywhere; only mutations are confined to cwd.
         let r = invoke(&cwd, "read", json!({"path": base.join("secret.txt")}));
+        assert!(!r.is_error && r.text.contains("1: nope"), "{}", r.text);
+        let r = invoke(&cwd, "write", json!({"path": base.join("new.txt"), "content": "x"}));
         assert!(r.is_error);
         assert_eq!(r.structured["code"], "FS_OUTSIDE_WORKSPACE");
+        assert!(!base.join("new.txt").exists());
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -2172,14 +3343,74 @@ mod tests {
     }
 
     #[test]
+    fn write_refuses_a_directory_name_and_a_foreign_share_at_once() {
+        let dir = tmp("write-dirname");
+        for raw in ["newdir/", "newdir\\", "a/b/"] {
+            let r = invoke(&dir, "write", json!({"path":raw,"content":"x"}));
+            assert!(r.is_error && r.structured["code"] == "FS_BAD_ARG", "{raw:?}: {}", r.text);
+        }
+        assert!(!dir.join("newdir").exists() && !dir.join("a").exists());
+        #[cfg(windows)]
+        {
+            // 192.0.2.0/24 is reserved for documentation: probing it would wait for a timeout.
+            let t = Instant::now();
+            let r = invoke(&dir, "write", json!({"path":"\\\\192.0.2.1\\share\\x.txt","content":"x"}));
+            assert!(r.is_error && r.structured["code"] == "FS_OUTSIDE_WORKSPACE", "{}", r.text);
+            assert!(t.elapsed().as_secs() < 2, "{:?}", t.elapsed());
+            // A workspace on a share owns the paths under it, however they are spelled.
+            assert_eq!(unc_share(Path::new(r"\\localhost\C$\ws\a.txt")), unc_share(Path::new(r"\\?\UNC\LOCALHOST\c$\ws")));
+            assert_ne!(unc_share(Path::new(r"\\localhost\C$\ws")), unc_share(Path::new(r"\\other\C$\ws")));
+            assert_eq!(unc_share(Path::new(r"C:\ws")), None);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_mutation_lock_holds_other_processes_out_too() {
+        let guard = lock_mutation();
+        // A thread that skips the in-process lock and asks the system for the mutex stands for another process.
+        assert!(!std::thread::spawn(|| os_mutex::acquire(200)).join().unwrap());
+        drop(guard);
+        let free = std::thread::spawn(|| {
+            let got = os_mutex::acquire(5000);
+            if got {
+                os_mutex::release();
+            }
+            got
+        });
+        assert!(free.join().unwrap());
+    }
+
+    #[test]
+    fn grep_ignore_case_reaches_the_fast_path_for_regex_and_literal() {
+        let dir = tmp("grep-ci");
+        fs::write(dir.join("a.txt"), "Hello world\nhello world\nHELLO WORLD\nnothing\n").unwrap();
+        for args in [
+            json!({"pattern":"hello","ignore_case":true}),
+            json!({"pattern":"hel+o","ignore_case":true}),
+            json!({"pattern":"hello","ignore_case":true,"literal":true}),
+        ] {
+            let r = invoke(&dir, "grep", args.clone());
+            assert!(r.text.contains("Found 3 matches"), "{args}: {}", r.text);
+        }
+        let r = invoke(&dir, "grep", json!({"pattern":"hello"}));
+        assert!(r.text.contains("Found 1 match"), "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn grep_explains_patterns_that_cannot_match_literally() {
         let dir = tmp("grep-literal");
         fs::write(dir.join("a.txt"), "TODO: x\na\nb\n").unwrap();
         let r = invoke(&dir, "grep", json!({"pattern":"TODO|FIXME"}));
-        assert!(!r.is_error && r.text.contains("No matches found") && r.text.contains("literal"), "{}", r.text);
+        assert!(!r.is_error && r.text.contains("Found 1 match") && r.text.contains("1: TODO: x"), "{}", r.text);
+        // Not a valid regex: searched as text, and said so.
+        let r = invoke(&dir, "grep", json!({"pattern":"TODO: x("}));
+        assert!(r.text.contains("No matches found") && r.text.contains("not a valid regex"), "{}", r.text);
         let r = invoke(&dir, "grep", json!({"pattern":"a\nb"}));
         assert!(r.is_error, "{}", r.text);
-        assert_eq!(r.structured["code"], "FS_UNSUPPORTED");
+        assert_eq!(r.structured["code"], "FS_BAD_ARG");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2220,7 +3451,7 @@ mod tests {
             return;
         }
         let r = invoke(&work, "read", json!({"path":"out/secret.txt"}));
-        assert_eq!(r.structured["code"], "FS_OUTSIDE_WORKSPACE", "{}", r.text);
+        assert!(!r.is_error, "{}", r.text); // reads follow the junction; walks and writes do not
         let r = invoke(&work, "write", json!({"path":"out/new.txt","content":"x"}));
         assert!(r.is_error && !outside.join("new.txt").exists(), "{}", r.text);
         let r = invoke(&work, "grep", json!({"pattern":"secret"}));
@@ -2245,7 +3476,38 @@ mod tests {
         assert!(!r.is_error, "{}", r.text);
         assert!(r.text.contains("src/a.rs"));
         assert!(r.text.contains("src/b.txt"));
-        assert!(!r.text.contains("node_modules"));
+        assert!(!r.text.contains("node_modules/x.rs"));
+        assert!(r.text.contains("not searched: node_modules"), "{}", r.text);
+        // Naming the directory, or asking for all, looks inside it.
+        let r = invoke(&dir, "glob", json!({"pattern":"node_modules/**/*.rs"}));
+        assert!(r.text.contains("node_modules/x.rs"), "{}", r.text);
+        let r = invoke(&dir, "glob", json!({"pattern":"**/*.rs", "all": true}));
+        assert!(r.text.contains("node_modules/x.rs"), "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_and_grep_visit_every_file_of_a_wide_tree_once() {
+        let dir = tmp("wide-tree");
+        for a in 0..6 {
+            for b in 0..6 {
+                let leaf = dir.join(format!("a{a}/b{b}/c"));
+                fs::create_dir_all(&leaf).unwrap();
+                for f in 0..3 {
+                    fs::write(leaf.join(format!("f{f}.txt")), "needle\n").unwrap();
+                }
+            }
+        }
+        let r = invoke(&dir, "glob", json!({"pattern":"**/*.txt","max_results":1000}));
+        assert!(!r.is_error, "{}", r.text);
+        assert_eq!(r.structured["count"], 108);
+        assert_eq!(r.structured["scanned"], 108);
+        let listed: std::collections::HashSet<&str> = r.text.lines().collect();
+        assert_eq!(listed.len(), 108, "{}", r.text);
+
+        let r = invoke(&dir, "grep", json!({"pattern":"needle","max_matches":1000}));
+        assert!(!r.is_error, "{}", r.text);
+        assert_eq!(r.structured["count"], 108);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2282,17 +3544,19 @@ mod tests {
         fs::write(dir.join("src/b.txt"), "needle here too\n").unwrap();
         let r = invoke(&dir, "grep", json!({"pattern":"needle"}));
         assert!(!r.is_error, "{}", r.text);
-        assert!(r.text.contains("src/a.rs:2: needle here"));
-        assert!(r.text.contains("src/b.txt:1: needle here too"));
+        assert!(r.text.contains("src/a.rs\n2: needle here"), "{}", r.text);
+        assert!(r.text.contains("src/b.txt\n1: needle here too"), "{}", r.text);
         assert_eq!(r.structured["count"], 2);
 
         let r = invoke(&dir, "grep", json!({"pattern":"needle","include":"*.rs"}));
         assert!(r.text.contains("src/a.rs"));
         assert!(!r.text.contains("src/b.txt"));
 
-        // qx grep is literal: regex metacharacters do not change the match.
-        let r = invoke(&dir, "grep", json!({"pattern":"n.*e"}));
-        assert!(r.text.contains("No matches found"));
+        // The pattern is a regex; `literal` searches it as text.
+        let r = invoke(&dir, "grep", json!({"pattern":"n.*e\\b"}));
+        assert!(r.text.contains("src/a.rs"), "{}", r.text);
+        let r = invoke(&dir, "grep", json!({"pattern":"n.*e", "literal": true}));
+        assert!(r.text.contains("No matches found"), "{}", r.text);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2304,7 +3568,7 @@ mod tests {
         let r = invoke(&dir, "grep", json!({"pattern":"needle"}));
         assert!(!r.is_error, "{}", r.text);
         assert_eq!(r.structured["skipped_binary"], 1);
-        assert!(r.text.contains("a.txt:1: needle"));
+        assert!(r.text.contains("a.txt\n1: needle"), "{}", r.text);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2418,4 +3682,390 @@ mod tests {
         assert!(!glob_match("src/[!a].rs", "src/a.rs", false));
         assert!(glob_match("src/**/x?.rs", "src/a/b/x1.rs", false));
     }
-}
+
+    #[test]
+    fn batch_ops_paths_and_edits_save_round_trips() {
+        let dir = tmp("batch");
+        fs::write(dir.join("a.txt"), "alpha\nbeta\n").unwrap();
+        fs::write(dir.join("b.txt"), "one\n").unwrap();
+        let r = invoke(&dir, "read", json!({"paths":["a.txt","b.txt","missing.txt"]}));
+        assert!(!r.is_error && r.text.contains("== 1/3 read a.txt") && r.text.contains("1: one") && r.text.contains("FS_NOT_FOUND"), "{}", r.text);
+        assert_eq!(r.structured["failed"], 1);
+
+        // Edits apply in order to the evolving text, and all-or-nothing.
+        let r = invoke(&dir, "edit", json!({"path":"a.txt","edits":[
+            {"old_string":"alpha","new_string":"A"}, {"old_string":"A\nbeta","new_string":"AB"}]}));
+        assert!(!r.is_error, "{}", r.text);
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "AB\n");
+        let r = invoke(&dir, "edit", json!({"path":"a.txt","edits":[
+            {"old_string":"AB","new_string":"x"}, {"old_string":"zzz","new_string":"y"}]}));
+        assert!(r.is_error && r.text.contains("edits[1]"), "{}", r.text);
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "AB\n");
+
+        // A failed write/edit stops the rest of a mixed batch; reads before it still answer.
+        let r = call(&json!({"cwd": dir, "ops":[
+            {"op":"read","path":"b.txt"}, {"op":"edit","path":"b.txt","old_string":"nope","new_string":"x"},
+            {"op":"read","path":"b.txt"}]}) );
+        assert!(!r.is_error && r.text.contains("skipped"), "{}", r.text);
+        let r = call(&json!({"cwd": dir, "ops":[{"op":"read","ops":[]}]}));
+        assert!(r.is_error, "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn the_workspace_index_follows_every_change_at_once() {
+        let dir = tmp("index");
+        fs::create_dir_all(dir.join("src/deep")).unwrap();
+        fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        fs::write(dir.join("src/a.rs"), "fn alpha() {}\n").unwrap();
+        fs::write(dir.join("src/deep/b.rs"), "fn beta() {}\n").unwrap();
+        fs::write(dir.join("node_modules/pkg/x.rs"), "fn hidden() {}\n").unwrap();
+        crate::index::ensure(&dir);
+        let canon = fs::canonicalize(&dir).unwrap();
+        assert!(crate::index::snapshot(&canon).is_some(), "an index was built");
+        let glob = |p: &str| invoke(&dir, "glob", json!({"pattern": p})).text;
+        let names = |p: &str| {
+            let mut v: Vec<String> = glob(p).lines().filter(|l| !l.starts_with("[qx]")).map(String::from).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names("**/*.rs"), ["src/a.rs", "src/deep/b.rs"]);
+        // New file, new directory with files, a copy, a rename, a delete: each visible on the next call.
+        fs::write(dir.join("src/c.rs"), "fn gamma() {}\n").unwrap();
+        assert_eq!(names("src/*.rs"), ["src/a.rs", "src/c.rs"]);
+        fs::create_dir_all(dir.join("lib/inner")).unwrap();
+        fs::write(dir.join("lib/inner/d.rs"), "fn delta() {}\n").unwrap();
+        assert_eq!(names("lib/**/*.rs"), ["lib/inner/d.rs"]);
+        fs::rename(dir.join("src/deep"), dir.join("moved")).unwrap();
+        assert_eq!(names("**/*.rs"), ["lib/inner/d.rs", "moved/b.rs", "src/a.rs", "src/c.rs"]);
+        fs::remove_file(dir.join("src/a.rs")).unwrap();
+        fs::remove_dir_all(dir.join("lib")).unwrap();
+        assert_eq!(names("**/*.rs"), ["moved/b.rs", "src/c.rs"]);
+        // A generated directory stays out, and the reply says so.
+        assert!(glob("**/*.rs").contains("node_modules"), "{}", glob("**/*.rs"));
+        assert!(!glob("**/*.rs").contains("node_modules/pkg"));
+        // Grep reads what the files hold now, including a rewrite of a file it has already searched.
+        let g = |pat: &str| invoke(&dir, "grep", json!({"pattern": pat})).text;
+        assert!(g("gamma").contains("src/c.rs"), "{}", g("gamma"));
+        fs::write(dir.join("src/c.rs"), "fn omega() {}\n").unwrap();
+        assert!(g("gamma").contains("No matches"), "{}", g("gamma"));
+        assert!(g("omega").contains("src/c.rs"), "{}", g("omega"));
+        // A search that names the generated directory goes to the disk, not the index.
+        assert!(invoke(&dir, "glob", json!({"pattern": "node_modules/**/*.rs"})).text.contains("node_modules/pkg/x.rs"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn the_index_equals_a_fresh_walk_after_random_changes() {
+        let dir = tmp("index-stress");
+        crate::index::ensure(&dir);
+        let canon = fs::canonicalize(&dir).unwrap();
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let mut dirs: Vec<PathBuf> = vec![dir.clone()];
+        for step in 0..400 {
+            let d = dirs[next(dirs.len() as u64) as usize].clone();
+            match next(6) {
+                0 | 1 => {
+                    let _ = fs::write(d.join(format!("f{}.rs", next(40))), format!("x{step}"));
+                }
+                2 => {
+                    let n = d.join(format!("d{}", next(12)));
+                    if fs::create_dir_all(&n).is_ok() {
+                        dirs.push(n);
+                    }
+                }
+                3 => {
+                    let _ = fs::remove_file(d.join(format!("f{}.rs", next(40))));
+                }
+                4 => {
+                    if dirs.len() > 1 {
+                        let i = 1 + next(dirs.len() as u64 - 1) as usize;
+                        let gone = dirs.remove(i);
+                        let _ = fs::remove_dir_all(&gone);
+                        dirs.retain(|p| !p.starts_with(&gone));
+                    }
+                }
+                _ => {
+                    if dirs.len() > 2 {
+                        let i = 1 + next(dirs.len() as u64 - 1) as usize;
+                        let from = dirs[i].clone();
+                        let to = dir.join(format!("m{step}"));
+                        if fs::rename(&from, &to).is_ok() {
+                            dirs.retain(|p| !p.starts_with(&from));
+                            dirs.push(to);
+                        }
+                    }
+                }
+            }
+            if step % 40 == 39 {
+                let mut want: Vec<String> = Vec::new();
+                let (parts, _) = walk_live(&canon, false, Vec::<String>::new, |v, p, _| {
+                    v.push(p.strip_prefix(&canon).unwrap().to_string_lossy().replace('\\', "/"));
+                });
+                for p in parts {
+                    want.extend(p);
+                }
+                want.sort();
+                let (snap, _) = crate::index::snapshot(&canon).expect("index stays valid");
+                let got: Vec<String> = snap.files.iter().map(|e| e.rel.clone()).collect();
+                assert_eq!(got, want, "after step {step}");
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    #[ignore = "micro-benchmark: cargo test --release bench_fs -- --ignored --nocapture"]
+    fn bench_fs() {
+        let cwd = std::env::current_dir().unwrap();
+        let time = |name: &str, args: Value| {
+            for _ in 0..200 {
+                let _ = call(&args);
+            }
+            let n = 2000;
+            let t = Instant::now();
+            for _ in 0..n {
+                let _ = call(&args);
+            }
+            println!("{name:<14} {:>8.1} us/call", t.elapsed().as_secs_f64() * 1e6 / n as f64);
+        };
+        let c = cwd.to_string_lossy().to_string();
+        time("stat", json!({"op":"stat","cwd":c,"path":"Cargo.toml"}));
+        time("read", json!({"op":"read","cwd":c,"path":"Cargo.toml"}));
+        time("list src", json!({"op":"list","cwd":c,"path":"src"}));
+        time("glob src/*.rs", json!({"op":"glob","cwd":c,"pattern":"src/*.rs"}));
+        time("grep src", json!({"op":"grep","cwd":c,"pattern":"fn \\w+_schema","path":"src"}));
+        let r = Root::new(&json!({"cwd": c})).unwrap();
+        let t = Instant::now();
+        for _ in 0..2000 {
+            let _ = Root::new(&json!({"cwd": c}));
+        }
+        println!("Root::new      {:>8.1} us", t.elapsed().as_secs_f64() * 1e6 / 2000.0);
+        let t = Instant::now();
+        for _ in 0..2000 {
+            let _ = r.resolve_read("Cargo.toml");
+        }
+        println!("resolve_read   {:>8.1} us", t.elapsed().as_secs_f64() * 1e6 / 2000.0);
+        let t = Instant::now();
+        for _ in 0..2000 {
+            let _ = fs::metadata("Cargo.toml");
+        }
+        println!("fs::metadata   {:>8.1} us", t.elapsed().as_secs_f64() * 1e6 / 2000.0);
+        let t = Instant::now();
+        for _ in 0..2000 {
+            let _ = fs::canonicalize("Cargo.toml");
+        }
+        println!("canonicalize   {:>8.1} us", t.elapsed().as_secs_f64() * 1e6 / 2000.0);
+    }
+    #[test]
+    fn a_bounded_live_glob_finds_what_a_full_walk_finds() {
+        let dir = tmp("bounded");
+        for p in ["a.rs", "src/a.rs", "src/deep/b.rs", "src/deep/er/c.rs", "lib/x/d.rs", "docs/e.md", "src-x/y.rs"] {
+            let f = dir.join(p);
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, "x").unwrap();
+        }
+        let canon = fs::canonicalize(&dir).unwrap();
+        let names = |pat: &str| {
+            let mut v: Vec<String> = invoke(&dir, "glob", json!({"pattern": pat}))
+                .text.lines().filter(|l| !l.starts_with("[qx]") && *l != "No files found.").map(String::from).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names("src/*.rs"), ["src/a.rs"]);
+        assert_eq!(names("src/*/*.rs"), ["src/deep/b.rs"]);
+        assert_eq!(names("src/**/*.rs"), ["src/a.rs", "src/deep/b.rs", "src/deep/er/c.rs"]);
+        assert_eq!(names("{src,lib}/*/*.rs"), ["lib/x/d.rs", "src/deep/b.rs"]);
+        assert_eq!(names("*.rs"), ["a.rs", "lib/x/d.rs", "src-x/y.rs", "src/a.rs", "src/deep/b.rs", "src/deep/er/c.rs"]);
+        assert_eq!(names("nope/*.rs"), Vec::<String>::new());
+        // `src-x` sorts between `src` and `src/deep`: the nested hint must still be dropped, not walked twice.
+        assert_eq!(names("{src,src-x,src/deep}/*.rs"), ["src-x/y.rs", "src/a.rs", "src/deep/b.rs"]);
+        // The walker itself: starts in the hinted directory and stops at the depth asked for.
+        let seen = std::sync::Mutex::new(Vec::new());
+        let _ = walk_bounded(&canon, false, &["src".to_string()], Some(1), || (), |_, p, _| {
+            seen.lock().unwrap().push(p.strip_prefix(&canon).unwrap().to_string_lossy().replace('\\', "/"));
+        });
+        assert_eq!(seen.into_inner().unwrap(), ["src/a.rs"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+    /// The smallest line diff by brute force: the lines outside a longest common subsequence.
+    fn lcs_delta(old: &[u8], new: &[u8]) -> (usize, usize) {
+        let lines = |t: &[u8]| std::str::from_utf8(t).unwrap().split_inclusive('\n').map(String::from).collect::<Vec<_>>();
+        let (o, n) = (lines(old), lines(new));
+        let mut t = vec![vec![0usize; n.len() + 1]; o.len() + 1];
+        for i in 0..o.len() {
+            for j in 0..n.len() {
+                t[i + 1][j + 1] = if o[i] == n[j] { t[i][j] + 1 } else { t[i][j + 1].max(t[i + 1][j]) };
+            }
+        }
+        (n.len() - t[o.len()][n.len()], o.len() - t[o.len()][n.len()])
+    }
+    #[test]
+    fn line_delta_matches_a_brute_force_diff() {
+        // A line keeps its terminator: a final newline or a line ending alone makes a line differ.
+        assert_eq!(line_delta(b"a\nb", b"a\nb\n"), (1, 1));
+        assert_eq!(line_delta(b"a\nb\n", b"a\nb"), (1, 1));
+        assert_eq!(line_delta(b"a\r\nb\r\n", b"a\nb\n"), (2, 2));
+        assert_eq!(line_delta(b"a\nb\nc", b"a\nx\ny\nc"), (2, 1));
+        assert_eq!(line_delta(b"a", b"a\nb"), (2, 1));
+        assert_eq!(line_delta(b"", b"a\nb\n"), (2, 0));
+        assert_eq!(line_delta(b"a\nb\n", b""), (0, 2));
+        assert_eq!(line_delta(b"", b""), (0, 0));
+        assert_eq!(line_delta(b"same\n", b"same\n"), (0, 0));
+        // Small strings over a tiny alphabet, half of them near-copies, from a fixed LCG.
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut rnd = move |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+        let alphabet = *b"ab\n\r";
+        for round in 0..2000 {
+            let old: Vec<u8> = (0..rnd(15)).map(|_| alphabet[rnd(4)]).collect();
+            let new: Vec<u8> = if round % 2 == 0 {
+                (0..rnd(15)).map(|_| alphabet[rnd(4)]).collect()
+            } else {
+                let mut v = old.clone();
+                for _ in 0..1 + rnd(3) {
+                    let at = rnd(v.len() + 1);
+                    match rnd(3) {
+                        0 if at < v.len() => {
+                            v.remove(at);
+                        }
+                        1 if at < v.len() => v[at] = alphabet[rnd(4)],
+                        _ => v.insert(at, alphabet[rnd(4)]),
+                    }
+                }
+                v
+            };
+            assert_eq!(line_delta(&old, &new), lcs_delta(&old, &new), "{old:?} -> {new:?}");
+        }
+        // Past the 64-byte steps of the head and tail compare, and a search that has to look (D = 200).
+        let (head, tail) = ("same line\n".repeat(50), "tail line\n".repeat(50));
+        let (old, new) = (format!("{head}x\n{tail}"), format!("{head}y\nz\n{tail}"));
+        assert_eq!(line_delta(old.as_bytes(), new.as_bytes()), (2, 1));
+        let lines = |f: &dyn Fn(usize) -> String, n: usize| (0..n).map(|i| f(i)).collect::<String>();
+        let old = lines(&|i| format!("l{i}\n"), 200);
+        let new = lines(&|i| if i % 2 == 1 { format!("m{i}\n") } else { format!("l{i}\n") }, 200);
+        assert_eq!(line_delta(old.as_bytes(), new.as_bytes()), lcs_delta(old.as_bytes(), new.as_bytes()));
+        assert_eq!(line_delta(old.as_bytes(), new.as_bytes()), (100, 100));
+        // Beyond DIFF_CAP the answer is an upper bound (everything between the shared ends), never less.
+        let old = lines(&|i| format!("l{i}\n"), 700);
+        let new = lines(&|i| if i % 2 == 1 { format!("m{i}\n") } else { format!("l{i}\n") }, 700);
+        let (a, r) = line_delta(old.as_bytes(), new.as_bytes());
+        assert!((350..=700).contains(&a) && (350..=700).contains(&r), "{a} {r}");
+    }
+    #[test]
+    fn write_and_edit_replies_count_the_lines_they_changed() {
+        let dir = tmp("delta");
+        let write = |content: &str| invoke(&dir, "write", json!({"path": "f.txt", "content": content}));
+        let reply = |what: &str| format!("<path>f.txt</path>\n<type>file</type>\n<content>\n{what}\n</content>");
+        let w = write("a\nb\nc\n");
+        assert_eq!(w.text, reply("Created file (+3 -0 lines)"));
+        assert_eq!((&w.structured["added"], &w.structured["removed"]), (&json!(3), &json!(0)));
+        // Nothing changed: said so, not `+0 -0`.
+        assert_eq!(write("a\nb\nc\n").text, reply("Updated file (no changes)"));
+        // Only the final newline went: that is a changed last line.
+        assert_eq!(write("a\nb\nc").text, reply("Updated file (+1 -1 lines)"));
+        assert_eq!(write("a\nb\nc\n").text, reply("Updated file (+1 -1 lines)"));
+        let w = write("a\nx\ny\nc\n");
+        assert_eq!(w.text, reply("Updated file (+2 -1 lines)"));
+        assert_eq!((&w.structured["added"], &w.structured["removed"]), (&json!(2), &json!(1)));
+        // A new empty file is `(empty)`; emptying a file removes its lines.
+        assert_eq!(write("").text, reply("Updated file (+0 -4 lines)"));
+        let e = invoke(&dir, "write", json!({"path": "empty.txt", "content": ""}));
+        assert_eq!(e.text, "<path>empty.txt</path>\n<type>file</type>\n<content>\nCreated file (empty)\n</content>");
+        assert_eq!((&e.structured["added"], &e.structured["removed"]), (&json!(0), &json!(0)));
+        assert_eq!(fs::read(dir.join("empty.txt")).unwrap(), b"");
+
+        // edit: replace_all counts each changed line once, two hits on a line are one changed line.
+        fs::write(dir.join("k.txt"), "k = 1\nk = 2\nk = 3\nz\nx x\n").unwrap();
+        let edit = |extra: Value| {
+            let mut args = json!({"path": "k.txt"});
+            args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            invoke(&dir, "edit", args)
+        };
+        let ok = "The file k.txt has been updated successfully.";
+        let r = edit(json!({"old_string": "k =", "new_string": "v =", "replace_all": true}));
+        assert_eq!(r.text, format!("{ok} All occurrences were successfully replaced. (+3 -3 lines)"));
+        assert_eq!(r.structured["replacements"], 3);
+        let r = edit(json!({"old_string": "x", "new_string": "w", "replace_all": true}));
+        assert_eq!(r.text, format!("{ok} All occurrences were successfully replaced. (+1 -1 lines)"));
+        assert_eq!(r.structured["replacements"], 2);
+        let r = edit(json!({"old_string": "z\n", "new_string": "z\nz2\nz3\n"}));
+        assert_eq!(r.text, format!("{ok} (+2 -0 lines)"));
+        assert_eq!(fs::read_to_string(dir.join("k.txt")).unwrap(), "v = 1\nv = 2\nv = 3\nz\nz2\nz3\nw w\n");
+        // A batch is counted on the file as a whole: a chained A -> B -> C is one changed line, and a
+        // round trip A -> B -> A changes nothing.
+        fs::write(dir.join("k.txt"), "A\nkeep\n").unwrap();
+        let chain = |a: &str, b: &str, c: &str| edit(json!({"edits": [
+            {"old_string": a, "new_string": b},
+            {"old_string": b, "new_string": c},
+        ]}));
+        let r = chain("A", "B", "C");
+        assert_eq!(r.text, format!("{ok} 2 edits applied. (+1 -1 lines)"));
+        assert_eq!(r.structured["replacements"], 2);
+        assert_eq!(fs::read_to_string(dir.join("k.txt")).unwrap(), "C\nkeep\n");
+        let r = chain("C", "D", "C");
+        assert_eq!(r.text, format!("{ok} 2 edits applied. (no changes)"));
+        assert_eq!(fs::read_to_string(dir.join("k.txt")).unwrap(), "C\nkeep\n");
+        // The final newline alone, through edit.
+        fs::write(dir.join("k.txt"), "a\nb").unwrap();
+        let r = edit(json!({"old_string": "b", "new_string": "b\n"}));
+        assert_eq!(r.text, format!("{ok} (+1 -1 lines)"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn line_counts_see_line_endings_through_write_and_edit() {
+        let dir = tmp("delta-crlf");
+        fs::write(dir.join("w.txt"), "a\r\nb\r\nc\r\n").unwrap();
+        assert!(!invoke(&dir, "read", json!({"path": "w.txt"})).is_error);
+        // The model writes LF text; the file keeps CRLF, so only the changed line differs.
+        let w = invoke(&dir, "write", json!({"path": "w.txt", "content": "a\nB\nc\n"}));
+        assert!(w.text.contains("Updated file (+1 -1 lines)"), "{}", w.text);
+        assert_eq!(fs::read(dir.join("w.txt")).unwrap(), b"a\r\nB\r\nc\r\n");
+        // The same text again: the CRLF it is written with makes the file identical.
+        let w = invoke(&dir, "write", json!({"path": "w.txt", "content": "a\nB\nc\n"}));
+        assert!(w.text.contains("Updated file (no changes)"), "{}", w.text);
+        // Content with a CR of its own is written as given, so its bare-LF lines now differ.
+        let w = invoke(&dir, "write", json!({"path": "w.txt", "content": "a\r\nB\nc\n"}));
+        assert!(w.text.contains("Updated file (+2 -2 lines)"), "{}", w.text);
+        assert_eq!(fs::read(dir.join("w.txt")).unwrap(), b"a\r\nB\nc\n");
+
+        fs::write(dir.join("e.txt"), "a\r\nb\r\nc\r\n").unwrap();
+        let e = invoke(&dir, "edit", json!({"path": "e.txt", "old_string": "b\n", "new_string": "b\nb2\n"}));
+        assert!(e.text.ends_with("(+1 -0 lines)"), "{}", e.text);
+        assert_eq!(fs::read(dir.join("e.txt")).unwrap(), b"a\r\nb\r\nb2\r\nc\r\n");
+        let e = invoke(&dir, "edit", json!({"path": "e.txt", "old_string": "b2", "new_string": "b3"}));
+        assert!(e.text.ends_with("(+1 -1 lines)"), "{}", e.text);
+        assert_eq!(fs::read(dir.join("e.txt")).unwrap(), b"a\r\nb\r\nb3\r\nc\r\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+    /// The server builds the index on one worker thread and re-arms and reads it from others, each gone
+    /// a moment later. A watch tied to its issuing thread dies with it (error 995) and the index is
+    /// then rebuilt on every call: this is what made globs and greps slow for real sessions.
+    #[cfg(windows)]
+    #[test]
+    fn the_index_outlives_the_threads_that_built_and_read_it() {
+        let dir = tmp("index-threads");
+        fs::write(dir.join("a.rs"), "x").unwrap();
+        let canon = fs::canonicalize(&dir).unwrap();
+        let d = dir.clone();
+        std::thread::spawn(move || crate::index::ensure(&d)).join().unwrap();
+        for round in 0..6 {
+            fs::write(dir.join(format!("n{round}.rs")), "y").unwrap();
+            let c = canon.clone();
+            let got = std::thread::spawn(move || {
+                crate::index::snapshot(&c).map(|(s, _)| s.files.iter().map(|e| e.rel.clone()).collect::<Vec<_>>())
+            })
+            .join()
+            .unwrap()
+            .expect("index still valid after the threads that used it exited");
+            assert!(got.contains(&format!("n{round}.rs")) && got.contains(&"a.rs".to_string()), "round {round}: {got:?}");
+            assert_eq!(got.len(), round + 2, "round {round}: {got:?}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }}

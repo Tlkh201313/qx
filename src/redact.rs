@@ -354,6 +354,12 @@ fn is_code_or_prose(b: &[u8], key_at: usize, sep: u8, spaced: bool, value: &[u8]
     if code_form && (value.windows(2).any(|w| w == b"::") || value.iter().any(|c| matches!(c, b'<' | b'>'))) {
         return true;
     }
+    // `token = jwt.sign({ id }, secret)`, `token: &str`, `key = $env:KEY`, `secret = config.secret`: an
+    // expression, a reference or a type, never a credential. Only in the spaced forms: a glued
+    // `TOKEN=abc(1)` is a config value.
+    if code_form && looks_like_expression(value) {
+        return true;
+    }
     if sep != b':' || value.iter().any(u8::is_ascii_digit) {
         return false;
     }
@@ -366,6 +372,25 @@ fn is_code_or_prose(b: &[u8], key_at: usize, sep: u8, spaced: bool, value: &[u8]
     // A bounded look-ahead: trimming a long whitespace run once per separator was quadratic.
     let sentence = rest.iter().take(256).find(|c| !c.is_ascii_whitespace()).is_some_and(u8::is_ascii_alphanumeric);
     after_word && (camel || sentence)
+}
+
+/// A value that is source code: a call or block (`f(x)`, `{id}`), a reference (`&str`, `*p`, `$env:X`,
+/// `%X%`), a dotted path (`config.token`) or a keyword (`null`, `None`, `true`).
+fn looks_like_expression(v: &[u8]) -> bool {
+    if v.iter().any(|c| matches!(c, b'(' | b')' | b'{' | b'}')) {
+        return true;
+    }
+    if matches!(v[0], b'&' | b'*') || (v[0] == b'$' && v.len() > 1) || (v[0] == b'%' && v.ends_with(b"%")) {
+        return true;
+    }
+    let word = std::str::from_utf8(v).unwrap_or("").to_ascii_lowercase();
+    if matches!(word.as_str(), "none" | "null" | "nil" | "undefined" | "true" | "false" | "self" | "this") {
+        return true;
+    }
+    // `a.b.c` with identifier parts and a lowercase start. Real tokens with dots (JWTs) have a prefix rule.
+    let ident = |s: &[u8]| !s.is_empty() && (s[0].is_ascii_alphabetic() || s[0] == b'_') && s.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_');
+    let parts: Vec<&[u8]> = v.split(|c| *c == b'.').collect();
+    parts.len() >= 2 && v[0].is_ascii_lowercase() && parts.iter().all(|p| ident(p)) && v.len() < 64
 }
 
 fn mask_ranges(line: &str, mut ranges: Vec<(usize, usize)>) -> (Cow<'_, str>, usize) {
