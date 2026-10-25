@@ -446,6 +446,7 @@ fn run_schema() -> Value {
     let c = client::current();
     let mut schema = json!({
         "name": "run",
+        "title": "qx run",
         "description": format!(
             "Run a local command (like {}, but faster). `program` + `args` execs directly; `command` is a shell line: auto picks PowerShell for cmdlets, `$var`, `a; b` and single quotes, Git Bash for POSIX pipelines, else cmd. Common tools run in-process (ls cat head tail wc grep sed mkdir rm cp mv touch which ...). Stdin is empty; output is compacted (errors kept) and secrets redacted; a cut output is saved to `full_output`. After `timeout_ms` (default 120000, max 270000) a running command becomes a background job: reply names its id; follow with `job`.",
             c.native(Native::Shell)
@@ -495,6 +496,7 @@ fn fs_schema() -> Value {
     let c = client::current();
     let mut schema = json!({
         "name": "fs",
+        "title": "qx fs",
         "description": "In-process files in the workspace. op=read (path, offset?, limit?; also reads a dir, any path, files of any size); write (path, content; replacing a file needs a prior read); edit (path, old_string, new_string, replace_all?; exact unique match, no prior read); glob (pattern, path?; newest first); grep (pattern is a REGEX, path?, include?, ignore_case?, literal?; output grouped by file); list; stat. BATCH to save round trips: `ops:[{op,...},...]` runs up to 32 in order (cwd is shared), `paths:[..]` reads/stats many files, `edits:[{old_string,new_string,replace_all?}]` applies several edits to one file atomically. Pass `cwd` (the session directory). Writes stay inside cwd; reads can go anywhere. Generated dirs (node_modules, target, build, dist, vendor...) are skipped unless named in the path/pattern or all=true; the reply says what was skipped.",
         "inputSchema": {
             "type": "object",
@@ -862,11 +864,12 @@ fn flag_arg(args: &Value, keys: &[&str]) -> bool {
 }
 
 fn call_tool(req: &Value, id: Option<Value>) -> Value {
-    let params = req.get("params").cloned().unwrap_or(Value::Null);
-    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let name = req.pointer("/params/name").and_then(Value::as_str).unwrap_or("");
+    // Borrowed: a write's `content` can be megabytes, and cloning it per call bought nothing.
+    static NO_ARGS: OnceLock<Value> = OnceLock::new();
+    let args = req.pointer("/params/arguments").unwrap_or_else(|| NO_ARGS.get_or_init(|| json!({})));
     if name == "fs" {
-        let reply = crate::fsops::call(&args);
+        let reply = crate::fsops::call(args);
         return tool_result(id, &reply.text, reply.is_error, reply.structured);
     }
     if name != "run" {
@@ -876,19 +879,19 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
     // A field of the wrong type is an error: ignoring it would run the command somewhere else
     // (`cwd`), for another time (`timeout_ms`), or as a different command (`program`).
     let (program, cmdline, cwd_text) = match (
-        text_arg(&args, &["program"]),
-        text_arg(&args, &["command"]),
-        text_arg(&args, &["cwd", "workdir"]),
+        text_arg(args, &["program"]),
+        text_arg(args, &["command"]),
+        text_arg(args, &["cwd", "workdir"]),
     ) {
         (Ok(p), Ok(c), Ok(d)) => (p, c, d),
         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return tool_text(id, &e, true),
     };
-    let (timeout_arg, wait_arg) = match (number_arg(&args, &["timeout_ms", "timeoutMs"]), number_arg(&args, &["wait_ms"])) {
+    let (timeout_arg, wait_arg) = match (number_arg(args, &["timeout_ms", "timeoutMs"]), number_arg(args, &["wait_ms"])) {
         (Ok(t), Ok(w)) => (t, w),
         (Err(e), _) | (_, Err(e)) => return tool_text(id, &e, true),
     };
-    if let Some(job) = text_arg(&args, &["job"]).ok().flatten().filter(|j| !j.trim().is_empty()) {
-        return job_call(id, job.trim(), wait_arg.unwrap_or(15_000), flag_arg(&args, &["kill"]));
+    if let Some(job) = text_arg(args, &["job"]).ok().flatten().filter(|j| !j.trim().is_empty()) {
+        return job_call(id, job.trim(), wait_arg.unwrap_or(15_000), flag_arg(args, &["kill"]));
     }
     // An empty `program` or `command` is an absent one.
     let program = program.filter(|p| !p.trim().is_empty());
@@ -934,8 +937,8 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
     };
     let timeout_ms = timeout_arg.unwrap_or(120_000).clamp(1_000, 3_600_000);
     let full = args.get("mode").and_then(|v| v.as_str()) == Some("full");
-    let background = flag_arg(&args, &["background", "run_in_background"]);
-    let kill_on_timeout = flag_arg(&args, &["kill_on_timeout"]);
+    let background = flag_arg(args, &["background", "run_in_background"]);
+    let kill_on_timeout = flag_arg(args, &["kill_on_timeout"]);
     let label = run_label(program, &list, cmdline);
 
     let guard_cmd = match program {

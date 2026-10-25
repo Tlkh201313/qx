@@ -502,11 +502,19 @@ impl Root {
         }) {
             return Err(FsError::arg(format!("\"{raw}\": {bad}")).fb("write"));
         }
+        if raw.ends_with(['/', '\\']) {
+            return Err(FsError::arg(format!("\"{raw}\" ends with a separator: it names a directory, not a file")).fb("write"));
+        }
         let candidate = self.candidate(raw);
+        // A path on another machine would be probed over the network (tens of seconds when it is down) just to be refused.
+        if let Some(share) = unc_share(&candidate) {
+            if unc_share(&self.cwd) != Some(share) {
+                self.ensure_inside(&candidate).map_err(|e| e.fb("write"))?;
+            }
+        }
         let name = candidate
             .file_name()
-            .ok_or_else(|| FsError::arg("path must name a file"))?
-            .to_os_string();
+            .ok_or_else(|| FsError::arg("path must name a file"))?;
 
         let nearest = nearest_existing(&candidate).ok_or_else(|| {
             FsError::new(
@@ -514,6 +522,7 @@ impl Root {
                 format!("no existing ancestor for {}", candidate.display()),
             )
         })?;
+        let exact = nearest == candidate;
         let nearest = fs::canonicalize(&nearest)
             .map_err(|e| FsError::io("cannot resolve path ancestor", e))?;
         self.ensure_inside(&nearest)?;
@@ -534,8 +543,12 @@ impl Root {
                     format!("cannot modify \"{raw}\": not a regular file"),
                 ));
             }
-            let canonical = fs::canonicalize(&candidate)
-                .map_err(|e| FsError::io(format!("cannot resolve \"{raw}\""), e))?;
+            // `nearest` is this very file, canonicalized a moment ago: resolving it again gives the same path.
+            let canonical = if exact {
+                nearest
+            } else {
+                fs::canonicalize(&candidate).map_err(|e| FsError::io(format!("cannot resolve \"{raw}\""), e))?
+            };
             self.ensure_inside(&canonical)?;
             return Ok((canonical, true));
         }
@@ -589,6 +602,20 @@ impl Root {
     }
 }
 
+/// `(server, share)` of a network path, in either spelling (`\\s\x` or `\\?\UNC\s\x`), compared without case.
+fn unc_share(p: &Path) -> Option<(String, String)> {
+    use std::path::Prefix;
+    let Some(Component::Prefix(prefix)) = p.components().next() else {
+        return None;
+    };
+    match prefix.kind() {
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+            Some((server.to_string_lossy().to_lowercase(), share.to_string_lossy().to_lowercase()))
+        }
+        _ => None,
+    }
+}
+
 /// Why Windows cannot hold a file or directory with this name, if it cannot.
 fn win_name_problem(name: &str) -> Option<&'static str> {
     if name.contains(':') {
@@ -634,28 +661,22 @@ impl Version {
     }
 }
 
-/// A cheap content fingerprint: full FNV for small files, first+last 8 KiB for
-/// large ones. Length and mtime are also compared, so a same-size, same-time
-/// middle-only edit is the only case this can miss.
+/// A content fingerprint over every byte, so a same-size edit anywhere in the file is seen (the clock is
+/// not compared: a `touch` is no conflict). Eight bytes a step (the multiply is odd, so each step is a
+/// bijection and one changed word always changes the hash); it only ever meets hashes made by this
+/// same function, always of the whole file.
 fn hash_bytes(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = FNV_OFFSET;
-    for &b in bytes.iter().take(8192) {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    let mut words = bytes.chunks_exact(8);
+    for w in &mut words {
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(w.try_into().unwrap_or_default())).wrapping_mul(K);
     }
-    if bytes.len() > 1_048_576 {
-        let start = bytes.len().saturating_sub(8192);
-        for &b in &bytes[start..] {
-            h ^= b as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-    } else {
-        for &b in bytes.iter().skip(8192) {
-            h ^= b as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
+    let rest = words.remainder();
+    if !rest.is_empty() {
+        let mut last = [0u8; 8];
+        last[..rest.len()].copy_from_slice(rest);
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(last)).wrapping_mul(K);
     }
     h
 }
@@ -700,6 +721,74 @@ fn check_observed(_cwd: &Path, path: &Path, current: Version, display: &str) -> 
 fn mutation_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Held from the check that a file is as it was read until the new content is in place. Other qx
+/// servers (another session, another agent) edit the same tree, so on Windows the lock is a named
+/// mutex the system also releases if its owner dies; past `MUTATION_WAIT_MS` the call goes on
+/// without it rather than hang.
+struct MutationGuard {
+    _local: std::sync::MutexGuard<'static, ()>,
+    #[cfg(windows)]
+    held: bool,
+}
+
+const MUTATION_WAIT_MS: u32 = 5000;
+
+fn lock_mutation() -> MutationGuard {
+    let local = mutation_lock().lock().unwrap_or_else(|e| e.into_inner());
+    MutationGuard {
+        _local: local,
+        #[cfg(windows)]
+        held: os_mutex::acquire(MUTATION_WAIT_MS),
+    }
+}
+
+impl Drop for MutationGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.held {
+            os_mutex::release();
+        }
+    }
+}
+
+#[cfg(windows)]
+mod os_mutex {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateMutexW(attributes: *mut c_void, initial_owner: i32, name: *const u16) -> *mut c_void;
+        fn WaitForSingleObject(handle: *mut c_void, millis: u32) -> u32;
+        fn ReleaseMutex(handle: *mut c_void) -> i32;
+    }
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_ABANDONED: u32 = 0x80;
+
+    /// One handle for the life of the process (null when the system refused one); kept as an
+    /// address because a raw pointer cannot sit in a static.
+    fn handle() -> *mut c_void {
+        static HANDLE: OnceLock<usize> = OnceLock::new();
+        *HANDLE.get_or_init(|| {
+            let name: Vec<u16> = "Local\\qx-fs-mutation\0".encode_utf16().collect();
+            // SAFETY: a NUL-terminated name and default security.
+            unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) as usize }
+        }) as *mut c_void
+    }
+
+    /// True when this thread now owns the mutex (an abandoned one counts: its owner died).
+    pub fn acquire(millis: u32) -> bool {
+        let h = handle();
+        // SAFETY: `h` is a live handle for the whole process.
+        !h.is_null() && matches!(unsafe { WaitForSingleObject(h, millis) }, WAIT_OBJECT_0 | WAIT_ABANDONED)
+    }
+
+    pub fn release() {
+        // SAFETY: only called by the thread that acquired it.
+        unsafe { ReleaseMutex(handle()) };
+    }
 }
 
 // ---------------------------------------------------------------------- I/O
@@ -915,10 +1004,11 @@ fn read(root: &Root, args: &Value) -> Result<Reply, FsError> {
         MAX_READ_LINE_CHARS,
     )?;
     let path = root.resolve_read(raw).map_err(|e| e.fb("read"))?;
-    if fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() > MAX_READ_BYTES) {
+    let md = fs::metadata(&path).ok();
+    if md.as_ref().is_some_and(|m| m.is_file() && m.len() > MAX_READ_BYTES) {
         return read_large(root, &path, raw, offset, limit, max_line_chars);
     }
-    if fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
+    if md.as_ref().is_some_and(|m| m.is_dir()) {
         // A directory is a listing: the same answer `list` gives, in one call instead of an error and a retry.
         return list(root, &json!({ "path": raw }));
     }
@@ -935,8 +1025,9 @@ fn read(root: &Root, args: &Value) -> Result<Reply, FsError> {
         .fb("read"));
     }
     let text = decode_text(&bytes);
+    let display = root.display(&path);
     let out = render_read(
-        &root.display(&path),
+        &display,
         &text,
         offset,
         limit,
@@ -948,7 +1039,7 @@ fn read(root: &Root, args: &Value) -> Result<Reply, FsError> {
         text: out.text,
         structured: json!({
             "op": "read",
-            "path": root.display(&path),
+            "path": display,
             "lines": out.lines,
             "total_lines": out.total,
             "end_line": out.end_line,
@@ -1033,7 +1124,7 @@ fn render_read(
     max_line_chars: usize,
     max_bytes: usize,
 ) -> Result<ReadWindow, FsError> {
-    let total = count_lines(text);
+    let total = count_lines(text.as_bytes());
     if offset > total && !(total == 0 && offset == 1) {
         return Ok(ReadWindow {
             text: format!("<path>{display}</path>\n<type>file</type>\n<content>\n(offset {offset} is past the end: the file has {total} lines)\n</content>"),
@@ -1109,12 +1200,9 @@ fn render_read(
     })
 }
 
-fn count_lines(text: &str) -> usize {
-    if text.is_empty() {
-        0
-    } else {
-        text.bytes().filter(|&b| b == b'\n').count() + usize::from(!text.ends_with('\n'))
-    }
+/// Lines in `text`: a last one without its `\n` counts too.
+fn count_lines(text: &[u8]) -> usize {
+    text.iter().filter(|&&b| b == b'\n').count() + usize::from(text.last().is_some_and(|&b| b != b'\n'))
 }
 
 fn decode_text(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
@@ -1183,18 +1271,19 @@ fn write(root: &Root, args: &Value) -> Result<Reply, FsError> {
         )
         .fb("write"));
     }
-    let _guard = mutation_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let guard = lock_mutation();
     let (path, existed) = root.resolve_for_write(raw).map_err(|e| e.fb("write"))?;
     root.check_mutable(&path).map_err(|e| e.fb("write"))?;
+    let display = root.display(&path);
 
     let mut written = std::borrow::Cow::Borrowed(content);
+    let mut before = Vec::new();
     if existed {
-        let (before, current) = read_file(&path, "write")?;
-        check_observed(&root.cwd, &path, current, &root.display(&path))
-            .map_err(|e| e.fb("write"))?;
+        let (bytes, current) = read_file(&path, "write")?;
+        check_observed(&root.cwd, &path, current, &display).map_err(|e| e.fb("write"))?;
         // `read` showed lossy, LF-only text: writing it back must not re-encode or flatten the file.
-        match carry_over_encoding(&before, content) {
-            Ok(text) => written = std::borrow::Cow::Owned(text),
+        match carry_over_encoding(&bytes, content) {
+            Ok(text) => written = text,
             Err(()) => {
                 return Err(FsError::new(
                     "FS_ENCODING",
@@ -1204,31 +1293,146 @@ fn write(root: &Root, args: &Value) -> Result<Reply, FsError> {
             }
         }
         atomic_replace(&path, written.as_bytes(), current).map_err(|e| e.fb("write"))?;
+        before = bytes;
     } else {
         create_noreplace(&path, content.as_bytes()).map_err(|e| e.fb("write"))?;
     }
     let content = written.as_ref();
     let version = version_after(&path, content.as_bytes()).map_err(|e| e.fb("write"))?;
     remember(&root.cwd, &path, version);
-    let display = root.display(&path);
+    // Only the reply is left to do, and the line count is not part of the change: not under the lock.
+    drop(guard);
+    let delta = line_delta(&before, content.as_bytes());
     let verb = if existed {
         "Updated file"
     } else {
         "Created file"
     };
     Ok(Reply {
-        text: format!("<path>{display}</path>\n<type>file</type>\n<content>\n{verb}\n</content>"),
+        text: format!("<path>{display}</path>\n<type>file</type>\n<content>\n{verb} {}\n</content>", lines_note(!existed, delta)),
         structured: json!({
             "op": "write",
             "path": display,
             "created": !existed,
             "bytes": content.len(),
+            "added": delta.0,
+            "removed": delta.1,
         }),
         is_error: false,
     })
 }
 
 // --------------------------------------------------------------------- edit
+
+/// What a reply says about the lines a write or edit changed.
+fn lines_note(created: bool, (added, removed): (usize, usize)) -> String {
+    match (added, removed) {
+        (0, 0) if created => "(empty)".to_string(),
+        (0, 0) => "(no changes)".to_string(),
+        _ => format!("(+{added} -{removed} lines)"),
+    }
+}
+
+/// Past this many added plus removed lines, `line_delta` stops looking for the smallest diff.
+const DIFF_CAP: usize = 512;
+
+/// Length of the common prefix of `a` and `b`; 64 bytes a step while they match (a vectorised compare).
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + 64 <= n && a[i..i + 64] == b[i..i + 64] {
+        i += 64;
+    }
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+/// Length of the common suffix of `a` and `b`.
+fn common_suffix(a: &[u8], b: &[u8]) -> usize {
+    let (n, la, lb) = (a.len().min(b.len()), a.len(), b.len());
+    let mut i = 0;
+    while i + 64 <= n && a[la - i - 64..la - i] == b[lb - i - 64..lb - i] {
+        i += 64;
+    }
+    while i < n && a[la - 1 - i] == b[lb - 1 - i] {
+        i += 1;
+    }
+    i
+}
+
+/// Bytes at the start of `a` and `b` that make up whole lines both have (a line keeps its `\n`).
+fn shared_head(a: &[u8], b: &[u8]) -> usize {
+    let n = common_prefix(a, b);
+    if n == a.len() && n == b.len() {
+        return n; // the same text, a last line without `\n` included
+    }
+    a[..n].iter().rposition(|&c| c == b'\n').map_or(0, |i| i + 1)
+}
+
+/// Bytes at the end of `a` and `b` that make up whole lines both have. Both texts start at a line start.
+fn shared_tail(a: &[u8], b: &[u8]) -> usize {
+    let n = common_suffix(a, b);
+    let (sa, sb) = (a.len() - n, b.len() - n);
+    let starts = |t: &[u8], s: usize| s == 0 || t[s - 1] == b'\n';
+    if starts(a, sa) && starts(b, sb) {
+        return n;
+    }
+    // The first shared line is cut short on one side: the shared lines begin after its end.
+    a[sa..].iter().position(|&c| c == b'\n').map_or(0, |i| n - i - 1)
+}
+
+/// Lines `(added, removed)` going from `old` to `new`. A line includes its terminator, so a change of
+/// line ending or of the final newline counts. The smallest diff: the lines outside a longest common
+/// subsequence. Done on bytes, with no table of lines: the shared head and tail are trimmed, the lines
+/// of what is left are counted, and Myers' greedy search finds only the edit distance D from which the
+/// two counts follow (its points are byte offsets of line starts).
+fn line_delta(old: &[u8], new: &[u8]) -> (usize, usize) {
+    let head = shared_head(old, new);
+    let (old, new) = (&old[head..], &new[head..]);
+    let tail = shared_tail(old, new);
+    let (old, new) = (&old[..old.len() - tail], &new[..new.len() - tail]);
+    let (n, m) = (count_lines(old), count_lines(new));
+    if n == 0 || m == 0 {
+        return (m, n);
+    }
+    const NONE: usize = usize::MAX;
+    let end = |t: &[u8], at: usize| t[at..].iter().position(|&c| c == b'\n').map_or(t.len(), |i| at + i + 1);
+    let max = (n + m).min(DIFF_CAP);
+    let mid = max + 1;
+    // The furthest point reached on each diagonal (old lines taken minus new lines taken), as byte offsets.
+    let mut far = vec![(NONE, 0usize); 2 * max + 3];
+    for d in 0..=max {
+        for k in (0..=d).map(|j| 2 * j as isize - d as isize) {
+            let at = (mid as isize + k) as usize;
+            let (left, above) = (far[at - 1], far[at + 1]);
+            let start = if d == 0 {
+                (0, 0)
+            } else {
+                // From diagonal k-1 by dropping an old line, or from k+1 by adding a new one: the further one.
+                let del = (left.0 < old.len()).then(|| (end(old, left.0), left.1));
+                let ins = (above.0 != NONE && above.1 < new.len()).then(|| (above.0, end(new, above.1)));
+                match (del, ins) {
+                    (Some(a), Some(b)) => if b.0 >= a.0 { b } else { a },
+                    (a, b) => a.or(b).unwrap_or((NONE, 0)),
+                }
+            };
+            if start.0 == NONE {
+                far[at] = start;
+                continue;
+            }
+            let run = shared_head(&old[start.0..], &new[start.1..]);
+            let reached = (start.0 + run, start.1 + run);
+            if reached == (old.len(), new.len()) {
+                return ((d + m - n) / 2, (d + n - m) / 2);
+            }
+            far[at] = reached;
+        }
+    }
+    // shortcut: beyond DIFF_CAP edits the whole middle counts as replaced (an upper bound), raise the cap if exact counts of big rewrites matter
+    (m, n)
+}
 
 /// One `{old_string, new_string, replace_all?}` replacement, applied to `text` in memory.
 fn apply_edit(text: &str, raw: &str, e: &Value, label: &str) -> Result<(String, usize), FsError> {
@@ -1252,7 +1456,28 @@ fn apply_edit(text: &str, raw: &str, e: &Value, label: &str) -> Result<(String, 
     }
     let replace_all = bool_arg(e, "replace_all", false);
     let (old, new) = match_line_endings(text, old, new);
-    let count = text.matches(&old).count();
+    // One pass finds the matches and builds the result; a second hit without `replace_all` is an
+    // error, so the scan stops there and the total is counted only for the message.
+    let mut updated = String::with_capacity(text.len() + new.len().saturating_sub(old.len()));
+    // `replace_all` multiplies `new` by the match count; stop before that outgrows memory.
+    let cap = MAX_WRITE_BYTES.max(text.len().saturating_mul(2));
+    let (mut done, mut count) = (0, 0);
+    for (at, hit) in text.match_indices(&old) {
+        count += 1;
+        if count > 1 && !replace_all {
+            break;
+        }
+        updated.push_str(&text[done..at]);
+        updated.push_str(&new);
+        done = at + hit.len();
+        if updated.len() > cap {
+            return Err(FsError::new(
+                "FS_TOO_LARGE",
+                format!("{label}the edited file would pass {cap} bytes; use the native {} tool", native(Native::Edit)),
+            )
+            .fb("edit"));
+        }
+    }
     if count == 0 {
         // Say where the closest thing is: usually an indentation or a stale line, found in one step.
         let first = old.lines().map(str::trim).find(|l| l.len() > 3).unwrap_or("");
@@ -1268,14 +1493,15 @@ fn apply_edit(text: &str, raw: &str, e: &Value, label: &str) -> Result<(String, 
         .fb("edit"));
     }
     if count > 1 && !replace_all {
+        let count = text.matches(&old).count();
         return Err(FsError::new(
             "FS_AMBIGUOUS",
             format!("{label}old_string occurs {count} times in \"{raw}\"; include more context or set replace_all"),
         )
         .fb("edit"));
     }
-    let updated = if replace_all { text.replace(&old, &new) } else { text.replacen(&old, &new, 1) };
-    Ok((updated, if replace_all { count } else { 1 }))
+    updated.push_str(&text[done..]);
+    Ok((updated, count))
 }
 
 fn edit(root: &Root, args: &Value) -> Result<Reply, FsError> {
@@ -1289,7 +1515,7 @@ fn edit(root: &Root, args: &Value) -> Result<Reply, FsError> {
     if batch.is_some_and(|b| b.len() > 64) {
         return Err(FsError::arg("edits is capped at 64 per call"));
     }
-    let _guard = mutation_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let guard = lock_mutation();
     let path = root.resolve_existing(raw).map_err(|e| e.fb("edit"))?;
     root.check_mutable(&path).map_err(|e| e.fb("edit"))?;
     let (bytes, current) = read_file(&path, "edit")?;
@@ -1305,27 +1531,28 @@ fn edit(root: &Root, args: &Value) -> Result<Reply, FsError> {
         )
         .fb("edit"));
     };
-    let mut updated = text.to_string();
-    let mut replacements = 0;
-    match batch {
+    let (updated, replacements) = match batch {
         Some(list) => {
+            let mut cur = String::new();
+            let mut total = 0;
             for (i, e) in list.iter().enumerate() {
                 let label = format!("edits[{i}]: ");
-                let (next, n) = apply_edit(&updated, raw, e, &label)?;
-                updated = next;
-                replacements += n;
+                // The first edit reads the file's own text; no copy of it is made.
+                let (next, n) = apply_edit(if i == 0 { text } else { cur.as_str() }, raw, e, &label)?;
+                cur = next;
+                total += n;
             }
+            (cur, total)
         }
-        None => {
-            let (next, n) = apply_edit(text, raw, args, "")?;
-            updated = next;
-            replacements = n;
-        }
-    }
+        None => apply_edit(text, raw, args, "")?,
+    };
     let replace_all = batch.is_none() && bool_arg(args, "replace_all", false);
     atomic_replace(&path, updated.as_bytes(), current).map_err(|e| e.fb("edit"))?;
     let version = version_after(&path, updated.as_bytes()).map_err(|e| e.fb("edit"))?;
     remember(&root.cwd, &path, version);
+    // Only the reply is left to do, and the line count is not part of the change: not under the lock.
+    drop(guard);
+    let delta = line_delta(&bytes, updated.as_bytes());
     let display = root.display(&path);
     let suffix = match (batch, replace_all) {
         (Some(b), _) => format!(" {} edits applied.", b.len()),
@@ -1333,11 +1560,13 @@ fn edit(root: &Root, args: &Value) -> Result<Reply, FsError> {
         _ => String::new(),
     };
     Ok(Reply {
-        text: format!("The file {display} has been updated successfully.{suffix}"),
+        text: format!("The file {display} has been updated successfully.{suffix} {}", lines_note(false, delta)),
         structured: json!({
             "op": "edit",
             "path": display,
             "replacements": replacements,
+            "added": delta.0,
+            "removed": delta.1,
             "bytes": updated.len(),
         }),
         is_error: false,
@@ -1348,8 +1577,13 @@ fn edit(root: &Root, args: &Value) -> Result<Reply, FsError> {
 /// file's other ending. `new` then takes the ending of the text it replaces, whether or not `old` itself
 /// held a line break.
 fn match_line_endings(text: &str, old: &str, new: &str) -> (String, String) {
-    let crlf = text.matches("\r\n").count();
-    let lf_only = text.matches('\n').count().saturating_sub(crlf);
+    // Without a CR there is no CRLF to count (and `crlf > lf_only` cannot hold): skip two scans of the file.
+    let (crlf, lf_only) = if text.contains('\r') {
+        let crlf = text.matches("\r\n").count();
+        (crlf, text.matches('\n').count().saturating_sub(crlf))
+    } else {
+        (0, 0)
+    };
     let mut old = old.to_string();
     if !text.contains(&old) {
         if crlf > 0 && old.contains('\n') && !old.contains("\r\n") {
@@ -1369,7 +1603,8 @@ fn match_line_endings(text: &str, old: &str, new: &str) -> (String, String) {
 }
 
 /// What `write` must keep of the file it replaces: the model read LF-only text without the BOM.
-fn carry_over_encoding(before: &[u8], content: &str) -> Result<String, ()> {
+fn carry_over_encoding<'a>(before: &[u8], content: &'a str) -> Result<std::borrow::Cow<'a, str>, ()> {
+    use std::borrow::Cow;
     let Ok(old) = std::str::from_utf8(before) else {
         return Err(()); // UTF-16 or a legacy code page: rewriting it as UTF-8 would corrupt it
     };
@@ -1377,14 +1612,18 @@ fn carry_over_encoding(before: &[u8], content: &str) -> Result<String, ()> {
     if old.contains('\0') && !content.contains('\0') {
         return Err(());
     }
-    let crlf = old.matches("\r\n").count();
-    let lf_only = old.matches('\n').count().saturating_sub(crlf);
-    let mut out = content.to_string();
-    if crlf > lf_only && !out.contains('\r') {
-        out = out.replace('\n', "\r\n");
+    // Mostly CRLF: only a file with a CR can be, so the counts are for those alone.
+    let crlf_file = old.contains('\r') && {
+        let crlf = old.matches("\r\n").count();
+        crlf > old.matches('\n').count().saturating_sub(crlf)
+    };
+    // The common case, an LF file without a BOM, writes `content` as it is: no copy.
+    let mut out = Cow::Borrowed(content);
+    if crlf_file && !content.contains('\r') {
+        out = Cow::Owned(content.replace('\n', "\r\n"));
     }
     if old.starts_with('\u{feff}') && !out.starts_with('\u{feff}') {
-        out.insert(0, '\u{feff}');
+        out.to_mut().insert(0, '\u{feff}');
     }
     Ok(out)
 }
@@ -1443,8 +1682,10 @@ fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
         let mut hints: Vec<String> = Vec::new();
         if !ignore_case && patterns.iter().all(|p| p.contains('/') && !literal_dir(p).is_empty()) {
             let mut dirs: Vec<String> = patterns.iter().map(|p| literal_dir(p)).collect();
-            dirs.sort();
-            dirs.dedup_by(|b, a| b.starts_with(&format!("{a}/")) || b == a);
+            // By path component, not by string: `src-x` sorts before `src/a`, which would hide that `src` covers it.
+            dirs.sort_by(|a, b| a.split('/').cmp(b.split('/')));
+            // Exact case on every platform: the matcher is case-sensitive, so `Src` and `src/deep` are different ranges.
+            dirs.dedup_by(|b, a| b == a || b.strip_prefix(a.as_str()).is_some_and(|rest| rest.starts_with('/')));
             hints = dirs;
         }
         // No `**` and a `/` in every pattern: a match lies as many directories down as the pattern has.
@@ -1674,7 +1915,7 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     let trace = std::env::var_os("QX_FS_TRACE").is_some();
     let t_scan = Instant::now();
     let panicked = AtomicBool::new(false);
-    let fast = fast_regex(&matcher, needle, bool_arg(args, "literal", false));
+    let fast = fast_regex(&matcher, needle, bool_arg(args, "literal", false), ignore_case);
     let fast = fast.as_ref();
     let matcher = &matcher;
     // Threads cost ~60 us each to start: only as many as the work is worth. A file whose text is
@@ -1987,7 +2228,7 @@ fn scan_buffer(text: &str, first_line: usize, re: &regex::Regex, matcher: &Match
 /// The multi-line search expression for `scan_buffer`, when it is certain to find every line the
 /// per-line matcher would accept: a pattern with no anchors or flags that mean something different
 /// on a whole text than on one line.
-fn fast_regex(matcher: &Matcher, pattern: &str, literal: bool) -> Option<regex::Regex> {
+fn fast_regex(matcher: &Matcher, pattern: &str, literal: bool, ignore_case: bool) -> Option<regex::Regex> {
     let source = match matcher {
         Matcher::Lit { needle, ci } if literal || !pattern.is_empty() => {
             let _ = ci;
@@ -2010,7 +2251,7 @@ fn fast_regex(matcher: &Matcher, pattern: &str, literal: bool) -> Option<regex::
                 }
                 rest = after;
             }
-            format!("(?mR){p}")
+            format!("(?mR){}{p}", if ignore_case { "(?i)" } else { "" })
         }
         _ => return None,
     };
@@ -2903,7 +3144,7 @@ mod tests {
 
         let r = invoke(&dir, "write", json!({"path":"a.txt","content":"changed\n"}));
         assert!(!r.is_error, "{}", r.text);
-        assert!(r.text.contains("Updated file"));
+        assert!(r.text.contains("Updated file (+1 -3 lines)"), "{}", r.text);
         assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "changed\n");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2930,6 +3171,23 @@ mod tests {
     }
 
     #[test]
+    fn replace_all_stops_before_the_result_outgrows_the_cap() {
+        let dir = tmp("edit_cap");
+        let r = invoke(&dir, "write", json!({"path":"a.txt","content":"a\n".repeat(100)}));
+        assert!(!r.is_error, "{}", r.text);
+        let big = "b".repeat(MAX_EDIT_BYTES);
+        let r = invoke(
+            &dir,
+            "edit",
+            json!({"path":"a.txt","old_string":"a","new_string":big,"replace_all":true}),
+        );
+        assert!(r.is_error);
+        assert_eq!(r.structured["code"], "FS_TOO_LARGE", "{}", r.text);
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "a\n".repeat(100));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn write_new_file_and_edit_replace_all() {
         let dir = tmp("edit");
         let r = invoke(
@@ -2938,7 +3196,7 @@ mod tests {
             json!({"path":"src/a.rs","content":"let x = 1;\nlet x = 2;\n"}),
         );
         assert!(!r.is_error, "{}", r.text);
-        assert!(r.text.contains("Created file"));
+        assert!(r.text.contains("Created file (+2 -0 lines)"), "{}", r.text);
         let r = invoke(
             &dir,
             "edit",
@@ -2995,6 +3253,22 @@ mod tests {
         let r = invoke(&dir, "write", json!({"path":"a.txt","content":"three\n"}));
         assert!(r.is_error);
         assert_eq!(r.structured["code"], "FS_STALE");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_same_size_edit_in_the_middle_of_a_big_file_is_stale() {
+        let dir = tmp("stale-big");
+        let mut bytes = "0123456789012345678901234567890123456789\n".repeat(80_000).into_bytes(); // 3 MiB+
+        fs::write(dir.join("big.txt"), &bytes).unwrap();
+        assert!(!invoke(&dir, "read", json!({"path":"big.txt","limit":1})).is_error);
+        let mid = bytes.len() / 2;
+        bytes[mid] = b'X';
+        fs::write(dir.join("big.txt"), &bytes).unwrap();
+        let r = invoke(&dir, "write", json!({"path":"big.txt","content":"gone\n"}));
+        assert!(r.is_error, "{}", r.text);
+        assert_eq!(r.structured["code"], "FS_STALE");
+        assert_eq!(fs::read(dir.join("big.txt")).unwrap(), bytes);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3065,6 +3339,63 @@ mod tests {
             let r = invoke(&dir, "write", json!({"path":ok,"content":"x"}));
             assert!(!r.is_error, "{ok:?}: {}", r.text);
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_refuses_a_directory_name_and_a_foreign_share_at_once() {
+        let dir = tmp("write-dirname");
+        for raw in ["newdir/", "newdir\\", "a/b/"] {
+            let r = invoke(&dir, "write", json!({"path":raw,"content":"x"}));
+            assert!(r.is_error && r.structured["code"] == "FS_BAD_ARG", "{raw:?}: {}", r.text);
+        }
+        assert!(!dir.join("newdir").exists() && !dir.join("a").exists());
+        #[cfg(windows)]
+        {
+            // 192.0.2.0/24 is reserved for documentation: probing it would wait for a timeout.
+            let t = Instant::now();
+            let r = invoke(&dir, "write", json!({"path":"\\\\192.0.2.1\\share\\x.txt","content":"x"}));
+            assert!(r.is_error && r.structured["code"] == "FS_OUTSIDE_WORKSPACE", "{}", r.text);
+            assert!(t.elapsed().as_secs() < 2, "{:?}", t.elapsed());
+            // A workspace on a share owns the paths under it, however they are spelled.
+            assert_eq!(unc_share(Path::new(r"\\localhost\C$\ws\a.txt")), unc_share(Path::new(r"\\?\UNC\LOCALHOST\c$\ws")));
+            assert_ne!(unc_share(Path::new(r"\\localhost\C$\ws")), unc_share(Path::new(r"\\other\C$\ws")));
+            assert_eq!(unc_share(Path::new(r"C:\ws")), None);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_mutation_lock_holds_other_processes_out_too() {
+        let guard = lock_mutation();
+        // A thread that skips the in-process lock and asks the system for the mutex stands for another process.
+        assert!(!std::thread::spawn(|| os_mutex::acquire(200)).join().unwrap());
+        drop(guard);
+        let free = std::thread::spawn(|| {
+            let got = os_mutex::acquire(5000);
+            if got {
+                os_mutex::release();
+            }
+            got
+        });
+        assert!(free.join().unwrap());
+    }
+
+    #[test]
+    fn grep_ignore_case_reaches_the_fast_path_for_regex_and_literal() {
+        let dir = tmp("grep-ci");
+        fs::write(dir.join("a.txt"), "Hello world\nhello world\nHELLO WORLD\nnothing\n").unwrap();
+        for args in [
+            json!({"pattern":"hello","ignore_case":true}),
+            json!({"pattern":"hel+o","ignore_case":true}),
+            json!({"pattern":"hello","ignore_case":true,"literal":true}),
+        ] {
+            let r = invoke(&dir, "grep", args.clone());
+            assert!(r.text.contains("Found 3 matches"), "{args}: {}", r.text);
+        }
+        let r = invoke(&dir, "grep", json!({"pattern":"hello"}));
+        assert!(r.text.contains("Found 1 match"), "{}", r.text);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3532,7 +3863,7 @@ mod tests {
     #[test]
     fn a_bounded_live_glob_finds_what_a_full_walk_finds() {
         let dir = tmp("bounded");
-        for p in ["a.rs", "src/a.rs", "src/deep/b.rs", "src/deep/er/c.rs", "lib/x/d.rs", "docs/e.md"] {
+        for p in ["a.rs", "src/a.rs", "src/deep/b.rs", "src/deep/er/c.rs", "lib/x/d.rs", "docs/e.md", "src-x/y.rs"] {
             let f = dir.join(p);
             fs::create_dir_all(f.parent().unwrap()).unwrap();
             fs::write(f, "x").unwrap();
@@ -3548,14 +3879,168 @@ mod tests {
         assert_eq!(names("src/*/*.rs"), ["src/deep/b.rs"]);
         assert_eq!(names("src/**/*.rs"), ["src/a.rs", "src/deep/b.rs", "src/deep/er/c.rs"]);
         assert_eq!(names("{src,lib}/*/*.rs"), ["lib/x/d.rs", "src/deep/b.rs"]);
-        assert_eq!(names("*.rs"), ["a.rs", "lib/x/d.rs", "src/a.rs", "src/deep/b.rs", "src/deep/er/c.rs"]);
+        assert_eq!(names("*.rs"), ["a.rs", "lib/x/d.rs", "src-x/y.rs", "src/a.rs", "src/deep/b.rs", "src/deep/er/c.rs"]);
         assert_eq!(names("nope/*.rs"), Vec::<String>::new());
+        // `src-x` sorts between `src` and `src/deep`: the nested hint must still be dropped, not walked twice.
+        assert_eq!(names("{src,src-x,src/deep}/*.rs"), ["src-x/y.rs", "src/a.rs", "src/deep/b.rs"]);
         // The walker itself: starts in the hinted directory and stops at the depth asked for.
         let seen = std::sync::Mutex::new(Vec::new());
         let _ = walk_bounded(&canon, false, &["src".to_string()], Some(1), || (), |_, p, _| {
             seen.lock().unwrap().push(p.strip_prefix(&canon).unwrap().to_string_lossy().replace('\\', "/"));
         });
         assert_eq!(seen.into_inner().unwrap(), ["src/a.rs"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+    /// The smallest line diff by brute force: the lines outside a longest common subsequence.
+    fn lcs_delta(old: &[u8], new: &[u8]) -> (usize, usize) {
+        let lines = |t: &[u8]| std::str::from_utf8(t).unwrap().split_inclusive('\n').map(String::from).collect::<Vec<_>>();
+        let (o, n) = (lines(old), lines(new));
+        let mut t = vec![vec![0usize; n.len() + 1]; o.len() + 1];
+        for i in 0..o.len() {
+            for j in 0..n.len() {
+                t[i + 1][j + 1] = if o[i] == n[j] { t[i][j] + 1 } else { t[i][j + 1].max(t[i + 1][j]) };
+            }
+        }
+        (n.len() - t[o.len()][n.len()], o.len() - t[o.len()][n.len()])
+    }
+    #[test]
+    fn line_delta_matches_a_brute_force_diff() {
+        // A line keeps its terminator: a final newline or a line ending alone makes a line differ.
+        assert_eq!(line_delta(b"a\nb", b"a\nb\n"), (1, 1));
+        assert_eq!(line_delta(b"a\nb\n", b"a\nb"), (1, 1));
+        assert_eq!(line_delta(b"a\r\nb\r\n", b"a\nb\n"), (2, 2));
+        assert_eq!(line_delta(b"a\nb\nc", b"a\nx\ny\nc"), (2, 1));
+        assert_eq!(line_delta(b"a", b"a\nb"), (2, 1));
+        assert_eq!(line_delta(b"", b"a\nb\n"), (2, 0));
+        assert_eq!(line_delta(b"a\nb\n", b""), (0, 2));
+        assert_eq!(line_delta(b"", b""), (0, 0));
+        assert_eq!(line_delta(b"same\n", b"same\n"), (0, 0));
+        // Small strings over a tiny alphabet, half of them near-copies, from a fixed LCG.
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut rnd = move |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+        let alphabet = *b"ab\n\r";
+        for round in 0..2000 {
+            let old: Vec<u8> = (0..rnd(15)).map(|_| alphabet[rnd(4)]).collect();
+            let new: Vec<u8> = if round % 2 == 0 {
+                (0..rnd(15)).map(|_| alphabet[rnd(4)]).collect()
+            } else {
+                let mut v = old.clone();
+                for _ in 0..1 + rnd(3) {
+                    let at = rnd(v.len() + 1);
+                    match rnd(3) {
+                        0 if at < v.len() => {
+                            v.remove(at);
+                        }
+                        1 if at < v.len() => v[at] = alphabet[rnd(4)],
+                        _ => v.insert(at, alphabet[rnd(4)]),
+                    }
+                }
+                v
+            };
+            assert_eq!(line_delta(&old, &new), lcs_delta(&old, &new), "{old:?} -> {new:?}");
+        }
+        // Past the 64-byte steps of the head and tail compare, and a search that has to look (D = 200).
+        let (head, tail) = ("same line\n".repeat(50), "tail line\n".repeat(50));
+        let (old, new) = (format!("{head}x\n{tail}"), format!("{head}y\nz\n{tail}"));
+        assert_eq!(line_delta(old.as_bytes(), new.as_bytes()), (2, 1));
+        let lines = |f: &dyn Fn(usize) -> String, n: usize| (0..n).map(|i| f(i)).collect::<String>();
+        let old = lines(&|i| format!("l{i}\n"), 200);
+        let new = lines(&|i| if i % 2 == 1 { format!("m{i}\n") } else { format!("l{i}\n") }, 200);
+        assert_eq!(line_delta(old.as_bytes(), new.as_bytes()), lcs_delta(old.as_bytes(), new.as_bytes()));
+        assert_eq!(line_delta(old.as_bytes(), new.as_bytes()), (100, 100));
+        // Beyond DIFF_CAP the answer is an upper bound (everything between the shared ends), never less.
+        let old = lines(&|i| format!("l{i}\n"), 700);
+        let new = lines(&|i| if i % 2 == 1 { format!("m{i}\n") } else { format!("l{i}\n") }, 700);
+        let (a, r) = line_delta(old.as_bytes(), new.as_bytes());
+        assert!((350..=700).contains(&a) && (350..=700).contains(&r), "{a} {r}");
+    }
+    #[test]
+    fn write_and_edit_replies_count_the_lines_they_changed() {
+        let dir = tmp("delta");
+        let write = |content: &str| invoke(&dir, "write", json!({"path": "f.txt", "content": content}));
+        let reply = |what: &str| format!("<path>f.txt</path>\n<type>file</type>\n<content>\n{what}\n</content>");
+        let w = write("a\nb\nc\n");
+        assert_eq!(w.text, reply("Created file (+3 -0 lines)"));
+        assert_eq!((&w.structured["added"], &w.structured["removed"]), (&json!(3), &json!(0)));
+        // Nothing changed: said so, not `+0 -0`.
+        assert_eq!(write("a\nb\nc\n").text, reply("Updated file (no changes)"));
+        // Only the final newline went: that is a changed last line.
+        assert_eq!(write("a\nb\nc").text, reply("Updated file (+1 -1 lines)"));
+        assert_eq!(write("a\nb\nc\n").text, reply("Updated file (+1 -1 lines)"));
+        let w = write("a\nx\ny\nc\n");
+        assert_eq!(w.text, reply("Updated file (+2 -1 lines)"));
+        assert_eq!((&w.structured["added"], &w.structured["removed"]), (&json!(2), &json!(1)));
+        // A new empty file is `(empty)`; emptying a file removes its lines.
+        assert_eq!(write("").text, reply("Updated file (+0 -4 lines)"));
+        let e = invoke(&dir, "write", json!({"path": "empty.txt", "content": ""}));
+        assert_eq!(e.text, "<path>empty.txt</path>\n<type>file</type>\n<content>\nCreated file (empty)\n</content>");
+        assert_eq!((&e.structured["added"], &e.structured["removed"]), (&json!(0), &json!(0)));
+        assert_eq!(fs::read(dir.join("empty.txt")).unwrap(), b"");
+
+        // edit: replace_all counts each changed line once, two hits on a line are one changed line.
+        fs::write(dir.join("k.txt"), "k = 1\nk = 2\nk = 3\nz\nx x\n").unwrap();
+        let edit = |extra: Value| {
+            let mut args = json!({"path": "k.txt"});
+            args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            invoke(&dir, "edit", args)
+        };
+        let ok = "The file k.txt has been updated successfully.";
+        let r = edit(json!({"old_string": "k =", "new_string": "v =", "replace_all": true}));
+        assert_eq!(r.text, format!("{ok} All occurrences were successfully replaced. (+3 -3 lines)"));
+        assert_eq!(r.structured["replacements"], 3);
+        let r = edit(json!({"old_string": "x", "new_string": "w", "replace_all": true}));
+        assert_eq!(r.text, format!("{ok} All occurrences were successfully replaced. (+1 -1 lines)"));
+        assert_eq!(r.structured["replacements"], 2);
+        let r = edit(json!({"old_string": "z\n", "new_string": "z\nz2\nz3\n"}));
+        assert_eq!(r.text, format!("{ok} (+2 -0 lines)"));
+        assert_eq!(fs::read_to_string(dir.join("k.txt")).unwrap(), "v = 1\nv = 2\nv = 3\nz\nz2\nz3\nw w\n");
+        // A batch is counted on the file as a whole: a chained A -> B -> C is one changed line, and a
+        // round trip A -> B -> A changes nothing.
+        fs::write(dir.join("k.txt"), "A\nkeep\n").unwrap();
+        let chain = |a: &str, b: &str, c: &str| edit(json!({"edits": [
+            {"old_string": a, "new_string": b},
+            {"old_string": b, "new_string": c},
+        ]}));
+        let r = chain("A", "B", "C");
+        assert_eq!(r.text, format!("{ok} 2 edits applied. (+1 -1 lines)"));
+        assert_eq!(r.structured["replacements"], 2);
+        assert_eq!(fs::read_to_string(dir.join("k.txt")).unwrap(), "C\nkeep\n");
+        let r = chain("C", "D", "C");
+        assert_eq!(r.text, format!("{ok} 2 edits applied. (no changes)"));
+        assert_eq!(fs::read_to_string(dir.join("k.txt")).unwrap(), "C\nkeep\n");
+        // The final newline alone, through edit.
+        fs::write(dir.join("k.txt"), "a\nb").unwrap();
+        let r = edit(json!({"old_string": "b", "new_string": "b\n"}));
+        assert_eq!(r.text, format!("{ok} (+1 -1 lines)"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn line_counts_see_line_endings_through_write_and_edit() {
+        let dir = tmp("delta-crlf");
+        fs::write(dir.join("w.txt"), "a\r\nb\r\nc\r\n").unwrap();
+        assert!(!invoke(&dir, "read", json!({"path": "w.txt"})).is_error);
+        // The model writes LF text; the file keeps CRLF, so only the changed line differs.
+        let w = invoke(&dir, "write", json!({"path": "w.txt", "content": "a\nB\nc\n"}));
+        assert!(w.text.contains("Updated file (+1 -1 lines)"), "{}", w.text);
+        assert_eq!(fs::read(dir.join("w.txt")).unwrap(), b"a\r\nB\r\nc\r\n");
+        // The same text again: the CRLF it is written with makes the file identical.
+        let w = invoke(&dir, "write", json!({"path": "w.txt", "content": "a\nB\nc\n"}));
+        assert!(w.text.contains("Updated file (no changes)"), "{}", w.text);
+        // Content with a CR of its own is written as given, so its bare-LF lines now differ.
+        let w = invoke(&dir, "write", json!({"path": "w.txt", "content": "a\r\nB\nc\n"}));
+        assert!(w.text.contains("Updated file (+2 -2 lines)"), "{}", w.text);
+        assert_eq!(fs::read(dir.join("w.txt")).unwrap(), b"a\r\nB\nc\n");
+
+        fs::write(dir.join("e.txt"), "a\r\nb\r\nc\r\n").unwrap();
+        let e = invoke(&dir, "edit", json!({"path": "e.txt", "old_string": "b\n", "new_string": "b\nb2\n"}));
+        assert!(e.text.ends_with("(+1 -0 lines)"), "{}", e.text);
+        assert_eq!(fs::read(dir.join("e.txt")).unwrap(), b"a\r\nb\r\nb2\r\nc\r\n");
+        let e = invoke(&dir, "edit", json!({"path": "e.txt", "old_string": "b2", "new_string": "b3"}));
+        assert!(e.text.ends_with("(+1 -1 lines)"), "{}", e.text);
+        assert_eq!(fs::read(dir.join("e.txt")).unwrap(), b"a\r\nb\r\nb3\r\nc\r\n");
         let _ = fs::remove_dir_all(&dir);
     }
     /// The server builds the index on one worker thread and re-arms and reads it from others, each gone
