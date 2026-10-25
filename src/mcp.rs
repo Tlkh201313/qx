@@ -8,7 +8,7 @@ use crate::{builtin, compact, digest, exec, guard, npm, redact};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// Bounds the server: concurrent commands, how many more may queue, and how long
@@ -24,8 +24,8 @@ impl Limits {
         let workers = std::env::var("QX_MCP_WORKERS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4)
-            .clamp(1, 16);
+            .unwrap_or(8)
+            .clamp(1, 32);
         let queue = std::env::var("QX_MCP_QUEUE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -39,6 +39,8 @@ pub fn serve() -> i32 {
     // The server outlives its calls, so a parked PowerShell is ready for the next one.
     #[cfg(windows)]
     exec::keep_powershell_warm();
+    #[cfg(not(test))]
+    crate::warmup::start();
     let stdin = std::io::stdin();
     serve_io(stdin.lock(), std::io::stdout(), Limits::from_env())
 }
@@ -51,7 +53,9 @@ fn serve_io<R: BufRead, W: Write + Send + 'static>(mut reader: R, out: W, limits
     // `QX_CLIENT` (or generic) until `initialize` names the client.
     client::set_current(Client::detect(None, |k| std::env::var(k).ok()));
     let out = Arc::new(Mutex::new(out));
-    let gate = Gate::new(limits.workers);
+    // The gate bounds spawned processes only (`spawn_slot`): reads, greps and built-ins never queue
+    // behind a long build.
+    *SPAWN_GATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Gate::new(limits.workers));
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let limit = limits.workers + limits.queue;
 
@@ -62,6 +66,7 @@ fn serve_io<R: BufRead, W: Write + Send + 'static>(mut reader: R, out: W, limits
         if !matches!(reader.read_until(b'\n', &mut buf), Ok(n) if n > 0) {
             break;
         }
+        let arrived = std::time::Instant::now();
         let line = String::from_utf8_lossy(&buf).into_owned();
         if line.trim().is_empty() {
             continue;
@@ -103,10 +108,8 @@ fn serve_io<R: BufRead, W: Write + Send + 'static>(mut reader: R, out: W, limits
         }
         let out = out.clone();
         let active = active.clone();
-        let gate = gate.clone();
         std::thread::spawn(move || {
             let _active = Active(active);
-            let _slot = gate.acquire();
             if SHUTDOWN.load(Ordering::SeqCst) {
                 // The client is gone: never start work nobody will read, but still answer
                 // every id that was waiting.
@@ -115,8 +118,13 @@ fn serve_io<R: BufRead, W: Write + Send + 'static>(mut reader: R, out: W, limits
                 });
                 return;
             }
+            let started = arrived.elapsed();
             if let Some(resp) = respond_value(&req) {
+                let done = arrived.elapsed();
                 send(&out, &resp);
+                if trace_calls() {
+                    eprintln!("[call] start +{:?} work {:?} total {:?}", started, done - started, arrived.elapsed());
+                }
             }
         });
     }
@@ -129,6 +137,12 @@ fn serve_io<R: BufRead, W: Write + Send + 'static>(mut reader: R, out: W, limits
         std::thread::sleep(Duration::from_millis(10));
     }
     0
+}
+
+/// `QX_TRACE_CALLS=1`: one stderr line per call with where its time went.
+fn trace_calls() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("QX_TRACE_CALLS").is_some())
 }
 
 /// Inline answers and worker answers differ only in where they run, never in content: this is the
@@ -258,13 +272,29 @@ fn cancel(id: &Value) {
 /// The client is gone: refuse new work and stop what runs. Children are killed by qx's job object.
 fn cancel_all() {
     SHUTDOWN.store(true, Ordering::SeqCst);
+    cancel_jobs();
     let running = INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
     for (_, flag) in running.iter() {
         flag.store(true, Ordering::Relaxed);
     }
 }
 
-/// Counting gate: at most N commands run at once; the rest wait on their own worker thread.
+/// The process-spawn gate of the running server (none for the CLI and most tests).
+static SPAWN_GATE: Mutex<Option<Arc<Gate>>> = Mutex::new(None);
+
+/// A slot for one real process. Waits for a free one until `deadline`, and gives up at once when the
+/// call is cancelled; `None` inside `Ok` means there is no gate to wait on. Err is the reply text.
+pub(crate) fn spawn_slot(deadline: std::time::Instant) -> Result<Option<Slot>, String> {
+    let gate = SPAWN_GATE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some(gate) = gate else { return Ok(None) };
+    match gate.acquire_until(deadline, &exec::should_stop) {
+        Some(slot) => Ok(Some(slot)),
+        None if exec::should_stop() => Err("cancelled before it started; not run".to_string()),
+        None => Err("every command slot stayed busy until the timeout (long commands are running); not started. Retry, or raise QX_MCP_WORKERS".to_string()),
+    }
+}
+
+/// Counting gate: at most N processes run at once; the rest wait on their own worker thread.
 struct Gate {
     slots: std::sync::Mutex<usize>,
     cv: std::sync::Condvar,
@@ -278,17 +308,20 @@ impl Gate {
         })
     }
 
-    fn acquire(self: &std::sync::Arc<Self>) -> Slot {
+    fn acquire_until(self: &std::sync::Arc<Self>, deadline: std::time::Instant, stop: &dyn Fn() -> bool) -> Option<Slot> {
         let mut n = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         while *n == 0 {
-            n = self.cv.wait(n).unwrap_or_else(|e| e.into_inner());
+            if stop() || std::time::Instant::now() >= deadline {
+                return None;
+            }
+            n = self.cv.wait_timeout(n, Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
         }
         *n -= 1;
-        Slot(self.clone())
+        Some(Slot(self.clone()))
     }
 }
 
-struct Slot(std::sync::Arc<Gate>);
+pub(crate) struct Slot(std::sync::Arc<Gate>);
 
 impl Drop for Slot {
     fn drop(&mut self) {
@@ -394,11 +427,17 @@ fn rpc_error(id: Value, code: i32, message: &str) -> Value {
 }
 
 /// Codex and Claude Code never show the model `structuredContent`, so advertising an
-/// `outputSchema` for them would promise data that never arrives.
-fn strip_output_schema(schema: &mut Value, c: Client) {
-    if c.structured() == Structured::Off {
-        if let Value::Object(m) = schema {
+/// `outputSchema` for them would promise data that never arrives. Claude Code hides MCP
+/// tools behind its tool search once they pass 10% of the context, and a model that must
+/// look qx up first runs `Bash` instead: `anthropic/alwaysLoad` keeps both tools listed.
+/// A server entry's own `"alwaysLoad": false` still wins.
+fn fit_schema(schema: &mut Value, c: Client) {
+    if let Value::Object(m) = schema {
+        if c.structured() == Structured::Off {
             m.remove("outputSchema");
+        }
+        if c == Client::ClaudeCode {
+            m.insert("_meta".into(), json!({ "anthropic/alwaysLoad": true }));
         }
     }
 }
@@ -408,19 +447,23 @@ fn run_schema() -> Value {
     let mut schema = json!({
         "name": "run",
         "description": format!(
-            "Run a local command fast. Prefer `program` + `args` (direct exec, no shell); a PowerShell cmdlet (`Get-ChildItem`) or a `.ps1` path also works as `program`. A single `command` runs without a shell; otherwise `shell` decides: auto = PowerShell for cmdlet/variable syntax, Git Bash when a pipeline runs a POSIX utility (ls, cat, head, grep, wc…), else cmd. Children never prompt: stdin is empty, PowerShell runs -NonInteractive, git gets GIT_EDITOR=true and GIT_TERMINAL_PROMPT=0. In-process built-ins: pwd, echo, ls, cat, head, tail, wc, grep, mkdir, rm, cp, mv, touch, which, basename, dirname, realpath, whoami, hostname, seq, sleep. Output is compacted, preserves errors from the middle, and redacts secrets. On failure, fall back to the native {} for sandbox escalation, background jobs, or PTY work.",
+            "Run a local command (like {}, but faster). `program` + `args` execs directly; `command` is a shell line: auto picks PowerShell for cmdlets, `$var`, `a; b` and single quotes, Git Bash for POSIX pipelines, else cmd. Common tools run in-process (ls cat head tail wc grep sed mkdir rm cp mv touch which ...). Stdin is empty; output is compacted (errors kept) and secrets redacted; a cut output is saved to `full_output`. After `timeout_ms` (default 120000, max 270000) a running command becomes a background job: reply names its id; follow with `job`.",
             c.native(Native::Shell)
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "program": { "type": "string", "description": "Executable name or path, e.g. git, cargo, python, node." },
-                "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments for program." },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "JSON array of strings for program, e.g. [\"-n\",\"foo\",\"src\"]. Never a bare string." },
                 "command": { "type": "string", "description": "Full shell command line for pipes/redirects/chaining." },
                 "shell": { "type": "string", "enum": ["auto", "cmd", "bash", "powershell"], "default": "auto", "description": "auto picks PowerShell for cmdlet/variable syntax, Git Bash when a pipeline runs a POSIX utility, else cmd. PowerShell runs -NoProfile -NonInteractive." },
                 "cwd": { "type": "string", "description": "Working directory." },
-                "timeout_ms": { "type": "integer", "default": 120000, "minimum": 1000, "description": "Kill the tree after this long (clamped to 1000..3600000); the reply carries exit_code 124 and timed_out true." },
-                "mode": { "type": "string", "enum": ["compact", "full"], "default": "compact" }
+                "timeout_ms": { "type": "integer", "default": 120000, "description": "Wait this long (max 270000). A command still running then keeps going as a background job and the reply names its id." },
+                "mode": { "type": "string", "enum": ["compact", "full"], "default": "compact" },
+                "background": { "type": "boolean", "description": "Start and return a job id at once." },
+                "job": { "type": "string", "description": "Follow up a background job by id (or `list`) instead of running a command." },
+                "wait_ms": { "type": "integer", "description": "With `job`: wait this long for it to finish (default 15000)." },
+                "kill": { "type": "boolean", "description": "With `job`: stop it." }
             }
         },
         "outputSchema": {
@@ -431,6 +474,8 @@ fn run_schema() -> Value {
                 "exit_code": { "type": "integer" },
                 "duration_ms": { "type": "integer" },
                 "timed_out": { "type": "boolean" },
+                "job": { "type": "string" },
+                "running": { "type": "boolean" },
                 "truncated": { "type": "boolean" },
                 "redactions": { "type": "integer" },
                 "profile": { "type": "string" },
@@ -442,7 +487,7 @@ fn run_schema() -> Value {
             }
         }
     });
-    strip_output_schema(&mut schema, c);
+    fit_schema(&mut schema, c);
     schema
 }
 
@@ -450,35 +495,33 @@ fn fs_schema() -> Value {
     let c = client::current();
     let mut schema = json!({
         "name": "fs",
-        "description": format!(
-            "Fast in-process filesystem operations for the workspace. op=read: line-numbered UTF-8 read (path, offset?, limit?). op=write: create or replace (path, content); an existing file needs a prior qx read. op=edit: literal replace (path, old_string, new_string, replace_all?); needs a prior qx read. op=glob: path discovery (pattern; path?). op=grep: literal content search (pattern; path?, include?, ignore_case?); one output line is path:line: text. op=list/stat. Pass cwd to pin the root; it defaults to where the server started. Paths outside cwd are refused. qx skips generated dirs (node_modules, target, dist, build, ...) during recursive walks for speed; pass one as `path` to search it directly, or use the native {glob}/{grep} when the whole ignored tree matters. qx grep is literal, not regex. On any error use the native {read}/{write}/{edit}/{glob}/{grep} tool. Native tools remain authoritative for sandbox escalation, images, and regex. qx mutations are atomic and read-before-write guarded, but do not replace the client's sandbox policy.",
-            glob = c.native(Native::Glob),
-            grep = c.native(Native::Grep),
-            read = c.native(Native::Read),
-            write = c.native(Native::Write),
-            edit = c.native(Native::Edit),
-        ),
+        "description": "In-process files in the workspace. op=read (path, offset?, limit?; also reads a dir, any path, files of any size); write (path, content; replacing a file needs a prior read); edit (path, old_string, new_string, replace_all?; exact unique match, no prior read); glob (pattern, path?; newest first); grep (pattern is a REGEX, path?, include?, ignore_case?, literal?; output grouped by file); list; stat. BATCH to save round trips: `ops:[{op,...},...]` runs up to 32 in order (cwd is shared), `paths:[..]` reads/stats many files, `edits:[{old_string,new_string,replace_all?}]` applies several edits to one file atomically. Pass `cwd` (the session directory). Writes stay inside cwd; reads can go anywhere. Generated dirs (node_modules, target, build, dist, vendor...) are skipped unless named in the path/pattern or all=true; the reply says what was skipped.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "op": { "type": "string", "enum": ["read", "write", "edit", "glob", "grep", "list", "stat"] },
-                "cwd": { "type": "string", "description": "Session working directory; the root every path is confined to. Defaults to where the server was started." },
-                "path": { "type": "string", "description": "File or directory, absolute or relative to cwd. Defaults to '.' for glob, grep, and list. Alias: file_path." },
-                "file_path": { "type": "string", "description": format!("Alias for path, matching the native {}/{}/{} tools.", c.native(Native::Read), c.native(Native::Write), c.native(Native::Edit)) },
+                "cwd": { "type": "string", "description": "Session working directory (writes stay inside it). Omitted: the last one given." },
+                "path": { "type": "string", "description": "File or directory (default '.'). Alias: file_path." },
+                "file_path": { "type": "string", "description": "Alias for path." },
                 "content": { "type": "string", "description": "write: complete new file content." },
                 "old_string": { "type": "string", "description": "edit: literal text to replace." },
                 "new_string": { "type": "string", "description": "edit: replacement text." },
                 "replace_all": { "type": "boolean", "default": false },
-                "pattern": { "type": "string", "description": "glob: path glob (supports *, **, ?, [class], {a,b}). grep: literal text." },
+                "ops": { "type": "array", "items": { "type": "object" }, "description": "Batch: [{op, path, ...}, ...] in one call; each item takes the same arguments as a single call." },
+                "paths": { "type": "array", "items": { "type": "string" }, "description": "read/stat: many files in one call." },
+                "edits": { "type": "array", "items": { "type": "object" }, "description": "edit: [{old_string, new_string, replace_all?}, ...] on one path, all or nothing." },
+                "pattern": { "type": "string", "description": "glob: path glob (*, **, ?, [class], {a,b}). grep: regex." },
                 "include": { "type": "string", "description": "grep: one glob limiting which files are searched." },
                 "offset": { "type": "integer", "default": 1, "description": "read: 1-based first line." },
                 "limit": { "type": "integer", "default": 2000, "description": "read: maximum lines (cap 2000)." },
                 "max_results": { "type": "integer", "default": 100, "description": "glob: maximum paths (cap 1000)." },
                 "max_matches": { "type": "integer", "default": 250, "description": "grep: maximum matches (cap 1000)." },
                 "max_line_chars": { "type": "integer", "default": 2000, "description": "read/grep: clip each line (cap 8000)." },
-                "ignore_case": { "type": "boolean", "default": false, "description": "ASCII case-insensitive glob/grep." }
+                "ignore_case": { "type": "boolean", "default": false },
+                "literal": { "type": "boolean", "description": "grep: match pattern as plain text." },
+                "all": { "type": "boolean", "description": "glob/grep: also search node_modules, target, build, dist, vendor..." }
             },
-            "required": ["op"]
+            "required": []
         },
         "outputSchema": {
             "type": "object",
@@ -505,7 +548,7 @@ fn fs_schema() -> Value {
             }
         }
     });
-    strip_output_schema(&mut schema, c);
+    fit_schema(&mut schema, c);
     schema
 }
 
@@ -530,6 +573,294 @@ pub(crate) fn run_label(program: Option<&str>, args: &[String], cmdline: Option<
     l
 }
 
+/// A foreground call waits at most this long: dsh gives up on a tool call at 300 s, and an answer
+/// that arrives after that is lost, so a command still running here becomes a background job.
+const SOFT_MS_DEFAULT: u64 = 270_000;
+/// Claude Code moves an MCP call still running after 120 s into a task that dies with the session:
+/// answer with a job handle before that happens.
+const SOFT_MS_CLAUDE: u64 = 100_000;
+
+fn soft_ms() -> u64 {
+    match client::current() {
+        Client::ClaudeCode => SOFT_MS_CLAUDE,
+        _ => SOFT_MS_DEFAULT,
+    }
+}
+/// A background job is killed after this long unless the call asked for less.
+const JOB_MAX_MS: u64 = 3_600_000;
+/// Live background jobs; below the process slots so a few jobs never starve ordinary commands.
+const MAX_LIVE_JOBS: usize = 6;
+
+type RunResult = Result<(exec::Outcome, &'static str), String>;
+
+/// What `render` needs to turn an outcome into a reply, kept with a job so a later poll renders it
+/// exactly as the foreground call would have.
+#[derive(Clone)]
+struct RunCtx {
+    label: String,
+    cwd: Option<std::path::PathBuf>,
+    full: bool,
+    guard_warning: Option<String>,
+    /// Said when the call named no `cwd`: the command ran in qx's own directory, which is rarely meant.
+    cwd_note: Option<String>,
+}
+
+/// One command running on its own thread. The call that started it waits a while; when the command
+/// outlives that wait it keeps running here and the model polls it by id.
+struct JobRec {
+    id: std::sync::Mutex<String>,
+    ctx: RunCtx,
+    started: std::time::Instant,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<Mutex<Option<Arc<exec::Progress>>>>,
+    result: Mutex<Option<RunResult>>,
+    cv: std::sync::Condvar,
+}
+
+static JOBS: Mutex<Vec<Arc<JobRec>>> = Mutex::new(Vec::new());
+static JOB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl JobRec {
+    fn id(&self) -> String {
+        self.id.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn done(&self) -> bool {
+        self.result.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// Wait until the command finishes, `until` passes, or the client cancels the waiting call
+    /// (which stops the command and gives it 3 s to report). `None` means still running.
+    fn wait(&self, until: std::time::Instant, call: &Inflight) -> Option<RunResult> {
+        let mut grace: Option<std::time::Instant> = None;
+        let mut guard = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(r) = guard.take() {
+                return Some(r);
+            }
+            if call.cancelled() && grace.is_none() {
+                self.cancel.store(true, Ordering::Relaxed);
+                grace = Some(std::time::Instant::now() + Duration::from_secs(3));
+            }
+            let limit = grace.unwrap_or(until);
+            let now = std::time::Instant::now();
+            if now >= limit {
+                return None;
+            }
+            guard = self
+                .cv
+                .wait_timeout(guard, (limit - now).min(Duration::from_millis(100)))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+}
+
+/// Run `work` on its own thread. Its cancel flag and progress slot belong to the job, so cancelling
+/// the original request later does not reach a command that was already handed over.
+fn spawn_runner(ctx: RunCtx, work: impl FnOnce() -> RunResult + Send + 'static) -> Arc<JobRec> {
+    let rec = Arc::new(JobRec {
+        id: std::sync::Mutex::new(String::new()),
+        ctx,
+        started: std::time::Instant::now(),
+        cancel: Arc::new(AtomicBool::new(SHUTDOWN.load(Ordering::SeqCst))),
+        progress: Arc::new(Mutex::new(None)),
+        result: Mutex::new(None),
+        cv: std::sync::Condvar::new(),
+    });
+    let r = rec.clone();
+    let spawned = std::thread::Builder::new().name("qx-run".into()).spawn(move || {
+        exec::set_cancel(Some(r.cancel.clone()));
+        exec::set_progress_slot(Some(r.progress.clone()));
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+            .unwrap_or_else(|_| Err("qx internal error: the command handler panicked".to_string()));
+        *r.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
+        r.cv.notify_all();
+    });
+    if spawned.is_err() {
+        *rec.result.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Err("could not start a worker thread".to_string()));
+    }
+    rec
+}
+
+/// Make `rec` pollable. False when too many jobs are alive already.
+fn register_job(rec: &Arc<JobRec>) -> bool {
+    let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+    // Results nobody fetched are dropped oldest first, so the list cannot grow without bound.
+    while jobs.iter().filter(|j| j.done()).count() > 16 {
+        if let Some(i) = jobs.iter().position(|j| j.done()) {
+            jobs.remove(i);
+        }
+    }
+    if jobs.iter().filter(|j| !j.done()).count() >= MAX_LIVE_JOBS {
+        return false;
+    }
+    let n = JOB_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    *rec.id.lock().unwrap_or_else(|e| e.into_inner()) = format!("j{n}");
+    jobs.push(rec.clone());
+    true
+}
+
+fn find_job(id: &str) -> Option<Arc<JobRec>> {
+    JOBS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|j| j.id() == id).cloned()
+}
+
+fn forget_job(id: &str) {
+    JOBS.lock().unwrap_or_else(|e| e.into_inner()).retain(|j| j.id() != id);
+}
+
+/// The client is gone: stop every background job too.
+fn cancel_jobs() {
+    for j in JOBS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        j.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+fn human(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 3600 {
+        format!("{}h{:02}m", s / 3600, s % 3600 / 60)
+    } else if s >= 60 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// The reply for a command that is still running: its newest output and how to follow it up.
+fn running_reply(id: Option<Value>, rec: &JobRec, headline: &str) -> Value {
+    let (so, se) = rec.progress.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or_else(
+        || (String::new(), String::new()),
+        |p| p.peek(64 * 1024),
+    );
+    let tidy = |s: String| {
+        let s = if s.contains('\x1b') { compact::strip_ansi(&s) } else { s };
+        let s = if std::env::var("QX_REDACT").ok().as_deref() == Some("off") { s } else { redact::redact(&s).0 };
+        compact::compact(&s, 40, 10, 30).0
+    };
+    let (so, se) = (tidy(so), tidy(se));
+    let job = rec.id();
+    let mut text = format!(
+        "[qx] {headline}\nFollow: {{job:\"{job}\", wait_ms:60000}}; stop: {{job:\"{job}\", kill:true}}\n"
+    );
+    if !so.is_empty() {
+        text.push_str("\n[stdout, newest]\n");
+        text.push_str(&so);
+        if !so.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    if !se.is_empty() {
+        text.push_str("\n[stderr, newest]\n");
+        text.push_str(&se);
+        if !se.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    tool_result(
+        id,
+        &text,
+        false,
+        json!({ "job": job, "running": true, "elapsed_ms": rec.started.elapsed().as_millis() as u64 }),
+    )
+}
+
+/// `run {job: "j1" | "list", wait_ms?, kill?}`: look at a background job, wait for it, or stop it.
+fn job_call(id: Option<Value>, job: &str, wait_ms: u64, kill: bool) -> Value {
+    let call = Inflight::begin(&id);
+    if job == "list" {
+        let jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+        if jobs.is_empty() {
+            return tool_text(id, "[qx] no background jobs", false);
+        }
+        let mut text = String::new();
+        for j in jobs.iter() {
+            text.push_str(&format!(
+                "{} {} {} {}\n",
+                j.id(),
+                if j.done() { "finished" } else { "running" },
+                human(j.started.elapsed()),
+                j.ctx.label.chars().take(100).collect::<String>()
+            ));
+        }
+        return tool_text(id, &text, false);
+    }
+    let Some(rec) = find_job(job) else {
+        let known: Vec<String> = JOBS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|j| j.id()).collect();
+        return tool_text(
+            id,
+            &format!("[qx] no job {job}; known: {} (jobs are lost when qx restarts)", if known.is_empty() { "none".into() } else { known.join(", ") }),
+            true,
+        );
+    };
+    let until = if kill {
+        rec.cancel.store(true, Ordering::Relaxed);
+        std::time::Instant::now() + Duration::from_secs(5)
+    } else {
+        std::time::Instant::now() + Duration::from_millis(wait_ms.min(soft_ms()))
+    };
+    match rec.wait(until, &call) {
+        Some(res) => {
+            forget_job(job);
+            let prefix = format!("[qx] job {job} finished after {}\n", human(rec.started.elapsed()));
+            finish(id, res, &rec.ctx, &prefix)
+        }
+        None => {
+            let headline = if kill {
+                format!("job {job} was asked to stop and has not exited yet ({} so far)", human(rec.started.elapsed()))
+            } else {
+                format!("job {job} still running ({})", human(rec.started.elapsed()))
+            };
+            running_reply(id, &rec, &headline)
+        }
+    }
+}
+
+fn finish(id: Option<Value>, res: RunResult, ctx: &RunCtx, prefix: &str) -> Value {
+    match res {
+        Ok((outcome, source)) => render(id, outcome, source, ctx, prefix),
+        Err(e) => tool_text(id, &e, true),
+    }
+}
+
+/// A string argument under any of the names a model may use (dsh's own shell tool says `workdir`).
+fn text_arg<'a>(args: &'a Value, keys: &[&str]) -> Result<Option<&'a str>, String> {
+    for key in keys {
+        match args.get(*key) {
+            None | Some(Value::Null) => continue,
+            Some(Value::String(s)) => return Ok(Some(s.as_str())),
+            Some(other) => return Err(format!("`{key}` must be a string, got {other}")),
+        }
+    }
+    Ok(None)
+}
+
+/// Whole numbers arrive as `5000`, `5000.0` or `"5000"`; anything else is an error, because guessing
+/// a time limit is worse than asking.
+fn number_arg(args: &Value, keys: &[&str]) -> Result<Option<u64>, String> {
+    for key in keys {
+        let Some(v) = args.get(*key).filter(|v| !v.is_null()) else { continue };
+        let whole = v
+            .as_u64()
+            .or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.fract() == 0.0 && *f < 1e15).map(|f| f as u64))
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
+        return match whole {
+            Some(n) => Ok(Some(n)),
+            None => Err(format!("`{key}` must be a whole number, got {v}")),
+        };
+    }
+    Ok(None)
+}
+
+fn flag_arg(args: &Value, keys: &[&str]) -> bool {
+    keys.iter().any(|k| match args.get(*k) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s.eq_ignore_ascii_case("true"),
+        _ => false,
+    })
+}
+
 fn call_tool(req: &Value, id: Option<Value>) -> Value {
     let params = req.get("params").cloned().unwrap_or(Value::Null);
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -544,17 +875,21 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
 
     // A field of the wrong type is an error: ignoring it would run the command somewhere else
     // (`cwd`), for another time (`timeout_ms`), or as a different command (`program`).
-    let text_arg = |key: &str| -> Result<Option<&str>, String> {
-        match args.get(key) {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::String(s)) => Ok(Some(s.as_str())),
-            Some(other) => Err(format!("`{key}` must be a string, got {other}")),
-        }
-    };
-    let (program, cmdline, cwd_text) = match (text_arg("program"), text_arg("command"), text_arg("cwd")) {
+    let (program, cmdline, cwd_text) = match (
+        text_arg(&args, &["program"]),
+        text_arg(&args, &["command"]),
+        text_arg(&args, &["cwd", "workdir"]),
+    ) {
         (Ok(p), Ok(c), Ok(d)) => (p, c, d),
         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return tool_text(id, &e, true),
     };
+    let (timeout_arg, wait_arg) = match (number_arg(&args, &["timeout_ms", "timeoutMs"]), number_arg(&args, &["wait_ms"])) {
+        (Ok(t), Ok(w)) => (t, w),
+        (Err(e), _) | (_, Err(e)) => return tool_text(id, &e, true),
+    };
+    if let Some(job) = text_arg(&args, &["job"]).ok().flatten().filter(|j| !j.trim().is_empty()) {
+        return job_call(id, job.trim(), wait_arg.unwrap_or(15_000), flag_arg(&args, &["kill"]));
+    }
     // An empty `program` or `command` is an absent one.
     let program = program.filter(|p| !p.trim().is_empty());
     let cmdline = cmdline.filter(|c| !c.trim().is_empty());
@@ -576,6 +911,7 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
             }
             list
         }
+        Some(Value::String(s)) => crate::guard::args_from_text(s),
         Some(_) => return tool_text(id, "`args` must be an array of strings", true),
     };
     if program.is_none() && !list.is_empty() {
@@ -588,21 +924,18 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
     if let Some(d) = cwd.as_ref().filter(|d| !d.is_dir()) {
         return tool_text(id, &format!("cwd is not a directory: {}", d.display()), true);
     }
-    let timeout_ms: u64 = match args.get("timeout_ms") {
-        None | Some(Value::Null) => 120_000,
-        Some(v) => {
-            // Whole-number floats (`600000.0`) are what JavaScript and Python callers produce.
-            let whole = v.as_u64().or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.fract() == 0.0 && *f < 1e15).map(|f| f as u64));
-            match whole {
-                Some(n) => n,
-                None => {
-                    return tool_text(id, &format!("`timeout_ms` must be a whole number of milliseconds, got {v}"), true)
-                }
-            }
+    // No `cwd`: the one the session last named (see `fsops::last_cwd`), else qx's own directory.
+    let cwd = match (cwd, cwd_text) {
+        (Some(d), _) => {
+            crate::fsops::note_cwd(&d);
+            Some(d)
         }
-    }
-    .clamp(1_000, 3_600_000);
+        (None, _) => crate::fsops::last_cwd().filter(|d| d.is_dir()),
+    };
+    let timeout_ms = timeout_arg.unwrap_or(120_000).clamp(1_000, 3_600_000);
     let full = args.get("mode").and_then(|v| v.as_str()) == Some("full");
+    let background = flag_arg(&args, &["background", "run_in_background"]);
+    let kill_on_timeout = flag_arg(&args, &["kill_on_timeout"]);
     let label = run_label(program, &list, cmdline);
 
     let guard_cmd = match program {
@@ -633,7 +966,7 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
         return tool_result(
             id,
             &format!(
-                "[qx guard] BLOCKED: {}\nThe command was not executed. Change the command, or ask the user to set QX_GUARD=off.",
+                "[qx guard] BLOCKED: {}\nThe command was not executed. Rewrite it with explicit paths (no pipes into delete, no computed targets), or use the native shell tool if the user really wants it.",
                 decision.summary()
             ),
             true,
@@ -651,32 +984,92 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
         None
     };
     guard::record("mcp", guard_cmd, &decision);
+    if program.is_none() && cmdline.is_none() {
+        return tool_text(id, "provide `program` + `args`, or `command`", true);
+    }
 
-    let timeout = Duration::from_millis(timeout_ms);
+    // The foreground wait never passes dsh's own limit; what is still running then is a job.
+    let promote = std::env::var("QX_PROMOTE").ok().as_deref() != Some("off") && !kill_on_timeout;
+    let window = Duration::from_millis(if promote { timeout_ms.min(soft_ms()) } else { timeout_ms });
+    let hard = if promote { Duration::from_millis(JOB_MAX_MS) } else { window };
     // mode "full" promises the untouched text: built-ins must not sample their own output either.
     let full_env: Vec<(String, String)> = if full { vec![("QX_LS_FULL".into(), "1".into())] } else { Vec::new() };
-    let (outcome, source) = if let Some(p) = program {
-        match run_direct(p, &list, &full_env, cwd.as_deref(), timeout, "program") {
-            Ok(x) => x,
-            Err(e) => return tool_text(id, &e, true),
-        }
-    } else if let Some(c) = cmdline {
-        // The guard above judged the whole line; env prefixes only change what runs.
-        let (mut envs, c) = exec::peel_env(c);
-        envs.extend(full_env);
-        let direct = exec::split_simple(c)
-            .and_then(|(prog, sargs)| run_direct(&prog, &sargs, &envs, cwd.as_deref(), timeout, "direct").ok());
-        match direct {
-            Some(x) => x,
-            None => match exec::run_shell(c, shell, &envs, &cwd, Some(timeout)) {
-                Ok(o) => (o, "shell"),
-                Err(e) => return tool_text(id, &e, true),
-            },
-        }
-    } else {
-        return tool_text(id, "provide `program` + `args`, or `command`", true);
+    let ctx = RunCtx {
+        label,
+        cwd: cwd.clone(),
+        full,
+        guard_warning,
+        cwd_note: if cwd_text.is_none() {
+            cwd.clone()
+                .or_else(|| std::env::current_dir().ok())
+                .map(|d| format!("[qx] no cwd given: ran in {}\n", d.display()))
+        } else {
+            None
+        },
     };
+    let (program, cmdline) = (program.map(str::to_string), cmdline.map(str::to_string));
+    let shell = shell.to_string();
+    let rec = spawn_runner(
+        ctx.clone(),
+        move || {
+            if let Some(p) = program {
+                run_direct(&p, &list, &full_env, cwd.as_deref(), window, hard, "program")
+            } else {
+                let c = cmdline.unwrap_or_default();
+                // The guard judged the whole line; env prefixes only change what runs.
+                let (mut envs, c) = exec::peel_env(&c);
+                envs.extend(full_env);
+                let direct = exec::split_simple(c)
+                    .and_then(|(prog, sargs)| run_direct(&prog, &sargs, &envs, cwd.as_deref(), window, hard, "direct").ok());
+                match direct {
+                    Some(x) => Ok(x),
+                    None => {
+                        let _slot = match spawn_slot(std::time::Instant::now() + window) {
+                            Ok(s) => s,
+                            Err(msg) => return Ok((busy_outcome(msg), "busy")),
+                        };
+                        exec::run_shell(c, &shell, &envs, &cwd, Some(hard)).map(|o| (o, "shell"))
+                    }
+                }
+            }
+        },
+    );
 
+    // `background` still gives a command that ends at once a plain answer.
+    let wait = if background { Duration::from_millis(300) } else { window + Duration::from_millis(400) };
+    match rec.wait(std::time::Instant::now() + wait, &inflight) {
+        Some(res) => finish(id, res, &ctx, ""),
+        None if inflight.cancelled() => tool_result(
+            id,
+            "exit_code: 124\ntimed_out: true\n(cancelled)\n",
+            true,
+            json!({"timed_out": true, "exit_code": 124, "source": "cancelled"}),
+        ),
+        None => {
+            if !promote || !register_job(&rec) {
+                // No job to hand over to: stop it, as a timeout always did.
+                rec.cancel.store(true, Ordering::Relaxed);
+                let until = std::time::Instant::now() + Duration::from_secs(5);
+                return match rec.wait(until, &inflight) {
+                    Some(res) => finish(id, res, &ctx, ""),
+                    None => tool_result(id, "exit_code: 124\ntimed_out: true\n(stopped; too many background jobs)\n", true, json!({"timed_out": true, "exit_code": 124})),
+                };
+            }
+            let headline = if background {
+                format!("job {} started", rec.id())
+            } else {
+                format!("still running after {}; moved to background job {}", human(rec.started.elapsed()), rec.id())
+            };
+            running_reply(id, &rec, &headline)
+        }
+    }
+}
+
+/// Everything after the command ended: strip, redact, digest or compact, spool what was cut, and
+/// write the reply text and its structured copy.
+fn render(id: Option<Value>, outcome: exec::Outcome, source: &str, ctx: &RunCtx, prefix: &str) -> Value {
+    let (full, cwd, guard_warning) = (ctx.full, ctx.cwd.as_deref(), ctx.guard_warning.clone());
+    let label = ctx.label.as_str();
     let strip = |s: String| if s.contains('\x1b') { compact::strip_ansi(&s) } else { s };
     let mut so = strip(outcome.stdout);
     let mut se = strip(outcome.stderr);
@@ -695,17 +1088,20 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
     let mut omitted = 0usize;
     // Content a digest dropped, as opposed to noise (see `Digest::lossy`): worth a spool file.
     let mut lossy = false;
-    // The text before compaction, kept only so a cut can be spooled to disk.
-    let mut original = (String::new(), String::new());
+    let mut spool = None;
     if !full {
-        if let Some(d) = digest::digest(&label, &so, &se, outcome.code) {
+        // The text before compaction, kept only so a cut can be spooled to disk.
+        let original: (String, String);
+        compact::drop_build_noise(&mut se);
+        compact::drop_build_noise(&mut so);
+        if let Some(d) = digest::digest(label, &so, &se, outcome.code) {
             lossy = d.lossy();
             original = (std::mem::replace(&mut so, d.stdout), std::mem::replace(&mut se, d.stderr));
             profile = d.profile;
             omitted = d.omitted;
             truncated |= d.clipped;
             if matches!(profile, "build" | "test" | "traceback") {
-                compact::relative_to_cwd(&mut so, &mut se, cwd.as_deref());
+                compact::relative_to_cwd(&mut so, &mut se, cwd);
             }
         } else {
             let (a, cut) = compact::compact(&so, 200, 80, 60);
@@ -713,12 +1109,22 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
             original = (std::mem::replace(&mut so, a), std::mem::replace(&mut se, b));
             truncated |= cut | cut_err;
         }
+        // A cut or a digest that dropped content must never lose facts for good: the agent can grep the full text.
+        if truncated || lossy {
+            spool = compact::spool(&original.0, &original.1);
+        }
+    } else if so.len() > FULL_TEXT_CAP || se.len() > FULL_TEXT_CAP {
+        // "Full" is still bounded: millions of characters in one reply cost more than they help. The
+        // end is kept (that is where a failure is), the whole text goes to a file.
+        spool = compact::spool(&so, &se);
+        truncated |= cap_text(&mut so, FULL_TEXT_CAP);
+        truncated |= cap_text(&mut se, FULL_TEXT_CAP);
     }
-    // A cut or a digest that dropped content must never lose facts for good: the agent can grep the full text.
-    // `mode:"full"` keeps no original, so there is nothing to spool.
-    let spool = if !full && (truncated || lossy) { compact::spool(&original.0, &original.1) } else { None };
 
-    let mut text = String::new();
+    let mut text = String::from(prefix);
+    if let Some(n) = &ctx.cwd_note {
+        text.push_str(n);
+    }
     if let Some(w) = &guard_warning {
         text.push_str(&format!("[qx guard] warning: {w}\n"));
     }
@@ -729,8 +1135,12 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
     if outcome.timed_out {
         text.push_str("timed_out: true\n");
     }
+    // A clean run says nothing but its output: the section header is ~4 tokens on every call.
+    let plain = outcome.code == 0 && !outcome.timed_out && se.is_empty();
     if !so.is_empty() {
-        text.push_str("\n[stdout]\n");
+        if !plain {
+            text.push_str("\n[stdout]\n");
+        }
         text.push_str(&so);
         if !so.ends_with('\n') {
             text.push('\n');
@@ -748,11 +1158,12 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
     }
     if let Some(p) = &spool {
         text.push_str(&format!("\n[qx] full output: {}\n", p.display()));
+    } else if (truncated || lossy) && !full {
+        text.push_str("\n[qx] output was cut and could not be saved; re-run with mode:\"full\" for all of it\n");
     }
     if redactions > 0 {
         text.push_str(&format!("\n[qx] redacted {redactions} secret(s)\n"));
     }
-
     let mut meta = json!({
         "source": source,
         "exit_code": outcome.code,
@@ -774,7 +1185,32 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
             meta[key] = value;
         }
     }
-    tool_result(id, &text, outcome.code != 0, meta)
+    // A command that ran is not a tool fault: a failing test or an empty `grep` is a result the model
+    // reads (dsh turns `isError` into a thrown error, which sends the model looking for a fallback).
+    let fault = outcome.timed_out || (outcome.code != 0 && client::current().exit_is_error());
+    tool_result(id, &text, fault, meta)
+}
+
+/// The most text one `mode:"full"` reply carries.
+const FULL_TEXT_CAP: usize = 96 * 1024;
+
+/// Keep the first fifth and the last four fifths of `s` within `max` bytes. True when it cut.
+fn cap_text(s: &mut String, max: usize) -> bool {
+    if s.len() <= max {
+        return false;
+    }
+    let head_len = max / 5;
+    let mut h = head_len;
+    while !s.is_char_boundary(h) {
+        h -= 1;
+    }
+    let mut t = s.len() - (max - head_len);
+    while !s.is_char_boundary(t) {
+        t += 1;
+    }
+    let cut = t - h;
+    *s = format!("{}\n[qx] ... {cut} bytes omitted ...\n{}", &s[..h], &s[t..]);
+    true
 }
 
 /// Run without a shell: the npm fast path, a built-in, then the real program.
@@ -785,6 +1221,7 @@ fn run_direct(
     envs: &[(String, String)],
     cwd: Option<&std::path::Path>,
     timeout: Duration,
+    hard: Duration,
     plain: &'static str,
 ) -> Result<(exec::Outcome, &'static str), String> {
     let started = |e| format!("failed to start: {e}");
@@ -793,7 +1230,11 @@ fn run_direct(
             for c in &mut cmds {
                 exec::apply_envs(c, envs);
             }
-            return exec::run_chain(cmds, Some(timeout)).map(|o| (o, "direct")).map_err(started);
+            let _slot = match spawn_slot(std::time::Instant::now() + timeout) {
+                Ok(s) => s,
+                Err(msg) => return Ok((busy_outcome(msg), "busy")),
+            };
+            return exec::run_chain(cmds, Some(hard)).map(|o| (o, "direct")).map_err(started);
         }
     }
     // Built-ins run in this thread: the call's deadline lets them stop on time, like a child.
@@ -825,7 +1266,16 @@ fn run_direct(
     if let Some(d) = cwd {
         cmd.current_dir(d);
     }
-    exec::run_captured(cmd, Some(timeout)).map(|o| (o, plain)).map_err(started)
+    let _slot = match spawn_slot(std::time::Instant::now() + timeout) {
+        Ok(s) => s,
+        Err(msg) => return Ok((busy_outcome(msg), "busy")),
+    };
+    exec::run_captured(cmd, Some(hard)).map(|o| (o, plain)).map_err(started)
+}
+
+/// A call that never got a process slot: reported like a timeout, with the reason, and never run.
+fn busy_outcome(msg: String) -> exec::Outcome {
+    exec::Outcome { code: 124, stdout: String::new(), stderr: msg, elapsed: Duration::ZERO, timed_out: true, cut: false }
 }
 
 fn tool_text(id: Option<Value>, text: &str, is_error: bool) -> Value {
@@ -928,6 +1378,15 @@ mod tests {
         assert!(has_schema(&list(Client::Hermes)));
         assert!(!has_schema(&list(Client::Codex)));
         assert!(!has_schema(&list(Client::ClaudeCode)));
+        // Only Claude Code reads the key; the others get the tools exactly as before.
+        let always_loaded = |v: &Value, i: usize| {
+            v.pointer(&format!("/result/tools/{i}/_meta/anthropic~1alwaysLoad")) == Some(&json!(true))
+        };
+        let claude = list(Client::ClaudeCode);
+        assert!(always_loaded(&claude, 0) && always_loaded(&claude, 1));
+        for c in [Client::Dsh, Client::Codex, Client::OpenCode, Client::Hermes, Client::Pi, Client::Generic] {
+            assert!(list(c).pointer("/result/tools/0/_meta").is_none(), "{c:?}");
+        }
 
         let run = |c: Client| client::scoped(c, || call(json!({"program":"echo","args":["x"],"mode":"full"})));
         assert!(run(Client::Dsh).pointer("/result/structuredContent/stdout").is_some());
@@ -985,7 +1444,11 @@ mod tests {
         let r = call(json!({"program":"echo","args":["a", 5]}));
         assert_eq!(r.pointer("/result/isError"), Some(&json!(true)));
         assert!(r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap().contains("args[1]"));
+        // A string is split into words (some models stringify the array); any other type is refused.
         let r = call(json!({"program":"echo","args":"a b"}));
+        assert_ne!(r.pointer("/result/isError"), Some(&json!(true)));
+        assert!(r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap().contains("a b"));
+        let r = call(json!({"program":"echo","args":7}));
         assert_eq!(r.pointer("/result/isError"), Some(&json!(true)));
     }
 
@@ -1030,7 +1493,7 @@ mod tests {
         };
         // A non-string cwd used to run the command (even a delete) in qx's own directory.
         assert!(err(json!({"program":"echo","args":["x"],"cwd":123})).contains("cwd"));
-        assert!(err(json!({"program":"echo","args":["x"],"timeout_ms":"500"})).contains("timeout_ms"));
+        assert!(err(json!({"program":"echo","args":["x"],"timeout_ms":"soon"})).contains("timeout_ms"));
         assert!(err(json!({"program":"echo","args":["x"],"timeout_ms":-5})).contains("timeout_ms"));
         assert!(err(json!({"program":7})).contains("program"));
         assert!(err(json!({"program":"echo","command":"echo y"})).contains("not both"));
@@ -1420,7 +1883,7 @@ mod tests {
         let queued = sink.reply(queued_id).expect("the queued call answers");
         assert_eq!(queued.pointer("/result/isError"), Some(&json!(true)));
         let text = queued.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
-        assert!(text.contains("qx is shutting down"), "queued call text: {text}");
+        assert!(text.contains("cancelled") || text.contains("shutting down"), "queued call text: {text}");
     }
 
     #[cfg(windows)]

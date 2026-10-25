@@ -422,6 +422,24 @@ pub fn build_command_env(
     cwd: Option<&std::path::Path>,
     envs: &[(String, String)],
 ) -> Result<Command, String> {
+    // `bash` on this PATH is usually the WSL launcher, which fails without a distro; Git Bash is the one meant.
+    if matches!(program.to_ascii_lowercase().as_str(), "bash" | "bash.exe" | "sh" | "sh.exe") {
+        if let Some(b) = resolve::git_bash() {
+            let mut c = Command::new(b);
+            c.args(args);
+            prepare(&mut c);
+            apply_python_fast(&mut c);
+            apply_child_defaults(&mut c, false);
+            return Ok(c);
+        }
+    }
+    // dsh's own shell tool is called `pwsh` but runs Windows PowerShell 5.1, and models pass that name
+    // on to `program`. Where no real pwsh is installed, the same call means the PowerShell that is.
+    if matches!(program.to_ascii_lowercase().as_str(), "pwsh" | "pwsh.exe")
+        && resolve::find_on_path("pwsh").is_none()
+    {
+        return build_command_env("powershell", args, cwd, envs);
+    }
     // A cmdlet is not a CreateProcess target; a `.ps1` is handled by `Target::Ps1`.
     if verb_noun(program) {
         return powershell_call(program, args);
@@ -691,6 +709,16 @@ fn msys_quote(a: &str) -> Option<String> {
 const CMD_LINE_CAP: usize = 8_000;
 
 pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
+    let shell = shell.trim().to_ascii_lowercase();
+    let shell = shell.strip_suffix(".exe").unwrap_or(&shell);
+    // Names models use for the shells qx has: anything unknown means "decide for me".
+    let shell = match shell {
+        "pwsh" | "powershell" | "ps" | "ps1" => "powershell",
+        "sh" | "bash" | "zsh" => "bash",
+        "cmd" => "cmd",
+        "none" => "none",
+        _ => "auto",
+    };
     let choice = if shell == "auto" { pick_shell(command) } else { shell };
     match choice {
         "bash" => {
@@ -770,12 +798,83 @@ fn cmd_exe(line: &str) -> Command {
 /// wasted "'$x' is not recognized" round trip.
 fn pick_shell(s: &str) -> &'static str {
     if powershell_syntax(s) {
-        "powershell"
-    } else if posix_syntax(s) {
-        "bash"
+        return "powershell";
+    }
+    // `ls -Force | select -first 3`: PowerShell parameters, whatever the first word looks like.
+    if ps_style_flags(s) && !s.contains("&&") && !s.contains("||") {
+        return "powershell";
+    }
+    if posix_syntax(s) || missing_posix_tool(s) {
+        return "bash";
+    }
+    // Lines cmd.exe would misread: it has no `;`, treats single quotes as ordinary characters
+    // (`python -c 'print(1)'` runs with nothing and exits 0) and never expands `$name`. The dsh
+    // shell tool is PowerShell, so these are the lines models write for it.
+    let ps_like = (has_unquoted(s, ';') && !s.contains('%'))
+        || single_quoted(s)
+        || dollar_name(s)
+        || ps_style_flags(s);
+    if ps_like {
+        // PowerShell 5.1 has no `&&`; bash has both.
+        if (s.contains("&&") || s.contains("||")) && resolve::git_bash().is_some() {
+            "bash"
+        } else {
+            "powershell"
+        }
     } else {
         "cmd"
     }
+}
+
+/// A single quote outside double quotes: a PowerShell/POSIX string, plain text to cmd.exe.
+fn single_quoted(s: &str) -> bool {
+    let mut in_double = false;
+    for ch in s.chars() {
+        match ch {
+            '"' => in_double = !in_double,
+            '\'' if !in_double => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `$name`: a variable to PowerShell and bash, literal text to cmd.exe.
+fn dollar_name(s: &str) -> bool {
+    s.as_bytes().windows(2).any(|w| w[0] == b'$' && (w[1].is_ascii_alphabetic() || w[1] == b'_'))
+}
+
+/// `ls -Force`, `rm -Recurse`, `cat -Raw`: PowerShell parameters, which a coreutils twin rejects.
+fn ps_style_flags(s: &str) -> bool {
+    const FLAGS: &[&str] = &[
+        "Force", "Recurse", "Raw", "Path", "LiteralPath", "Filter", "Include", "Exclude", "Name",
+        "Depth", "File", "Directory", "ErrorAction", "First", "Last", "Skip", "Property",
+        "ExpandProperty", "Wait", "PassThru", "Encoding", "Tail", "TotalCount", "Head", "Unique",
+        "Descending", "Verbose", "WhatIf", "Confirm", "Value", "Stream", "Delimiter",
+    ];
+    s.split_whitespace().any(|w| w.strip_prefix('-').is_some_and(|f| FLAGS.contains(&f)))
+}
+
+/// A POSIX utility named in the line that is not on PATH (cmd cannot run it), with Git Bash at hand.
+fn missing_posix_tool(s: &str) -> bool {
+    segments(s).into_iter().any(|seg| {
+        let w = first_word(seg);
+        BASH_ONLY.contains(&w) && resolve::find_on_path(w).is_none() && resolve::git_coreutil(w).is_some()
+    }) && resolve::git_bash().is_some()
+}
+/// Whether `c` appears outside single and double quotes.
+fn has_unquoted(s: &str, c: char) -> bool {
+    let mut quote: Option<char> = None;
+    for ch in s.chars() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch == c => return true,
+            None => {}
+        }
+    }
+    false
 }
 
 /// Command positions: `;`, `&&`, `||`, a newline, a pipe, or the brace/paren that opens a
@@ -980,6 +1079,45 @@ fn unfinished_char(b: &[u8]) -> usize {
         _ => 1,
     };
     if cont + 1 < need { cont + 1 } else { 0 }
+}
+
+/// What a running command has written so far, readable while it runs (unlike `snapshot`, which
+/// ends the capture). A background job shows this to the model before the command is done.
+pub(crate) struct Progress {
+    out: std::sync::Arc<Capture>,
+    err: std::sync::Arc<Capture>,
+}
+
+impl Progress {
+    /// The last `max_bytes` of each stream, cut at a character boundary, as text.
+    pub(crate) fn peek(&self, max_bytes: usize) -> (String, String) {
+        (peek_tail(&self.out, max_bytes), peek_tail(&self.err, max_bytes))
+    }
+}
+
+fn peek_tail(c: &Capture, max_bytes: usize) -> String {
+    let Ok(b) = c.data.lock() else { return String::new() };
+    let mut all: Vec<u8> = Vec::with_capacity((b.head.len() + b.tail.len()).min(max_bytes * 2));
+    let total = b.head.len() + b.tail.len();
+    let skip = total.saturating_sub(max_bytes);
+    all.extend(b.head.iter().chain(b.tail.iter()).skip(skip));
+    drop(b);
+    // Start on a character boundary.
+    let lead = all.iter().take(3).take_while(|&&x| x & 0xC0 == 0x80).count();
+    all.drain(..lead);
+    let open = unfinished_char(&all);
+    all.truncate(all.len() - open);
+    decode_output(all)
+}
+
+thread_local! {
+    /// Where `collect` publishes a running command's `Progress`: set by the MCP runner thread of a
+    /// call that may become a background job.
+    static PROGRESS_SLOT: std::cell::RefCell<Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Progress>>>>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn set_progress_slot(slot: Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Progress>>>>>) {
+    PROGRESS_SLOT.with(|p| *p.borrow_mut() = slot);
 }
 
 fn snapshot(c: &Capture) -> (Vec<u8>, bool) {
@@ -1431,6 +1569,12 @@ fn collect(
 ) -> std::io::Result<Outcome> {
     let (out_sink, out_done) = capture_from_cap(child.stdout.take().expect("stdout piped"), CAPTURE_CAP);
     let (err_sink, err_done) = capture_from_cap(child.stderr.take().expect("stderr piped"), CAPTURE_CAP);
+    PROGRESS_SLOT.with(|p| {
+        if let Some(slot) = p.borrow().as_ref() {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(std::sync::Arc::new(Progress { out: out_sink.clone(), err: err_sink.clone() }));
+        }
+    });
 
     let (code, timed_out) = wait_or_kill(&mut child, job, timeout)?;
     trace(start, "child reaped");
@@ -1476,7 +1620,9 @@ mod warm {
 
     static ENABLED: AtomicBool = AtomicBool::new(false);
     static FILLING: AtomicBool = AtomicBool::new(false);
-    static PARKED: Mutex<Option<Parked>> = Mutex::new(None);
+    /// Two, so a burst of calls (a model often fires several) does not meet a cold start on the second.
+    static PARKED: Mutex<Vec<Parked>> = Mutex::new(Vec::new());
+    const PARKED_TARGET: usize = 2;
     /// Tests share one process: only the thread that turned warm mode on takes the parked
     /// PowerShell, or a test running alongside takes it from the test that checks it.
     #[cfg(test)]
@@ -1508,10 +1654,23 @@ mod warm {
     pub fn enable() {
         if std::env::var("QX_PS_WARM").ok().as_deref() != Some("off") {
             ENABLED.store(true, Ordering::SeqCst);
+            // Start the first one now: the first PowerShell call is otherwise always cold.
+            #[cfg(not(test))]
+            fill();
         }
         #[cfg(test)]
         {
             *OWNER.lock().unwrap() = Some(std::thread::current().id());
+        }
+    }
+
+    /// Idle refill: a parked PowerShell that died (or was never started) is replaced before a call needs it.
+    pub fn top_up() {
+        if ENABLED.load(Ordering::Relaxed) {
+            if let Ok(mut slot) = PARKED.lock() {
+                slot.retain_mut(|p| matches!(p.child.try_wait(), Ok(None)));
+            }
+            fill();
         }
     }
 
@@ -1541,23 +1700,16 @@ mod warm {
             Some(_) => return None,
         };
         let env = env_of(cmd);
-        let (parked, empty) = {
+        let parked = {
             let mut slot = PARKED.lock().ok()?;
             // Died while parked, or parked with an environment a plain call no longer gets (the
             // Python stub could not be written then): drop it, or every call after starts cold.
-            let stale = |p: &mut Parked| {
-                !matches!(p.child.try_wait(), Ok(None)) || (p.env != env && p.env != env_of(&powershell(String::new())))
-            };
-            if slot.as_mut().is_some_and(stale) {
-                *slot = None;
-            }
-            // A `NAME=v` prefix changes the environment: that call starts cold, the parked one waits.
-            let parked = slot.take_if(|p| p.env == env);
-            (parked, slot.is_none())
+            let plain_env = env_of(&powershell(String::new()));
+            slot.retain_mut(|p| matches!(p.child.try_wait(), Ok(None)) && (p.env == env || p.env == plain_env));
+            // A `NAME=v` prefix changes the environment: that call starts cold, the parked ones wait.
+            slot.iter().position(|p| p.env == env).map(|i| slot.remove(i))
         };
-        if empty {
-            fill();
-        }
+        fill();
         let mut parked = parked?;
         let payload = format!("{dir}\n{script}\n#qx-end");
         let mut stdin = parked.child.stdin.take()?;
@@ -1574,12 +1726,15 @@ mod warm {
             return;
         }
         std::thread::spawn(|| {
-            let mut c = powershell(BOOT.to_string());
-            let env = env_of(&c);
-            if let Ok(child) = c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+            while PARKED.lock().map_or(false, |s| s.len() < PARKED_TARGET) {
+                let mut c = powershell(BOOT.to_string());
+                let env = env_of(&c);
+                let Ok(child) = c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() else {
+                    break;
+                };
                 let job = job::Job::assign(&child);
                 if let Ok(mut slot) = PARKED.lock() {
-                    *slot = Some(Parked { child, job, env });
+                    slot.push(Parked { child, job, env });
                 }
             }
             FILLING.store(false, Ordering::SeqCst);
@@ -1599,12 +1754,13 @@ mod warm {
 
     #[cfg(test)]
     pub fn parked_pid() -> Option<u32> {
-        PARKED.lock().ok()?.as_ref().map(|p| p.child.id())
+        PARKED.lock().ok()?.first().map(|p| p.child.id())
     }
 }
 
 #[cfg(windows)]
 pub use warm::enable as keep_powershell_warm;
+pub use warm::top_up as top_up_powershell;
 
 /// Run one `command` through `shell`, with env prefixes, a cwd and one retry for a startup
 /// flake that is not the command's fault.

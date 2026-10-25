@@ -50,6 +50,11 @@ pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Dige
         let (o, n) = git_log(stdout)?;
         ("git-log", o, None, n, false)
     } else if is_diff(&l) {
+        // A diff that fits is shown as git printed it: without its context lines and headers the hunk
+        // offsets no longer match what is shown. Only a long one is condensed (and spooled).
+        if stdout.lines().count() <= 400 {
+            return None;
+        }
         let (o, n, c) = git_diff(stdout)?;
         ("git-diff", o, None, n, c)
     } else if is_pathlist(&l) {
@@ -136,8 +141,11 @@ fn verbatim(l: &str, code: i32) -> bool {
                 && w[1..].contains(['s', 'v']))
     };
     let w: Vec<&str> = words(l).collect();
+    // A failing run that asked for its output (`--nocapture`, `-v`) wants the prints most of all.
+    let _ = code;
     w.iter().any(|x| machine(x))
-        || (code == 0 && (w.iter().any(|x| shows(x)) || w.windows(2).any(|p| p[0] == "--reporter" && p[1] == "verbose")))
+        || w.iter().any(|x| shows(x))
+        || w.windows(2).any(|p| p[0] == "--reporter" && p[1] == "verbose")
 }
 
 fn merge(stdout: &str, stderr: &str) -> String {
@@ -877,6 +885,7 @@ fn fail_line(t: &str, build: bool) -> bool {
         || t.starts_with("error[")
         || t.starts_with("The following tests FAILED")
         || t.starts_with("test failed")
+        || t.starts_with("not ok")
 }
 
 /// `test_x.py:14: ` / `pkg/mod.py:13: ZeroDivisionError` (unindented, so the
@@ -1028,6 +1037,14 @@ fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool
             i = j;
             continue;
         }
+        if t == "failures:" {
+            // cargo lists the failed test names indented under this heading.
+            let mut k = i + 1;
+            while k < lines.len() && k - i <= 80 && lines[k].starts_with("    ") && !lines[k].trim().is_empty() {
+                keep[k] = true;
+                k += 1;
+            }
+        }
         if let Some(pkg) = t.strip_prefix("npm warn deprecated ") {
             // The package is the signal; npm's reason text is the noise.
             deprecated.push(pkg.split(": ").next().unwrap_or(pkg));
@@ -1082,7 +1099,7 @@ fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool
     let mut kept = 0usize;
     // A green run that drops more than progress (prints, console.log, unknown notes) keeps the
     // full text on disk: the caller sees it was cut and where it went.
-    let mut clipped = code == 0 && lines.iter().zip(&keep).any(|(l, k)| !k && !routine_line(l.trim()));
+    let mut clipped = lines.iter().zip(&keep).any(|(l, k)| !k && !routine_line(l.trim()));
     // msbuild/tsc print each located error again in their summary; the location
     // makes an exact repeat a true duplicate (rustc headers repeat without one).
     let mut seen = std::collections::HashSet::new();
