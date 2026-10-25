@@ -1447,7 +1447,13 @@ fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
             dirs.dedup_by(|b, a| b.starts_with(&format!("{a}/")) || b == a);
             hints = dirs;
         }
-        let (parts, skipped_dirs) = walk_hinted(&root_path, all, &hints, GlobPart::default, |part, p, meta| {
+        // No `**` and a `/` in every pattern: a match lies as many directories down as the pattern has.
+        let max_depth = if patterns.iter().all(|p| p.contains('/') && !p.contains("**")) {
+            patterns.iter().map(|p| p.split('/').count() - 1).max()
+        } else {
+            None
+        };
+        let (parts, skipped_dirs) = walk_bounded(&root_path, all, &hints, max_depth, GlobPart::default, |part, p, meta| {
             part.walked += 1;
             let rel = p
                 .strip_prefix(&root_path)
@@ -2308,12 +2314,39 @@ where
     I: Fn() -> S + Sync,
     F: Fn(&mut S, &Path, &FileMeta) + Sync,
 {
+    walk_bounded(root, all, hints, None, init, visit)
+}
+
+/// `walk_hinted` that also knows how deep a match can lie: `max_depth` is the number of directory
+/// levels below `root` whose files can match (`src/*.rs` -> 1). Without an index the live walk then
+/// starts in the hinted directories and never descends past that depth, instead of reading the tree.
+pub(crate) fn walk_bounded<S, I, F>(
+    root: &Path,
+    all: bool,
+    hints: &[String],
+    max_depth: Option<usize>,
+    init: I,
+    visit: F,
+) -> (Vec<S>, Vec<String>)
+where
+    S: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, &Path, &FileMeta) + Sync,
+{
     if !all {
         if let Some((snap, prefix)) = crate::index::snapshot(root) {
             return walk_snapshot(&snap, &prefix, hints, init, visit);
         }
     }
-    walk_live(root, all, init, visit)
+    // A hint that steps out of the root (`..`) or is not a plain directory name falls back to the root.
+    let usable = !hints.is_empty()
+        && hints.iter().all(|h| !h.is_empty() && h.split('/').all(|s| !s.is_empty() && s != "." && s != ".." && !s.contains(':')));
+    let starts: Vec<(PathBuf, usize)> = if usable {
+        hints.iter().map(|h| (root.join(h), h.split('/').count())).collect()
+    } else {
+        vec![(root.to_path_buf(), 0)]
+    };
+    walk_from(root, all, starts, max_depth.unwrap_or(MAX_WALK_DEPTH).min(MAX_WALK_DEPTH), init, visit)
 }
 
 fn walk_snapshot<S, I, F>(snap: &crate::index::Snapshot, prefix: &str, hints: &[String], init: I, visit: F) -> (Vec<S>, Vec<String>)
@@ -2392,13 +2425,27 @@ where
     I: Fn() -> S + Sync,
     F: Fn(&mut S, &Path, &FileMeta) + Sync,
 {
+    walk_from(root, all, vec![(root.to_path_buf(), 0)], MAX_WALK_DEPTH, init, visit)
+}
+
+fn walk_from<S, I, F>(root: &Path, all: bool, starts: Vec<(PathBuf, usize)>, limit: usize, init: I, visit: F) -> (Vec<S>, Vec<String>)
+where
+    S: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, &Path, &FileMeta) + Sync,
+{
+    let starts: Vec<(PathBuf, usize)> = starts.into_iter().filter(|(p, d)| *d <= limit && p.is_dir()).collect();
+    if starts.is_empty() {
+        return (vec![init()], Vec::new());
+    }
     let walk = Walk {
         root,
         all,
+        limit,
         skipped: Mutex::new(std::collections::BTreeSet::new()),
         state: Mutex::new(WalkState {
-            dirs: vec![(root.to_path_buf(), 0)],
-            pending: 1,
+            pending: starts.len(),
+            dirs: starts,
         }),
         wake: Condvar::new(),
         files: AtomicUsize::new(0),
@@ -2432,6 +2479,8 @@ struct Walk<'a> {
     root: &'a Path,
     /// Also enter the generated directories of `skip_dir` (never VCS metadata).
     all: bool,
+    /// Deepest directory level whose files are visited (the root is level 0).
+    limit: usize,
     /// Generated directories left out, so a reply can say what it did not search.
     skipped: Mutex<std::collections::BTreeSet<String>>,
     state: Mutex<WalkState>,
@@ -2479,7 +2528,7 @@ impl Walk<'_> {
     }
 
     fn read<S, F: Fn(&mut S, &Path, &FileMeta)>(&self, dir: &Path, depth: usize, part: &mut S, visit: &F) {
-        if depth > MAX_WALK_DEPTH || self.files.load(Ordering::Relaxed) >= MAX_WALK_FILES {
+        if depth > self.limit || self.files.load(Ordering::Relaxed) >= MAX_WALK_FILES {
             return;
         }
         let Ok(entries) = fs::read_dir(dir) else {
@@ -2498,6 +2547,9 @@ impl Walk<'_> {
                     if !is_vcs_dir(&name) {
                         self.skipped.lock().unwrap_or_else(|e| e.into_inner()).insert(name);
                     }
+                    continue;
+                }
+                if depth >= self.limit {
                     continue;
                 }
                 if let Some(child) = child_dir(&entry, self.root) {
@@ -3476,4 +3528,59 @@ mod tests {
             let _ = fs::canonicalize("Cargo.toml");
         }
         println!("canonicalize   {:>8.1} us", t.elapsed().as_secs_f64() * 1e6 / 2000.0);
+    }
+    #[test]
+    fn a_bounded_live_glob_finds_what_a_full_walk_finds() {
+        let dir = tmp("bounded");
+        for p in ["a.rs", "src/a.rs", "src/deep/b.rs", "src/deep/er/c.rs", "lib/x/d.rs", "docs/e.md"] {
+            let f = dir.join(p);
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, "x").unwrap();
+        }
+        let canon = fs::canonicalize(&dir).unwrap();
+        let names = |pat: &str| {
+            let mut v: Vec<String> = invoke(&dir, "glob", json!({"pattern": pat}))
+                .text.lines().filter(|l| !l.starts_with("[qx]") && *l != "No files found.").map(String::from).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names("src/*.rs"), ["src/a.rs"]);
+        assert_eq!(names("src/*/*.rs"), ["src/deep/b.rs"]);
+        assert_eq!(names("src/**/*.rs"), ["src/a.rs", "src/deep/b.rs", "src/deep/er/c.rs"]);
+        assert_eq!(names("{src,lib}/*/*.rs"), ["lib/x/d.rs", "src/deep/b.rs"]);
+        assert_eq!(names("*.rs"), ["a.rs", "lib/x/d.rs", "src/a.rs", "src/deep/b.rs", "src/deep/er/c.rs"]);
+        assert_eq!(names("nope/*.rs"), Vec::<String>::new());
+        // The walker itself: starts in the hinted directory and stops at the depth asked for.
+        let seen = std::sync::Mutex::new(Vec::new());
+        let _ = walk_bounded(&canon, false, &["src".to_string()], Some(1), || (), |_, p, _| {
+            seen.lock().unwrap().push(p.strip_prefix(&canon).unwrap().to_string_lossy().replace('\\', "/"));
+        });
+        assert_eq!(seen.into_inner().unwrap(), ["src/a.rs"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+    /// The server builds the index on one worker thread and re-arms and reads it from others, each gone
+    /// a moment later. A watch tied to its issuing thread dies with it (error 995) and the index is
+    /// then rebuilt on every call: this is what made globs and greps slow for real sessions.
+    #[cfg(windows)]
+    #[test]
+    fn the_index_outlives_the_threads_that_built_and_read_it() {
+        let dir = tmp("index-threads");
+        fs::write(dir.join("a.rs"), "x").unwrap();
+        let canon = fs::canonicalize(&dir).unwrap();
+        let d = dir.clone();
+        std::thread::spawn(move || crate::index::ensure(&d)).join().unwrap();
+        for round in 0..6 {
+            fs::write(dir.join(format!("n{round}.rs")), "y").unwrap();
+            let c = canon.clone();
+            let got = std::thread::spawn(move || {
+                crate::index::snapshot(&c).map(|(s, _)| s.files.iter().map(|e| e.rel.clone()).collect::<Vec<_>>())
+            })
+            .join()
+            .unwrap()
+            .expect("index still valid after the threads that used it exited");
+            assert!(got.contains(&format!("n{round}.rs")) && got.contains(&"a.rs".to_string()), "round {round}: {got:?}");
+            assert_eq!(got.len(), round + 2, "round {round}: {got:?}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = fs::remove_dir_all(&dir);
     }}

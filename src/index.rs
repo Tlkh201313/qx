@@ -116,7 +116,11 @@ mod imp {
             template: Handle,
         ) -> Handle;
         fn CloseHandle(h: Handle) -> i32;
-        fn CreateEventW(security: *mut c_void, manual: i32, initial: i32, name: *const u16) -> Handle;
+        // Bound to a completion port, the watch request survives the exit of the thread that issued it;
+        // a plain overlapped request is cancelled (error 995) the moment that thread ends, and the
+        // server issues it from short-lived worker threads.
+        fn CreateIoCompletionPort(file: Handle, port: Handle, key: usize, threads: u32) -> Handle;
+        fn GetQueuedCompletionStatus(port: Handle, n: *mut u32, key: *mut usize, ov: *mut *mut Overlapped, ms: u32) -> i32;
         fn ReadDirectoryChangesW(
             dir: Handle,
             buf: *mut c_void,
@@ -127,13 +131,10 @@ mod imp {
             ov: *mut Overlapped,
             completion: *mut c_void,
         ) -> i32;
-        fn WaitForSingleObject(h: Handle, ms: u32) -> u32;
-        fn GetOverlappedResult(h: Handle, ov: *mut Overlapped, n: *mut u32, wait: i32) -> i32;
         fn CancelIoEx(h: Handle, ov: *mut Overlapped) -> i32;
     }
 
     const INVALID_HANDLE: isize = -1;
-    const WAIT_OBJECT_0: u32 = 0;
     const BUFFER_WORDS: usize = 64 * 1024; // 256 KB of change records
     const MAX_ROOTS: usize = 4;
     // FILE_NOTIFY_CHANGE_FILE_NAME | DIR_NAME | SIZE | LAST_WRITE
@@ -149,7 +150,7 @@ mod imp {
         root: PathBuf,
         snap: Arc<Snapshot>,
         dir: Handle,
-        event: Handle,
+        port: Handle,
         pending: Box<Pending>,
         broken: bool,
     }
@@ -161,16 +162,42 @@ mod imp {
         fn drop(&mut self) {
             unsafe {
                 CancelIoEx(self.dir, &mut self.pending.ov);
-                let mut n = 0u32;
-                GetOverlappedResult(self.dir, &mut self.pending.ov, &mut n, 1);
+                // The request ends with exactly one packet; the buffer stays until the kernel is done with it.
+                let (mut n, mut key, mut pov) = (0u32, 0usize, std::ptr::null_mut());
+                let got = GetQueuedCompletionStatus(self.port, &mut n, &mut key, &mut pov, 2000);
+                if got == 0 && pov.is_null() {
+                    let stuck = std::mem::replace(&mut self.pending, Box::new(Pending { ov: Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: std::ptr::null_mut() }, buf: Vec::new() }));
+                    Box::leak(stuck);
+                }
                 CloseHandle(self.dir);
-                CloseHandle(self.event);
+                CloseHandle(self.port);
             }
         }
     }
 
     static REGISTRY: Mutex<Vec<Arc<Mutex<Index>>>> = Mutex::new(Vec::new());
     static BUILDING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static BUILT: std::sync::Condvar = std::sync::Condvar::new();
+
+    /// A query that arrives while the index of its tree is being built waits for it (up to 2 s): the
+    /// build is the same walk the query would do, and two walks at once take longer than either.
+    fn wait_for_build(root: &Path) -> bool {
+        let want = key(root);
+        let covers = |k: &String| want == *k || want.strip_prefix(k.as_str()).is_some_and(|r| r.starts_with('\\'));
+        let mut building = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
+        if !building.iter().any(covers) {
+            return false;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while building.iter().any(covers) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            building = BUILT.wait_timeout(building, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        true
+    }
 
     fn key(p: &Path) -> String {
         let s = p.to_string_lossy().replace('/', "\\");
@@ -186,7 +213,7 @@ mod imp {
         fn issue(&mut self) -> bool {
             let words = self.pending.buf.len();
             let p = &mut *self.pending;
-            p.ov = Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: self.event };
+            p.ov = Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: std::ptr::null_mut() };
             unsafe {
                 ReadDirectoryChangesW(
                     self.dir,
@@ -203,10 +230,14 @@ mod imp {
 
         /// Apply every change the kernel has queued. Cheap when there is none: one wait with no timeout.
         fn drain(&mut self) {
-            while !self.broken && unsafe { WaitForSingleObject(self.event, 0) } == WAIT_OBJECT_0 {
-                let mut n = 0u32;
-                let ok = unsafe { GetOverlappedResult(self.dir, &mut self.pending.ov, &mut n, 0) } != 0;
+            while !self.broken {
+                let (mut n, mut key, mut pov) = (0u32, 0usize, std::ptr::null_mut());
+                let ok = unsafe { GetQueuedCompletionStatus(self.port, &mut n, &mut key, &mut pov, 0) } != 0;
+                if pov.is_null() {
+                    return; // nothing queued
+                }
                 if !ok || n == 0 {
+                    trace(|| format!("drain: ok={ok} n={n}"));
                     // 0 bytes is the kernel's buffer overflow: some changes were lost.
                     self.broken = true;
                     return;
@@ -218,6 +249,7 @@ mod imp {
                 };
                 // Re-arm first: changes that land while this batch is applied are queued, not lost.
                 if !self.issue() {
+                    trace(|| "drain: re-arm failed".to_string());
                     self.broken = true;
                     return;
                 }
@@ -273,6 +305,7 @@ mod imp {
                     };
                     let ft = md.file_type();
                     if ft.is_symlink() || is_reparse(&md) {
+                        trace(|| format!("change: link/reparse {rel}"));
                         self.broken = true; // let the walk decide how to treat a junction
                     } else if ft.is_dir() {
                         if action != MODIFIED {
@@ -283,7 +316,10 @@ mod imp {
                         Arc::make_mut(&mut self.snap).upsert(rel, full, modified);
                     }
                 }
-                _ => self.broken = true,
+                other => {
+                    trace(|| format!("change: unknown action {other} {rel}"));
+                    self.broken = true
+                }
             }
         }
 
@@ -335,8 +371,8 @@ mod imp {
         if dir as isize == INVALID_HANDLE || dir.is_null() {
             return None;
         }
-        let event = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
-        if event.is_null() {
+        let port = unsafe { CreateIoCompletionPort(dir, std::ptr::null_mut(), 0, 1) };
+        if port.is_null() {
             unsafe { CloseHandle(dir) };
             return None;
         }
@@ -344,15 +380,15 @@ mod imp {
             root: root.to_path_buf(),
             snap: Arc::new(Snapshot::default()),
             dir,
-            event,
+            port,
             pending: Box::new(Pending {
-                ov: Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event },
+                ov: Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: std::ptr::null_mut() },
                 buf: vec![0u32; BUFFER_WORDS],
             }),
             broken: false,
         };
         if !index.issue() {
-            return None;
+            return None; // Drop closes the handles
         }
         let (parts, skipped) = crate::fsops::walk_live(root, false, Vec::<Entry>::new, |found, p, meta| {
             let rel = p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/");
@@ -389,11 +425,22 @@ mod imp {
         None
     }
 
+    fn trace(msg: impl FnOnce() -> String) {
+        if std::env::var_os("QX_FS_TRACE").is_some() {
+            eprintln!("[index] {}", msg());
+        }
+    }
+
     pub fn snapshot(root: &Path) -> Option<(Arc<Snapshot>, String)> {
-        let (ix, prefix) = find(root)?;
+        let found = find(root).or_else(|| if wait_for_build(root) { find(root) } else { None });
+        let Some((ix, prefix)) = found else {
+            trace(|| format!("miss: no index for {}", root.display()));
+            return None;
+        };
         let mut guard = ix.lock().ok()?;
         guard.drain();
         if guard.broken {
+            trace(|| "broken: rebuilding".to_string());
             let base = guard.root.clone();
             drop(guard);
             forget(&base);
@@ -431,7 +478,10 @@ mod imp {
             }
             building.push(k.clone());
         }
-        if let Some(index) = build(root) {
+        let started = std::time::Instant::now();
+        let built = build(root);
+        trace(|| format!("build {} -> {} in {:?}", root.display(), built.as_ref().map_or(0, |i| i.snap.files.len()), started.elapsed()));
+        if let Some(index) = built {
             let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
             if reg.len() >= MAX_ROOTS {
                 reg.remove(0);
@@ -439,5 +489,6 @@ mod imp {
             reg.push(Arc::new(Mutex::new(index)));
         }
         BUILDING.lock().unwrap_or_else(|e| e.into_inner()).retain(|b| b != &k);
+        BUILT.notify_all();
     }
 }
