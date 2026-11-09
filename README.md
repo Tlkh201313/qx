@@ -189,7 +189,7 @@ A non-zero exit is a result, not a tool error, for every client (Claude Code wou
    `notifications/cancelled` stops the matching running call (it reports as
    timed out), also while the call still waits for a worker slot; ping and
    cancel are answered even when every slot is busy. `args` must be an array of strings (anything else is an error,
-   not a different command) and `timeout_ms` (also as `"5000"`) is clamped to 1 s-1 h. dsh's own names `workdir` and `timeoutMs` are accepted too. A command still running when `timeout_ms` (at most 270 s, below dsh's 300 s tool limit) ends is **not killed**: it becomes a background job and the reply names its id (`run {job:"j1", wait_ms:60000}` waits, `{job:"j1", kill:true}` stops it, `{job:"list"}` lists; `background:true` starts one at once; `kill_on_timeout:true` or `QX_PROMOTE=off` restore kill-on-timeout). A non-zero exit is a result, not a tool error, except for Claude Code and Codex. Omitting `cwd` uses the last one the session named, and the reply says so.
+   not a different command) and `timeout_ms` (also as `"5000"`) is clamped to 1 s-1 h. dsh's own names `workdir` and `timeoutMs` are accepted too. A command still running when `timeout_ms` (at most 270 s, below dsh's 300 s tool limit) ends is **not killed**: it becomes a background job and the reply names its id (`run {job:"j1", wait_ms:60000}` waits, `{job:"j1", kill:true}` stops it, `{job:"list"}` lists; `background:true` starts one at once; `kill_on_timeout:true` or `QX_PROMOTE=off` restore kill-on-timeout). A non-zero exit is a result, not a tool error, for every client (`QX_EXIT_ERROR=1` makes it one). Omitting `cwd` uses the last one the session named, and the reply says so.
 7. **Diagnostics** - `qx doctor` measures process-creation latency and names the
    antivirus products fighting over every spawn. `QX_TRACE=1` prints the phase
    timings of a run (spawn, wait, kill window, taskkill, reap) to stderr, so
@@ -270,7 +270,7 @@ code. A commit message that merely mentions `.env` or `curl` is not blocked;
 `;` included; PGP key blocks too). Values that are plainly code or prose
 (`std::env::var(`, `Option<String>`, `pub token: String`, `error: invalid
 secret: expected 32 bytes`) are left readable. A human at a TTY sees raw output
-unless `QX_REDACT=1`.
+unless `QX_REDACT=1`. `fs` replies are not redacted: they return file contents as written, so a secret in a file you read is shown.
 
 **Audit** - every warning or block is appended to
 `%LOCALAPPDATA%\qx\audit.jsonl`; review with `qx audit`. Set `QX_AUDIT=1` to log
@@ -522,7 +522,7 @@ real server and prints `pi bridge ok`.
 | `write` | `path`, `content` | create, or replace after a qx read; parents created; atomic |
 | `edit` | `path`, `old_string`, `new_string`, `replace_all?` | literal replace, no prior read needed; unique unless `replace_all`; UTF-8 only (UTF-16 / legacy code pages get `FS_ENCODING` and are left untouched) |
 | `glob` | `pattern`, `path?` | `*`, `**`, `?`, `[class]`, `{a,b}`; newest first; generated dirs skipped |
-| `grep` | `pattern`, `path?`, `include?`, `ignore_case?` | regex (`literal?` for text), grouped by file as `N: text`; `all?` also searches node_modules/target/build/dist/vendor (the reply names what it skipped); scans files in parallel |
+| `grep` | `pattern`, `path?`, `include?`, `ignore_case?` | regex (`literal?` for text), grouped by file as `N: text`; `all?` also searches node_modules/target/build/dist/vendor and, in a git repo, the folders git ignores (the reply names what it skipped); an option no `fs` operation reads is named in an `ignored (not fs options)` line; scans files in parallel |
 | `list` / `stat` | `path?` | directory entries / one path's type, size, mtime |
 
 Agents should prefer `program` + `args` for commands. It removes one process
@@ -638,7 +638,7 @@ creation. Fixing that is worth more than any CLI:
 ## Design notes
 
 - Zero async runtime, zero wrapper daemon - `std::process` only.
-- One dependency (`serde_json`) for the MCP protocol.
+- Two dependencies: `serde_json` for the MCP protocol and `regex` for `fs grep` and the built-in `grep`.
 - Capture mode reads stdout and stderr on separate threads, so large output can
   never deadlock the child. Each stream is capped at 16 MiB; the excess is
   drained, not buffered.
