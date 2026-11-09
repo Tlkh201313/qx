@@ -11,7 +11,7 @@ use std::ops::Range;
 pub fn member(text: &str, path: &[&str]) -> Result<Option<Range<usize>>, String> {
     let mut start = first_value(text)?;
     for (depth, key) in path.iter().enumerate() {
-        let (list, close) = members(text, start)?;
+        let (list, _) = members(text, start)?;
         let Some(hit) = list.iter().find(|m| m.key == *key) else {
             return Ok(None);
         };
@@ -21,14 +21,13 @@ pub fn member(text: &str, path: &[&str]) -> Result<Option<Range<usize>>, String>
         let bytes = text.as_bytes();
         if bytes.get(hit.value_start) != Some(&b'{') {
             // A non-object on the way down means the member we want cannot exist.
-            let _ = close;
             return Ok(None);
         }
         start = hit.value_start;
     }
     // An empty path means the whole document's value.
     let mut end = start;
-    value(text.as_bytes(), &mut end, true)?;
+    value(text.as_bytes(), &mut end)?;
     Ok(Some(start..end))
 }
 
@@ -43,7 +42,7 @@ pub fn set_member(text: &str, path: &[&str], value: &Value) -> Result<String, St
             // Same bytes: nothing to do, so repeated runs stay Unchanged.
             return Ok(text.to_string());
         }
-        let indent = indent_at(text, range.start);
+        let indent = line_indent(text, range.start);
         let mut out = String::with_capacity(text.len() + 64);
         out.push_str(&text[..range.start]);
         out.push_str(&reindent(value, &indent));
@@ -89,7 +88,7 @@ fn array(text: &str, path: &[&str]) -> Result<Option<Array>, String> {
             return Ok(Some((range.start..i, items)));
         }
         let start = i;
-        value(b, &mut i, true)?;
+        value(b, &mut i)?;
         items.push(start..i);
         skip(b, &mut i);
         match b.get(i) {
@@ -244,7 +243,8 @@ struct Member {
 }
 
 fn first_value(text: &str) -> Result<usize, String> {
-    let mut i = 0;
+    // PowerShell 5.1 `Set-Content -Encoding UTF8` writes a BOM; it stays in the file, the edits go after it.
+    let mut i = if text.starts_with('\u{feff}') { '\u{feff}'.len_utf8() } else { 0 };
     skip(text.as_bytes(), &mut i);
     if i < text.len() {
         Ok(i)
@@ -279,7 +279,7 @@ fn members(text: &str, start: usize) -> Result<(Vec<Member>, usize), String> {
         i += 1;
         skip(b, &mut i);
         let value_start = i;
-        value(b, &mut i, true)?;
+        value(b, &mut i)?;
         out.push(Member {
             key,
             key_start,
@@ -372,11 +372,6 @@ fn line_indent(text: &str, pos: usize) -> String {
         .chars()
         .take_while(|c| *c == ' ' || *c == '\t')
         .collect()
-}
-
-/// Indentation to give the first line of a value replaced in place.
-fn indent_at(text: &str, value_start: usize) -> String {
-    line_indent(text, value_start)
 }
 
 /// `serde_json`'s pretty output, re-indented to sit at `indent`.
@@ -498,10 +493,8 @@ fn string_value(text: &str, i: &mut usize) -> Result<String, String> {
     Err("unterminated string".into())
 }
 
-fn value(b: &[u8], i: &mut usize, allow_comments: bool) -> Result<(), String> {
-    if allow_comments {
-        skip(b, i);
-    }
+fn value(b: &[u8], i: &mut usize) -> Result<(), String> {
+    skip(b, i);
     match b.get(*i) {
         Some(b'"') => {
             string_bytes(b, i)?;
@@ -525,7 +518,7 @@ fn value(b: &[u8], i: &mut usize, allow_comments: bool) -> Result<(), String> {
                             return Err("expected ':'".into());
                         }
                         *i += 1;
-                        value(b, i, allow_comments)?;
+                        value(b, i)?;
                         skip(b, i);
                         match b.get(*i) {
                             Some(b',') => *i += 1,
@@ -550,7 +543,7 @@ fn value(b: &[u8], i: &mut usize, allow_comments: bool) -> Result<(), String> {
                         return Ok(());
                     }
                     Some(_) => {
-                        value(b, i, allow_comments)?;
+                        value(b, i)?;
                         skip(b, i);
                         match b.get(*i) {
                             Some(b',') => *i += 1,
@@ -690,6 +683,19 @@ mod tests {
         // A BOM (Notepad writes one) and non-ASCII outside strings survive as characters.
         let v: Value = serde_json::from_str(&to_strict_json("\u{feff}{\"a\": \"caf\u{e9}\" /* \u{4e2d} */}")).unwrap();
         assert_eq!(v["a"], "caf\u{e9}");
+    }
+
+    #[test]
+    fn a_leading_bom_is_kept_and_edited_around() {
+        let src = "\u{feff}{\n  \"a\": 1\n}\n";
+        assert!(member(src, &["a"]).unwrap().is_some());
+        let out = set_member(src, &["servers", "qx"], &json!({"type":"local"})).unwrap();
+        assert!(out.starts_with('\u{feff}'), "{out:?}");
+        let v: Value = serde_json::from_str(&to_strict_json(&out)).unwrap();
+        assert_eq!(v["servers"]["qx"]["type"], "local");
+        assert_eq!(v["a"], 1);
+        let out = remove_member(&out, &["servers"]).unwrap();
+        assert!(out.starts_with('\u{feff}') && !out.contains("servers"), "{out:?}");
     }
 
     #[test]

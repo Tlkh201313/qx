@@ -207,7 +207,7 @@ fn mask_conn_strings(line: &str) -> (Cow<'_, str>, usize) {
             let b = bytes[k];
             if b == b'@' {
                 at = Some(k);
-            } else if b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b',' | b';' | b'|' | b'/' | b'?' | b'#') {
+            } else if b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b',' | b';' | b'|' | b'/' | b'?') {
                 // Userinfo ends at the path: `http://localhost:4873/@scope/pkg` has no password.
                 break;
             }
@@ -272,7 +272,7 @@ fn mask_key_values(line: &str) -> (Cow<'_, str>, usize) {
         let key_at = KEYS.iter().find_map(|k| {
             let kb = k.as_bytes();
             (ends_with(kb) && if flag { flag_word_starts(b, e - kb.len()) } else { key_starts(b, e - kb.len(), e) })
-                .then_some(e - kb.len())
+                .then(|| e - kb.len())
         })
         // Docker's `"auth": "<base64>"` (a JSON key only: `git auth: done` is prose) and a SAS URL's
         // `&sig=` / `?sig=` (only as a query parameter: `--sig` and `signature=` are not).
@@ -752,12 +752,16 @@ mod tests {
         for (line, secret) in [
             ("mongodb://admin:p@ssw0rdSecret@db.example/app", "ssw0rdSecret"),
             ("postgres://u:pa&ss1234@h/db", "pa&ss1234"),
+            // `#` is a legal password character; it must not end the userinfo scan.
+            ("postgres://app:s3cr#etPass@db/x", "s3cr#etPass"),
         ] {
             let (s, n) = redact(line);
             assert!(n >= 1 && !s.contains(secret), "{line} -> {s}");
         }
         // no password: nothing to mask
         assert_eq!(redact("ssh://git@github.com:22/org/repo").1, 0);
+        // a fragment after a host with no password is not a password either
+        assert_eq!(redact("https://example.com/docs#section").1, 0);
     }
 
     #[test]

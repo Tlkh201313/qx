@@ -133,7 +133,7 @@ pub fn edit_dsh(text: Option<&str>, exe: &Path, a: Action) -> Edit {
                     let ci = indent_of(lines[command].as_str());
                     lines[command] = format!("{}command: '{}'", " ".repeat(ci), yaml_path(exe));
 
-                    let after = lines[env].trim()["env:".len()..].trim().to_string();
+                    let after = after_key(&lines[env], "env:");
                     if !after.is_empty() && after != "{}" {
                         return Edit::Refuse(refusal_dsh(exe, "config.env is a flow-style mapping"));
                     }
@@ -243,13 +243,13 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
                     lines.push(String::new());
                 }
                 lines.push("mcp_servers:".to_string());
-                lines.push(hermes_block(exe, "  ", &[]));
+                lines.push(hermes_block(exe, "  ", &Kept::default()));
                 verdict(finish(expand(lines), had_newline, eol), text)
             }
         };
     };
     // A flow-style mapping hides the whole server list on one line.
-    let inline = lines[servers].trim()["mcp_servers:".len()..].trim().to_string();
+    let inline = after_key(&lines[servers], "mcp_servers:");
     if !inline.is_empty() && inline != "{}" {
         return Edit::Refuse(refusal_hermes(exe, "mcp_servers is a flow-style mapping"));
     }
@@ -269,7 +269,7 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
     match (qx, a) {
         (None, Action::Remove) => Edit::Unchanged,
         (None, Action::Install) => {
-            let block = hermes_block(exe, &" ".repeat(child_indent), &[]);
+            let block = hermes_block(exe, &" ".repeat(child_indent), &Kept::default());
             let last_child = (servers + 1..end).rfind(|i| !is_noise(lines[*i].as_str()));
             let insert_at = last_child
                 .map(|i| {
@@ -292,11 +292,17 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
                 }
                 Action::Install => {
                     // `qx: {…}` keeps the user's keys on one line; rewriting it would drop them.
-                    let inline = lines[start].trim()["qx:".len()..].trim().to_string();
+                    let inline = after_key(&lines[start], "qx:");
                     if !inline.is_empty() && inline != "{}" {
                         return Edit::Refuse(refusal_hermes(exe, "the qx server is a flow-style mapping"));
                     }
-                    let kept = kept_env(&lines, start, qend);
+                    // `env: {…}` hides the user's variables the same way.
+                    if lines[start + 1..qend].iter().any(|l| {
+                        l.trim().starts_with("env:") && !matches!(after_key(l, "env:").as_str(), "" | "{}")
+                    }) {
+                        return Edit::Refuse(refusal_hermes(exe, "the qx env is a flow-style mapping"));
+                    }
+                    let kept = kept(&lines, start, qend);
                     let block = hermes_block(exe, &" ".repeat(child_indent), &kept);
                     lines.splice(start..qend, std::iter::once(block));
                     verdict(finish(expand(lines), had_newline, eol), text)
@@ -304,6 +310,13 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
             }
         }
     }
+}
+
+/// What follows `key` on its line, without a trailing ` # comment`: `env:  # vars` has nothing after it.
+fn after_key(line: &str, key: &str) -> String {
+    let rest = line.trim()[key.len()..].trim();
+    let cut = if rest.starts_with('#') { Some(0) } else { rest.find(" #") };
+    cut.map_or(rest, |i| rest[..i].trim_end()).to_string()
 }
 
 /// Split any multi-line element back into one element per line.
@@ -315,33 +328,69 @@ fn expand(lines: Vec<String>) -> Vec<String> {
 }
 
 /// `qx:` at `indent`, with the matrix keys.
-fn hermes_block(exe: &Path, indent: &str, kept: &[String]) -> String {
-    let deeper = format!("{indent}  ");
+fn hermes_block(exe: &Path, indent: &str, kept: &Kept) -> String {
+    let deeper = format!("{indent}{}", " ".repeat(kept.step));
     let mut out = format!(
-        "{indent}qx:\n{deeper}command: '{}'\n{deeper}args: [mcp]\n{deeper}env:\n{deeper}  QX_CLIENT: hermes\n{deeper}timeout: 600\n{deeper}connect_timeout: 60",
+        "{indent}qx:\n{deeper}command: '{}'\n{deeper}args: [mcp]\n{deeper}env:\n{deeper}  QX_CLIENT: hermes",
         yaml_scalar_path(exe)
     );
-    for line in kept {
+    for line in &kept.env {
+        out.push_str(&format!("\n{deeper}  {line}"));
+    }
+    for line in &kept.extra {
         out.push('\n');
-        out.push_str(&format!("{deeper}  {line}"));
+        out.push_str(line);
+    }
+    // A timeout the user tuned stays; a fresh entry gets ours.
+    for (key, default) in [("timeout", 600), ("connect_timeout", 60)] {
+        if !kept.extra.iter().any(|l| l.trim().starts_with(&format!("{key}:"))) {
+            out.push_str(&format!("\n{deeper}{key}: {default}"));
+        }
     }
     out
 }
 
-/// `KEY: value` lines under the child's `env:`, which the user may have set.
-fn kept_env(lines: &[String], start: usize, end: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut env_indent = None;
-    for line in lines.iter().take(end).skip(start) {
+/// What a rewrite of the `qx:` entry must not lose.
+struct Kept {
+    /// `KEY: value` lines under the entry's `env:`.
+    env: Vec<String>,
+    /// The entry's other keys (`enabled`, `tools:` with its children, ...), verbatim.
+    extra: Vec<String>,
+    /// Indent the entry's own keys use below `qx:`.
+    step: usize,
+}
+
+impl Default for Kept {
+    fn default() -> Self {
+        Kept { env: Vec::new(), extra: Vec::new(), step: 2 }
+    }
+}
+
+fn kept(lines: &[String], start: usize, end: usize) -> Kept {
+    let mut out = Kept::default();
+    let Some(ci) = (start + 1..end).find(|i| !is_noise(&lines[*i])).map(|i| indent_of(&lines[i])) else {
+        return out;
+    };
+    out.step = ci.saturating_sub(indent_of(&lines[start])).max(1);
+    let (mut keep, mut env) = (false, false);
+    for line in &lines[start + 1..end] {
         let t = line.trim();
-        if t == "env:" {
-            env_indent = Some(indent_of(line.as_str()));
+        // A `- item` at the key's own indent still belongs to that key.
+        let own = !is_noise(line) && indent_of(line) == ci && !t.starts_with("- ");
+        if own {
+            let key = t.split(':').next().unwrap_or("").trim();
+            env = key == "env";
+            keep = !matches!(key, "command" | "args" | "env");
+        }
+        if t.is_empty() || own && env {
             continue;
         }
-        if let Some(ei) = env_indent {
-            if indent_of(line.as_str()) > ei && !t.is_empty() && !t.starts_with("QX_CLIENT:") {
-                out.push(t.to_string());
+        if env {
+            if !t.starts_with("QX_CLIENT:") && !t.starts_with('#') {
+                out.env.push(t.to_string());
             }
+        } else if keep {
+            out.extra.push(line.clone());
         }
     }
     out
@@ -390,7 +439,7 @@ fn refusal_dsh(exe: &Path, why: &str) -> String {
 fn refusal_hermes(exe: &Path, why: &str) -> String {
     format!(
         "{why}. Edit it by hand, or paste this under `mcp_servers:`:\n{}",
-        hermes_block(exe, "  ", &[])
+        hermes_block(exe, "  ", &Kept::default())
     )
 }
 
@@ -523,6 +572,19 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_after_a_key_is_not_a_flow_mapping() {
+        assert_eq!(after_key("  env:  # vars", "env:"), "");
+        assert_eq!(after_key("mcp_servers: {}  # none", "mcp_servers:"), "{}");
+        assert_eq!(after_key("env: {A: b}", "env:"), "{A: b}");
+        let exe = Path::new(r"C:\q\qx.exe");
+        let src = "model: x\nmcp_servers:  # servers\n  codegraph:\n    command: cg\n";
+        let out = changed(edit_hermes(Some(src), exe, Action::Install));
+        assert!(out.contains("mcp_servers:  # servers\n") && out.contains("  qx:\n"), "{out}");
+        let dsh = DSH.replacen("env:", "env:  # vars", 1);
+        assert!(!matches!(edit_dsh(Some(&dsh), exe, Action::Install), Edit::Refuse(_)));
+    }
+
+    #[test]
     fn yaml_paths_with_an_apostrophe_are_escaped() {
         // A quote in the install path must be doubled, or the YAML stops parsing.
         let exe = Path::new(r"C:\Users\O'Brien\qx.exe");
@@ -555,6 +617,22 @@ mod tests {
         assert!(!refusal.contains("- insert:"), "{refusal}");
         assert!(!refusal.contains("QX_CLIENT: dsh"), "{refusal}");
         assert!(refusal.contains("qx:"), "{refusal}");
+    }
+
+    #[test]
+    fn hermes_install_keeps_the_users_own_keys() {
+        let src = "mcp_servers:\n  qx:\n    command: old\n    args:\n      - mcp\n    tools:\n      include:\n        - run\n    enabled: false\n    timeout: 90\n    env:\n      QX_GUARD: safe\n  other:\n    command: x\n";
+        let out = match edit_hermes(Some(src), Path::new(r"C:\q\qx.exe"), Action::Install) {
+            Edit::Changed(t) => t,
+            _ => panic!("expected a change"),
+        };
+        for keep in ["    tools:\n      include:\n        - run\n", "    enabled: false\n", "    timeout: 90\n", "      QX_GUARD: safe\n", "  other:\n    command: x\n"] {
+            assert!(out.contains(keep), "{keep:?} lost:\n{out}");
+        }
+        assert!(out.contains("command: 'C:\\q\\qx.exe'") && !out.contains("command: old"), "{out}");
+        assert_eq!(out.matches("timeout:").count(), 2, "{out}"); // timeout + connect_timeout
+        assert!(!out.contains("timeout: 600"), "{out}");
+        assert!(matches!(edit_hermes(Some(&out), Path::new(r"C:\q\qx.exe"), Action::Install), Edit::Unchanged), "{out}");
     }
 
     #[test]

@@ -171,7 +171,8 @@ fn collapse_similar(lines: Vec<String>) -> (Vec<String>, bool) {
         while j < keys.len() && keys[j] == keys[i] {
             j += 1;
         }
-        if j - i >= 8 && keys[i].contains('#') && !interesting(&lines[i]) && !names_a_file(&lines[i]) {
+        // A key with no letter left is a column of numbers (`seq 400`, ids, sizes): the numbers are the content.
+        if j - i >= 8 && keys[i].contains('#') && keys[i].chars().any(char::is_alphabetic) && !interesting(&lines[i]) && !names_a_file(&lines[i]) {
             out.push(lines[i].clone());
             out.push(format!("[qx] ... {} similar lines (only digits differ) ...", j - i - 2));
             out.push(lines[j - 1].clone());
@@ -219,20 +220,18 @@ pub fn relative_paths(text: &mut String, cwd: &str) -> usize {
 }
 
 /// Save the uncut output (already redacted) so a truncation never loses facts:
-/// the agent can grep the file. Keeps the newest 40; None on any I/O error.
+/// the agent can grep the file. Keeps the newest 40, and anything younger than 10 minutes (the folder is
+/// shared by every qx process, so one noisy run must not evict another session's `full_output`);
+/// None on any I/O error.
 pub fn spool(stdout: &str, stderr: &str) -> Option<std::path::PathBuf> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let dir = std::env::temp_dir().join("qx-spool");
     std::fs::create_dir_all(&dir).ok()?;
-    let mut old: Vec<_> = std::fs::read_dir(&dir).ok()?.flatten().map(|e| e.path()).collect();
-    old.sort();
-    for p in &old[..old.len().saturating_sub(39)] {
-        let _ = std::fs::remove_file(p);
-    }
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
+    prune_spool(&dir, ms, 39, 10 * 60 * 1000);
     let path = dir.join(format!("{ms:015}-{}-{}.log", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
     let mut body = stdout.to_string();
     if !stderr.is_empty() {
@@ -241,6 +240,20 @@ pub fn spool(stdout: &str, stderr: &str) -> Option<std::path::PathBuf> {
     }
     std::fs::write(&path, body).ok()?;
     Some(path)
+}
+
+/// Deletes spool files beyond the newest `keep`, except those written less than `min_age_ms` ago. File names
+/// start with their write time in milliseconds, so name order is age order.
+fn prune_spool(dir: &std::path::Path, now_ms: u128, keep: usize, min_age_ms: u128) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut old: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    old.sort();
+    for p in &old[..old.len().saturating_sub(keep)] {
+        let written = p.file_name().and_then(|n| n.to_str()).and_then(|n| n.split('-').next()?.parse::<u128>().ok());
+        if written.is_none_or(|w| now_ms.saturating_sub(w) >= min_age_ms) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// Cargo build-script chatter: the `cargo:rerun-if-*` directives and the `NAME = None` lines that follow
@@ -510,6 +523,11 @@ mod tests {
         assert!(out.lines().count() < 10, "{out}");
         let e: String = (0..60).map(|i| format!("error: item {i} failed\n")).collect();
         assert!(!compact(&e, 20, 5, 5).0.contains("similar lines"));
+        // A column of bare numbers is data, not progress: the head and tail window keeps real lines.
+        let nums: String = (1..=400).map(|i| format!("{i}\n")).collect();
+        let (out, cut) = compact(&nums, 50, 10, 10);
+        assert!(cut && !out.contains("similar lines"), "{out}");
+        assert!(out.lines().any(|l| l == "10") && out.lines().any(|l| l == "391"), "{out}");
         // under budget nothing is touched
         let small: String = (0..12).map(|i| format!("n {i}\n")).collect();
         assert_eq!(compact(&small, 50, 10, 10).0, small);
@@ -540,6 +558,26 @@ mod tests {
         let p = spool("out\n", "err\n").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "out\n\n[stderr]\nerr\n");
         let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn spool_prune_spares_new_files_and_the_newest_ones() {
+        let dir = std::env::temp_dir().join(format!("qx-spool-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now: u128 = 10_000_000;
+        // 45 files written in the last 10 minutes, 5 written long ago.
+        for i in 0..50u128 {
+            let ms = if i < 5 { i } else { now - 1000 + i };
+            std::fs::write(dir.join(format!("{ms:015}-1-{i}.log")), "x").unwrap();
+        }
+        prune_spool(&dir, now, 39, 600_000);
+        let left = std::fs::read_dir(&dir).unwrap().count();
+        // The 5 old ones go (outside the newest 39); the 45 recent ones stay though that is over 39.
+        assert_eq!(left, 45);
+        prune_spool(&dir, now + 700_000, 39, 600_000);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 39);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

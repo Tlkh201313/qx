@@ -618,8 +618,20 @@ fn bin_path(root: &Path) -> OsString {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// CI images (and some developers) export `npm_config_prefix` and friends, which makes `fast`
+    /// decline on purpose. The tests below assert the fast path itself, so they run without them.
+    /// Only ever removes, so parallel tests cannot disagree about it.
+    pub(crate) fn plain_npm_env() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            for k in ["npm_config_script_shell", "npm_config_workspace", "npm_config_workspaces", "npm_config_ignore_scripts", "npm_config_prefix", "npm_config_userconfig", "npm_config_globalconfig", "QX_NPM_FAST"] {
+                std::env::remove_var(k);
+            }
+        });
+    }
 
     #[test]
     fn parses_run_and_args() {
@@ -638,6 +650,7 @@ mod tests {
 
     #[test]
     fn pre_and_post_run_around_the_script() {
+        plain_npm_env();
         let d = std::env::temp_dir().join(format!("qx-npmchain-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
@@ -690,6 +703,7 @@ mod tests {
 
     #[test]
     fn a_plain_script_runs_its_local_bin_without_cmd() {
+        plain_npm_env();
         if crate::resolve::find_on_path("node").is_none() {
             println!("skip: node is not on PATH");
             return;
@@ -719,6 +733,7 @@ mod tests {
 
     #[test]
     fn shell_syntax_cmd_internals_and_logic_shims_keep_cmd() {
+        plain_npm_env();
         let root = std::env::temp_dir().join(format!("qx-npmkeep-{}", std::process::id()));
         let bin = root.join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -744,6 +759,7 @@ mod tests {
 
     #[test]
     fn pnpm_fast_path_requires_a_pinned_pnpm() {
+        plain_npm_env();
         let d = std::env::temp_dir().join(format!("qx-pnpm-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
@@ -791,6 +807,7 @@ mod tests {
 
     #[test]
     fn npmrc_ignore_scripts_falls_back() {
+        plain_npm_env();
         let d = std::env::temp_dir().join(format!("qx-npmrc-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
@@ -806,6 +823,7 @@ mod tests {
 
     #[test]
     fn what_npm_adds_that_qx_cannot_falls_back() {
+        plain_npm_env();
         let d = std::env::temp_dir().join(format!("qx-npmadds-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -859,6 +877,7 @@ mod tests {
 
     #[test]
     fn a_relative_cwd_gives_absolute_paths() {
+        plain_npm_env();
         let rel = PathBuf::from("target").join(format!("qx-relcwd-{}", std::process::id()));
         std::fs::create_dir_all(rel.join("node_modules").join(".bin")).unwrap();
         std::fs::write(rel.join("package.json"), r#"{"scripts":{"x":"echo x"}}"#).unwrap();
@@ -872,6 +891,7 @@ mod tests {
 
     #[test]
     fn a_script_step_keeps_the_git_prefix_command_for_added() {
+        plain_npm_env();
         let root = std::env::temp_dir().join(format!("qx-npmgit-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("package.json"), r#"{"scripts":{"c":"wc -l package.json"}}"#).unwrap();

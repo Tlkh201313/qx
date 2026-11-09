@@ -296,6 +296,10 @@ mod imp {
                     return;
                 }
             }
+            // A folder git ignores (the walk left it out, and recorded it in `skipped` by its path).
+            if self.snap.skipped.iter().any(|s| rel.strip_prefix(s.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))) {
+                return;
+            }
             let full = self.root.join(rel.replace('/', "\\"));
             match action {
                 REMOVED | RENAMED_OLD => Arc::make_mut(&mut self.snap).remove(rel),
@@ -405,12 +409,15 @@ mod imp {
 
     fn find(root: &Path) -> Option<(Arc<Mutex<Index>>, String)> {
         let want = key(root);
-        let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        for ix in reg.iter() {
+        let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        // The nearest root that holds the folder: an exact one, else the longest base.
+        let mut hit: Option<(usize, String)> = None;
+        for (at, ix) in reg.iter().enumerate() {
             let Ok(guard) = ix.lock() else { continue };
             let base = key(&guard.root);
             if want == base {
-                return Some((ix.clone(), String::new()));
+                hit = Some((at, String::new()));
+                break;
             }
             if let Some(rest) = want.strip_prefix(&base).and_then(|r| r.strip_prefix('\\')) {
                 // The case of the on-disk path, not of the query, names the prefix.
@@ -418,11 +425,25 @@ mod imp {
                 let tail: String = root.to_string_lossy().replace('\\', "/");
                 let tail = tail.trim_end_matches('/');
                 if tail.len() >= n {
-                    return Some((ix.clone(), tail[tail.len() - n..].to_string()));
+                    let prefix = tail[tail.len() - n..].to_string();
+                    if covers_in(&guard, &prefix) && hit.as_ref().is_none_or(|(_, p)| prefix.len() < p.len()) {
+                        hit = Some((at, prefix));
+                    }
                 }
             }
         }
-        None
+        // A root in use goes to the back, so the one evicted for room is the one used longest ago.
+        let (at, prefix) = hit?;
+        let ix = reg.remove(at);
+        reg.push(ix.clone());
+        Some((ix, prefix))
+    }
+
+    /// Whether `prefix` (a folder under the index root) is in the index: a folder the walk skipped by
+    /// name (node_modules, target) or a hidden one is not.
+    fn covers_in(index: &Index, prefix: &str) -> bool {
+        let under_ignored = |s: &String| prefix.strip_prefix(s.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+        prefix.split('/').all(|c| !c.starts_with('.') && !index.snap.skipped.contains(c)) && !index.snap.skipped.iter().any(under_ignored)
     }
 
     fn trace(msg: impl FnOnce() -> String) {
@@ -468,7 +489,9 @@ mod imp {
         let Ok(root) = std::fs::canonicalize(root) else { return };
         let root = root.as_path();
         let k = key(root);
-        if find(root).is_some_and(|(_, prefix)| prefix.is_empty()) {
+        // A folder inside an indexed root is served by that index (`find` only names a root that holds it);
+        // building its own would evict the root.
+        if find(root).is_some() {
             return;
         }
         {
@@ -478,6 +501,7 @@ mod imp {
             }
             building.push(k.clone());
         }
+        let _done = BuildDone(k.clone());
         let started = std::time::Instant::now();
         let built = build(root);
         trace(|| format!("build {} -> {} in {:?}", root.display(), built.as_ref().map_or(0, |i| i.snap.files.len()), started.elapsed()));
@@ -488,7 +512,36 @@ mod imp {
             }
             reg.push(Arc::new(Mutex::new(index)));
         }
-        BUILDING.lock().unwrap_or_else(|e| e.into_inner()).retain(|b| b != &k);
-        BUILT.notify_all();
+    }
+
+    /// Takes a root off the building list when its build ends, also by a panic: a root left on it would
+    /// never be built again, and every query on it would wait the full 2 s.
+    struct BuildDone(String);
+
+    impl Drop for BuildDone {
+        fn drop(&mut self) {
+            BUILDING.lock().unwrap_or_else(|e| e.into_inner()).retain(|b| b != &self.0);
+            BUILT.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_build_that_panics_does_not_stay_on_the_building_list() {
+            let k = String::from("c:\\qx-test-panicking-root");
+            BUILDING.lock().unwrap_or_else(|e| e.into_inner()).push(k.clone());
+            let k2 = k.clone();
+            let t = std::thread::spawn(move || {
+                let _done = BuildDone(k2);
+                panic!("build died");
+            });
+            assert!(t.join().is_err());
+            let left = BUILDING.lock().unwrap_or_else(|e| e.into_inner()).contains(&k);
+            assert!(!left, "the root is still on the building list");
+            assert!(!wait_for_build(Path::new("C:\\qx-test-panicking-root")));
+        }
     }
 }

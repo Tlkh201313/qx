@@ -69,7 +69,6 @@ impl Native {
 
 impl Client {
     // Used by `qx setup` to walk every client it can register.
-    #[allow(dead_code)]
     pub const ALL: [Client; 6] = [
         Client::Dsh,
         Client::ClaudeCode,
@@ -80,7 +79,6 @@ impl Client {
     ];
 
     // Used by `qx setup` to name each client in its own config.
-    #[allow(dead_code)]
     pub fn key(self) -> &'static str {
         match self {
             Client::Dsh => "dsh",
@@ -192,19 +190,25 @@ impl Client {
     /// Server instructions, kept under 1024 bytes: Codex reads the first 512, Claude
     /// Code truncates at 4096, dsh fails above 32 KiB, and all three are paid per request.
     pub fn instructions(self) -> String {
-        let (shell, read, write) = (
-            self.native(Native::Shell),
-            self.native(Native::Read),
-            self.native(Native::Write),
-        );
+        let (shell, read) = (self.native(Native::Shell), self.native(Native::Read));
+        // Naming Edit/Glob/Grep too keeps the model off its own tools: native Edit waited a median
+        // 7 s on a permission prompt and wanted a prior Read. Codex maps several roles to one tool.
+        let mut names: Vec<&str> = Vec::new();
+        for n in [Native::Shell, Native::Read, Native::Write, Native::Edit, Native::Glob, Native::Grep] {
+            if !names.contains(&self.native(n)) {
+                names.push(self.native(n));
+            }
+        }
+        let last = names.pop().unwrap_or_default();
+        let replaced = if names.is_empty() { last.to_string() } else { format!("{} and {last}", names.join(", ")) };
         format!(
-            "qx replaces {shell}, {read} and {write} for this session. Call {} for every command \
-             (PowerShell lines, `a; b` and pipes work; `program` + `args` is fastest; keep \
-             `mode: \"compact\"`) and {} for files (`op=read|write|edit|glob|grep|list|stat`; \
-             grep takes a regex; batch with `ops`/`paths`/`edits` to save round trips). Always pass the session `cwd`. A command still running after \
-             `timeout_ms` keeps going as a background job: follow it with `job`, `wait_ms`, \
-             `kill`. A non-zero exit is a result, not a fault. A cut output has a `full_output` \
-             file to read. Only for images or sandbox escalation, fall back to {shell}/{read}.",
+            "qx replaces {replaced} for this session. Call {} for every command \
+             (shell lines and pipes work; `program` + `args` is fastest; default `mode: \"compact\"`) \
+             and {} for files (`op=read|write|edit|glob|grep|list|stat`; batch with \
+             `ops`/`paths`/`edits`). Always pass the session `cwd`. A command still running after \
+             `timeout_ms` becomes a background job: follow it with `job`, `wait_ms`, `kill`. \
+             A non-zero exit is a result, not a fault. A cut output has a `full_output` file. \
+             For images or sandbox escalation only, fall back to {shell}/{read}.",
             self.tool_id("run"),
             self.tool_id("fs"),
         )
@@ -327,6 +331,8 @@ mod tests {
         }
         assert_eq!(Client::OpenCode.tool_id("run"), "qx_run");
         assert!(Client::Codex.instructions().contains("apply_patch"));
+        assert!(Client::ClaudeCode.instructions().contains("`Write`, `Edit`, `Glob` and `Grep`"));
+        assert!(Client::Codex.instructions().starts_with("qx replaces `exec_command` and `apply_patch`"));
     }
 
     #[test]
