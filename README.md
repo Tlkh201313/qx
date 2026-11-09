@@ -1,32 +1,121 @@
-# qx — fast local command executor
+# qx — the fast, safe way for AI agents to run commands on Windows
 
-`qx` is a small Rust CLI + MCP server that runs local commands with the fewest
-possible Windows process creations. It exists because on a machine with several
-real-time antivirus scanners, **spawning a process is the expensive part** — not
-the command itself.
+[![CI](https://github.com/Tlkh201313/qx/actions/workflows/ci.yml/badge.svg)](https://github.com/Tlkh201313/qx/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platform: Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
 
-**Platform:** Windows 10/11. The crate builds elsewhere, but command lines are
-routed through `cmd.exe`/PowerShell/Git Bash and the client configs live under
-`%USERPROFILE%`, so qx is only supported on Windows. Building needs Rust 1.82 or
-newer; Git for Windows is recommended (its `usr\bin` tools back declined
-built-ins).
-
+**qx** is a small Rust program that sits between your AI coding agent (Claude Code,
+Codex, OpenCode and more) and your machine. It runs the agent's commands and file
+edits faster, sends back less noise, and stops the dangerous ones.
 
 https://github.com/user-attachments/assets/801cf4e3-ecb5-4cb4-910e-4b8313615101
 
+## Why use it
 
-**Install:**
+On Windows, starting a program is slow: every new process is scanned by your
+antivirus, and one machine with several scanners took 593 ms just to start `cmd.exe`.
+An agent starts hundreds of processes a day. qx removes most of them.
+
+| Without qx | With qx |
+|---|---|
+| Every `ls`, `cat` and `grep` starts a process. | 30+ common commands run **inside qx**: **0 to 2 ms** through MCP, no process at all. |
+| `git`, `npm`, `pnpm` and `pytest` go through `cmd.exe`, a shell or a JS launcher. | qx starts the real program directly. Starting a pnpm script fell from 569 ms to 67 ms. |
+| A failing build prints 5,000 lines and the agent reads all of them. | Output is cut to the part that matters. **Errors buried in the middle are kept**, and the full text is saved to a file. |
+| One bad `rm -rf` or `git push --force` can ruin your day. | A built-in gate denies the catastrophic commands and logs the risky ones. |
+| Secrets in command output end up in the model's context. | API keys, tokens and passwords are replaced with `***`. |
+| Reading five files costs five model round trips. | `fs` reads, edits and searches files, and batches up to 32 operations in one call. |
+
+## Quick start
+
+You need Windows 10 or 11 and [Rust](https://rustup.rs) 1.82 or newer. Git for Windows is recommended.
 
 ```powershell
 cargo install --git https://github.com/Tlkh201313/qx --locked
-qx setup all     # register qx with every installed agent CLI
-qx doctor        # check what each client points at
+qx setup all     # register qx with every agent you have installed
+qx doctor        # check that each agent points at qx
 ```
 
-Do not run `cargo install qx`: the `qx` name on crates.io belongs to an
-unrelated project. To build from a clone, see [Build & install](#build--install).
+Then restart your agent. Its shell and file tools are now backed by qx.
 
-## What it does
+> Do not run `cargo install qx`: that name on crates.io belongs to an unrelated project.
+> To build from a clone, see [Build & install](#build--install).
+
+`qx setup` only touches the qx entry in each agent's config. It keeps a backup next to
+the file (`<name>.qx-bak`), and `qx setup --remove` takes qx out again. Add `--dry-run`
+to see what would change first.
+
+## Works with
+
+| Agent | Set up with | Notes |
+|---|---|---|
+| Claude Code | `qx setup claude-code` | Also adds a hook, so its own Bash and PowerShell commands run through qx. |
+| Codex | `qx setup codex` | Gets text-only replies, which is what Codex shows its model. |
+| OpenCode | `qx setup opencode` | |
+| DeepSeek Harness (dsh) | `qx setup dsh` | |
+| Hermes | `qx setup hermes` | |
+| pi | `qx setup pi` | Uses a small bridge extension. |
+| Anything that speaks MCP | add `qx mcp` as a stdio server | [Details](#mcp-setup) |
+
+## Use it from the command line too
+
+```powershell
+qx git status                           # runs git.exe directly
+qx cargo test --quiet                   # failures and the final result, not 800 lines
+qx npm run build                        # skips npm's slow start
+qx -c "npm run build 2>&1 | tail -30"   # a shell line, when you need pipes
+qx --raw <cmd>                          # untouched output
+qx check "git push --force"             # ask the gate first: DENY
+qx doctor                               # why is this machine slow?
+```
+
+## How fast is it
+
+Measured on the author's machine (Windows 11, four antivirus products running), so
+read these as an illustration. The benchmark is in the repo, so you can run it on yours:
+`python scripts/bench_mcp.py <path to qx.exe> <repo>`.
+
+| What | Time |
+|---|---|
+| A built-in command or any `fs` call through MCP (`ls`, `read`, `grep`, `glob`) | **0.2 to 1.7 ms** |
+| `git --version` through qx, against the same call made directly from Python | **22.9 ms** against 27.2 ms |
+| Starting a pnpm script, before and after qx's pnpm fast path | 569 ms down to **67 ms** |
+| A venv console script (`hermes --version`), before and after the launcher bypass | 26 s down to **0.6 s** |
+| `bash -lc "git --version"` (a login shell, which agents often use) | 63 s |
+
+More numbers are in [Measured on one machine](#measured-on-one-machine-av-active).
+
+## Is it safe
+
+qx is meant to be on your agent's allow-list, so it carries its own gate. Before
+every command it checks the line, including the text inside `cmd /c`,
+`powershell -Command` and `bash -c`.
+
+- **Denied:** deleting drive roots, Windows, Program Files or your home folder, `git push --force`,
+  `curl ... | sh`, encoded PowerShell, SQL `DROP` and `TRUNCATE`, disk and boot changes.
+- **Warned and logged:** `git reset --hard`, `git clean -f`, wildcard deletes, deleting outside the project.
+- **File edits stay inside the project folder.** Symlink escapes are refused, `.git` is read-only, and
+  overwriting a file you have not read is refused.
+- **Nothing cut is lost.** When output is shortened, the full text is saved and the reply gives its path.
+
+The gate reads the command line. It does not run a sandbox, so a script that does
+something bad inside is not caught. [Trust & safety](#trust--safety-why-it-is-safe-to-auto-approve)
+says exactly what it does and does not cover.
+
+## Reference
+
+- [How it works](#how-it-works): the built-ins, direct exec, shim bypass, output compaction
+- [Trust & safety](#trust--safety-why-it-is-safe-to-auto-approve)
+- [Build & install](#build--install) and [Usage](#usage)
+- [MCP setup](#mcp-setup) for each agent, the [`run` and `fs` tools](#the-run-tool), [limits](#limits-and-shutdown)
+- [Measured on one machine](#measured-on-one-machine-av-active), [the real bottleneck](#the-real-bottleneck), [design notes](#design-notes)
+- [Tests](#tests) and [License](#license)
+
+**Platform:** Windows 10/11 only. The crate builds elsewhere, but command lines are
+routed through `cmd.exe`, PowerShell or Git Bash, and the agent configs live under
+`%USERPROFILE%`.
+
+## How it works
+
 
 1. **In-process built-ins** — 32 common commands run inside qx with **zero process
    creation**: `pwd echo true false sleep clear cls ls dir cat type head tail wc grep
@@ -537,7 +626,7 @@ the native dsh tool.
 The server runs at most 8 processes at once (`QX_MCP_WORKERS`, clamped 1–32; in-process work does not count) and
 queues at most 64 more beyond that (`QX_MCP_QUEUE`, clamped 0–1024). A call past
 the limit is refused immediately with `qx busy: N calls already running or
-queued (limit 4+64); retry shortly`, so a runaway client cannot queue unbounded
+queued (limit 8+64); retry shortly`, so a runaway client cannot queue unbounded
 work. Requests are routed by their JSON-RPC method, not by text: only a call
 carrying an `id` takes a worker slot, so a `tools/call` notification never
 starts a command.
@@ -644,7 +733,7 @@ creation. Fixing that is worth more than any CLI:
   drained, not buffered.
 - Timeout terminates a Windows Job Object plus `taskkill /T`, then waits a
   bounded 2 s - a surviving grandchild can never hang qx.
-- MCP runs up to 4 commands concurrently with bounded backpressure; JSON-RPC
+- MCP runs up to 8 commands concurrently with bounded backpressure; JSON-RPC
   replies are matched by id, so out-of-order completion is safe.
 - Child processes get a rebuilt environment: PATH is deduplicated and PATHEXT is
   restored when the inherited block is malformed or oversized.
