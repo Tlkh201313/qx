@@ -1862,6 +1862,7 @@ mod tests {
             println!("skip: node is not on PATH");
             return;
         }
+        crate::npm::tests::plain_npm_env();
         let _server = server_lock();
         let d = std::env::temp_dir().join(format!("qx-mcp-npmplain-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();

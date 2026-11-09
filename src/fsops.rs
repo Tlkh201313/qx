@@ -186,8 +186,10 @@ pub(crate) fn prime(dir: &Path) {
 fn scratch_root() -> &'static Path {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
-        let p = std::env::temp_dir().join("claude");
-        fs::canonicalize(&p).unwrap_or(p)
+        // Canonicalise the temp dir (it exists), not `claude` (it may not yet): otherwise a missing
+        // folder leaves a short `RUNNER~1` form that never matches the canonical path of a write.
+        let t = std::env::temp_dir();
+        fs::canonicalize(&t).unwrap_or(t).join("claude")
     })
 }
 

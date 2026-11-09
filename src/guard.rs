@@ -2297,6 +2297,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn parent_escape_without_cwd_reaches_the_real_target() {
+        if !runs_on_the_system_drive() {
+            println!("skip: not running from the system drive");
+            return;
+        }
         let up = "..\\".repeat(40) + "windows";
         let p = absolutize(&up, None);
         assert!(protected(&p, None).is_some(), "{}", p.display());
@@ -3144,8 +3148,22 @@ mod tests {
         }
     }
 
+    /// `..\..\Windows` lands on the drive qx runs from; it is protected only when that is the
+    /// system drive (CI checks out on D:, where `D:\Windows` is just a folder).
+    #[cfg(windows)]
+    fn runs_on_the_system_drive() -> bool {
+        let drive = |p: &std::path::Path| p.to_string_lossy().trim_start_matches(r"\?\").chars().next().map(|c| c.to_ascii_uppercase());
+        let sys = std::env::var_os("SystemRoot").map(PathBuf::from).and_then(|p| drive(&p));
+        sys.is_some() && sys == std::env::current_dir().ok().and_then(|p| drive(&p))
+    }
+
     #[test]
     fn a_relative_cwd_is_relative_to_qx_not_to_nothing() {
+        #[cfg(windows)]
+        if !runs_on_the_system_drive() {
+            println!("skip: not running from the system drive");
+            return;
+        }
         // `cwd: "."` from a client must not turn `..\..\..\Windows` into a harmless relative `Windows`.
         let line = format!(r"rd /s /q {}Windows", r"..\".repeat(16));
         let with_dot = check_shell_mode(Mode::Safe, &line, Some(Path::new(".")));
