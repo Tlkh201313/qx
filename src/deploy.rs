@@ -90,7 +90,13 @@ pub fn install(src: &Path, dst: &Path) -> std::io::Result<Installed> {
         .unwrap_or(0);
     let new = parent.join(format!("{name}.new-{}", std::process::id()));
     // Copy first, so a half-written file can never take the canonical name.
-    std::fs::copy(src, &new)?;
+    if let Err(e) = std::fs::copy(src, &new) {
+        let _ = std::fs::remove_file(&new);
+        return Err(e);
+    }
+    // Siblings from earlier deploys go only now that this one will land: the clients that held
+    // them have exited, and one still holding its file simply fails to delete and stays.
+    sweep_aside(dst);
     let aside = if exists {
         let aside = parent.join(format!("{name}.old-{stamp}"));
         if let Err(e) = std::fs::rename(dst, &aside) {
@@ -176,12 +182,6 @@ pub fn run(args: &[String]) -> i32 {
         }
         return 0;
     }
-    // Siblings from a previous deploy can go now: the clients that held them have exited,
-    // and one still holding its file simply fails to delete and stays.
-    let swept = sweep_aside(&dst);
-    if swept > 0 {
-        println!("qx deploy: removed {swept} previous copy/copies");
-    }
     match install(&src, &dst) {
         Ok(Installed::Unchanged) => {
             println!("qx deploy: up to date ({})", dst.display());
@@ -238,6 +238,28 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&dst).unwrap(), "B");
         assert_eq!(sweep_aside(&dst), 1);
         assert_eq!(sweep_aside(&dst), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_copies_go_only_when_a_new_build_lands_and_a_failed_copy_leaves_nothing() {
+        let dir = tmp("sweep");
+        let (src, dst) = (dir.join("src.exe"), dir.join("qx.exe"));
+        let stale = dir.join("qx.exe.old-1");
+        std::fs::write(&src, "A").unwrap();
+        std::fs::write(&dst, "A").unwrap();
+        std::fs::write(&stale, "older").unwrap();
+        assert_eq!(install(&src, &dst).unwrap(), Installed::Unchanged);
+        assert!(stale.exists(), "nothing was installed, so nothing is swept");
+        std::fs::write(&src, "B").unwrap();
+        install(&src, &dst).unwrap();
+        assert!(!stale.exists());
+
+        let ghost = dir.join("ghost.exe");
+        let fresh = dir.join("sub").join("qx.exe");
+        assert!(install(&ghost, &fresh).is_err());
+        let leftovers = std::fs::read_dir(dir.join("sub")).unwrap().count();
+        assert_eq!(leftovers, 0, "a failed copy must not leave qx.exe.new-<pid> behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

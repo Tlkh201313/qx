@@ -34,6 +34,19 @@ impl Digest {
     }
 }
 
+/// A diff up to this many lines is shown as git printed it (see `digest`).
+const DIFF_WHOLE: usize = 400;
+
+/// Line budget `(max, head, tail)` for the plain compaction of a command that `digest` declined: a diff that
+/// fits `DIFF_WHOLE` must not be cut at the usual 200 lines, or its middle files vanish.
+pub fn plain_budget(label: &str, usual: (usize, usize, usize)) -> (usize, usize, usize) {
+    if is_diff(&core_label(&label.to_ascii_lowercase())) {
+        (DIFF_WHOLE.max(usual.0), DIFF_WHOLE * 2 / 5, DIFF_WHOLE * 3 / 10)
+    } else {
+        usual
+    }
+}
+
 pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Digest> {
     if std::env::var("QX_DIGEST").ok().as_deref() == Some("off") {
         return None;
@@ -52,7 +65,7 @@ pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Dige
     } else if is_diff(&l) {
         // A diff that fits is shown as git printed it: without its context lines and headers the hunk
         // offsets no longer match what is shown. Only a long one is condensed (and spooled).
-        if stdout.lines().count() <= 400 {
+        if stdout.lines().count() <= DIFF_WHOLE {
             return None;
         }
         let (o, n, c) = git_diff(stdout)?;
@@ -1336,6 +1349,16 @@ mod tests {
         assert!(out.contains("new.txt"));
         assert!(!out.contains("use \"git add"));
         assert!(omitted > 0);
+    }
+
+    #[test]
+    fn a_diff_that_fits_is_not_cut_at_the_plain_budget() {
+        let (max, head, tail) = plain_budget("git diff", (200, 80, 60));
+        assert!(max >= DIFF_WHOLE && head + tail < max);
+        let body: String = (0..DIFF_WHOLE).map(|i| format!("+line {i} {}\n", "x".repeat(i % 7))).collect();
+        assert!(digest("git diff", &body, "", 0).is_none());
+        assert!(!compact::compact(&body, max, head, tail).1);
+        assert_eq!(plain_budget("ls", (200, 80, 60)), (200, 80, 60));
     }
 
     #[test]

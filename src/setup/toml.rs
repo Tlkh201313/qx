@@ -23,7 +23,8 @@ fn is_env_header(trimmed: &str) -> bool {
 
 /// A header as TOML reads it: no trailing comment, no spaces (`[ mcp_servers . qx ] # note`).
 fn norm_header(line: &str) -> String {
-    strip_comment(line).chars().filter(|c| !c.is_whitespace()).collect()
+    // `'qx'` and `"qx"` are the same key.
+    strip_comment(line).chars().filter(|c| !c.is_whitespace()).map(|c| if c == '\'' { '"' } else { c }).collect()
 }
 
 /// Every run of lines belonging to a qx table, in file order.
@@ -58,7 +59,7 @@ pub fn edit_codex(text: Option<&str>, exe: &Path, a: Action) -> Edit {
     let Some(text) = text else {
         return match a {
             Action::Remove => Edit::Unchanged,
-            Action::Install => Edit::Changed(render(exe, &[], "\n")),
+            Action::Install => Edit::Changed(render(exe, &Kept::default(), "\n")),
         };
     };
     if refuses(text, a) {
@@ -78,21 +79,19 @@ pub fn edit_codex(text: Option<&str>, exe: &Path, a: Action) -> Edit {
         if out.last().is_some_and(|l| !l.trim().is_empty()) {
             out.push(String::new());
         }
-        out.extend(render(exe, &[], eol).lines().map(str::to_string));
+        out.extend(render(exe, &Kept::default(), eol).lines().map(str::to_string));
         let refs: Vec<&str> = out.iter().map(String::as_str).collect();
         return verdict(join(&refs, eol, true), text);
     }
 
-    // The env keys the user may have set live in one of those tables, wherever it is.
-    let env = kept_env(&lines, &tables);
+    // What the user added to the entry lives in those tables, wherever they are.
+    let kept = kept(&lines, &tables);
     let mut out: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
     // Remove in reverse so earlier ranges keep their offsets.
     for (start, end) in tables.iter().rev() {
         out.drain(*start..*end);
     }
     let at = first.unwrap_or(0).min(out.len());
-    let block_line = |i: usize| -> Option<&str> { out.get(i).map(String::as_str) };
-    let _ = block_line;
     match a {
         Action::Remove => {
             // A blank line that used to separate the block from what followed stays one.
@@ -101,7 +100,7 @@ pub fn edit_codex(text: Option<&str>, exe: &Path, a: Action) -> Edit {
             }
         }
         Action::Install => {
-            let block: Vec<String> = render(exe, &env, eol).lines().map(str::to_string).collect();
+            let block: Vec<String> = render(exe, &kept, eol).lines().map(str::to_string).collect();
             let block_len = block.len();
             let needs_gap = out.get(at).is_some_and(|l| !l.trim().is_empty());
             for (offset, line) in block.into_iter().enumerate() {
@@ -133,39 +132,84 @@ pub fn codex_command(text: &str) -> Option<String> {
     None
 }
 
-/// `KEY = "value"` lines under any qx env table.
-fn kept_env(lines: &[&str], tables: &[(usize, usize)]) -> Vec<String> {
-    let mut out = Vec::new();
+/// What a rewrite of the qx entry must not lose.
+#[derive(Default)]
+struct Kept {
+    /// The entry's own keys except `command` and `args` (`enabled`, `cwd`, tuned timeouts, ...).
+    main: Vec<String>,
+    /// `KEY = "value"` lines under any qx env table.
+    env: Vec<String>,
+    /// Other qx subtables (`[mcp_servers.qx.tools.run]`), verbatim, blank-separated.
+    subs: Vec<String>,
+}
+
+/// Brackets an `args = [` value opens minus the ones it closes. shortcut: brackets inside strings
+/// are counted too; fine for `args`, which holds plain words.
+fn open_brackets(value: &str) -> i32 {
+    strip_comment(value).chars().map(|c| match c { '[' => 1, ']' => -1, _ => 0 }).sum()
+}
+
+fn kept(lines: &[&str], tables: &[(usize, usize)]) -> Kept {
+    let mut out = Kept::default();
     for (start, end) in tables {
-        if !is_env_header(&norm_header(lines[*start])) {
-            continue;
-        }
-        for line in &lines[start + 1..*end] {
-            let t = line.trim();
-            if t.is_empty() || t.starts_with('#') || !t.contains('=') {
-                continue;
+        let header = norm_header(lines[*start]);
+        let body = &lines[start + 1..*end];
+        if is_env_header(&header) {
+            for line in body {
+                let t = line.trim();
+                if t.is_empty() || t.starts_with('#') || !t.contains('=') {
+                    continue;
+                }
+                let key = t.split('=').next().unwrap_or("").trim();
+                if key != "QX_CLIENT" {
+                    out.env.push(t.to_string());
+                }
             }
-            let key = t.split('=').next().unwrap_or("").trim();
-            if key != "QX_CLIENT" {
-                out.push(t.to_string());
+        } else if matches!(header.as_str(), "[mcp_servers.qx]" | "[mcp_servers.\"qx\"]") {
+            let mut open = 0;
+            for line in body {
+                if open > 0 {
+                    open += open_brackets(line);
+                    continue;
+                }
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match line.split_once('=').map(|(k, v)| (k.trim(), v)) {
+                    Some(("command", _)) => {}
+                    Some(("args", v)) => open = open_brackets(v).max(0),
+                    _ => out.main.push(line.to_string()),
+                }
             }
+        } else {
+            let mut sub: Vec<&str> = lines[*start..*end].to_vec();
+            while sub.last().is_some_and(|l| l.trim().is_empty()) {
+                sub.pop();
+            }
+            out.subs.push(String::new());
+            out.subs.extend(sub.into_iter().map(str::to_string));
         }
     }
     out
 }
 
-fn render(exe: &Path, env: &[String], eol: &str) -> String {
+fn render(exe: &Path, kept: &Kept, eol: &str) -> String {
     let mut lines = vec![
         "[mcp_servers.qx]".to_string(),
         format!("command = {}", toml_path(exe)),
         "args = [\"mcp\"]".to_string(),
-        "startup_timeout_sec = 20".to_string(),
-        "tool_timeout_sec = 600".to_string(),
-        String::new(),
-        "[mcp_servers.qx.env]".to_string(),
-        "QX_CLIENT = \"codex\"".to_string(),
     ];
-    lines.extend(env.iter().cloned());
+    lines.extend(kept.main.iter().cloned());
+    // A timeout the user tuned stays; a fresh entry gets ours.
+    for (key, default) in [("startup_timeout_sec", 20), ("tool_timeout_sec", 600)] {
+        let set = kept.main.iter().any(|l| l.split_once('=').is_some_and(|(k, _)| k.trim() == key));
+        if !set {
+            lines.push(format!("{key} = {default}"));
+        }
+    }
+    lines.extend([String::new(), "[mcp_servers.qx.env]".to_string(), "QX_CLIENT = \"codex\"".to_string()]);
+    lines.extend(kept.env.iter().cloned());
+    lines.extend(kept.subs.iter().cloned());
     lines.join(eol)
 }
 
@@ -251,7 +295,7 @@ fn refuses(text: &str, action: Action) -> bool {
 fn refusal(exe: &Path) -> String {
     format!(
         "config.toml uses an inline table or dotted key qx will not rewrite. Paste this instead:\n{}",
-        render(exe, &[], "\n")
+        render(exe, &Kept::default(), "\n")
     )
 }
 
@@ -418,6 +462,48 @@ model = \"y\"
             assert_eq!(count(&out, "[mcp_servers.qx]"), 1, "{src} -> {out}");
             assert!(!out.contains("command = 'old'"), "{src} -> {out}");
         }
+    }
+
+    #[test]
+    fn codex_install_keeps_the_users_own_keys_and_subtables() {
+        let src = "\
+[mcp_servers.qx]
+command = 'old.exe'
+args = [
+  \"mcp\",
+]
+enabled = false
+cwd = 'D:\\work'
+tool_timeout_sec = 90
+
+[mcp_servers.qx.tools.run]
+approval_mode = \"approve\"
+
+[mcp_servers.qx.env]
+QX_GUARD = \"safe\"
+
+[profiles.fast]
+model = \"y\"
+";
+        let out = changed(edit_codex(Some(src), Path::new(EXE), Action::Install));
+        for keep in ["enabled = false", "cwd = 'D:\\work'", "tool_timeout_sec = 90", "[mcp_servers.qx.tools.run]\napproval_mode = \"approve\"", "QX_GUARD = \"safe\"", "[profiles.fast]\nmodel = \"y\""] {
+            assert!(out.contains(keep), "{keep} lost:\n{out}");
+        }
+        assert!(out.contains("command = 'C:\\q\\qx.exe'\nargs = [\"mcp\"]\n"), "{out}");
+        assert!(!out.contains("old.exe") && !out.contains("tool_timeout_sec = 600"), "{out}");
+        assert_eq!(count(&out, "args ="), 1, "{out}");
+        assert!(
+            matches!(edit_codex(Some(&out), Path::new(EXE), Action::Install), Edit::Unchanged),
+            "second run rewrote the file:\n{out}"
+        );
+    }
+
+    #[test]
+    fn codex_recognises_a_single_quoted_key() {
+        let src = "[mcp_servers.'qx']\ncommand = 'old'\n";
+        let out = changed(edit_codex(Some(src), Path::new(EXE), Action::Install));
+        assert_eq!(count(&out, "[mcp_servers."), 2, "{out}");
+        assert!(!out.contains("'old'"), "{out}");
     }
 
     #[test]

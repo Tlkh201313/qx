@@ -84,4 +84,6 @@ export default function (pi) {
   };
   register("mcp__qx__run", "qx run", RUN_DESCRIPTION, RUN_PARAMETERS, "run");
   register("mcp__qx__fs", "qx fs", FS_DESCRIPTION, FS_PARAMETERS, "fs");
+  // Stop the qx child with the session instead of leaving it to die with pi's pipes.
+  pi.on?.("session_shutdown", () => bridge.close());
 }

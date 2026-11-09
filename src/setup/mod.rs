@@ -16,12 +16,11 @@ use std::path::{Path, PathBuf};
 /// Where each client keeps its configuration, resolved once from the environment.
 pub struct Paths {
     pub home: PathBuf,
-    /// Kept for callers that resolve a second location under it (Hermes, Codex).
-    #[allow(dead_code)]
-    pub local_app_data: PathBuf,
     pub dsh_home: PathBuf,
     pub hermes_home: PathBuf,
     pub codex_home: PathBuf,
+    /// `CLAUDE_CONFIG_DIR`: Claude Code then keeps both its files there instead of under the home.
+    pub claude_config_dir: Option<PathBuf>,
 }
 
 impl Paths {
@@ -42,8 +41,8 @@ impl Paths {
             dsh_home: pick("DSH_HOME", home.join(".dsh")),
             hermes_home: pick("HERMES_HOME", local_app_data.join("hermes")),
             codex_home: pick("CODEX_HOME", home.join(".codex")),
+            claude_config_dir: var("CLAUDE_CONFIG_DIR").map(PathBuf::from),
             home,
-            local_app_data,
         }
     }
 }
@@ -85,7 +84,7 @@ pub fn plan(c: Client, p: &Paths, exe: &Path, a: Action) -> Result<Vec<Change>, 
             },
         ]),
         Client::OpenCode => {
-            let (file, _) = opencode_file(p);
+            let file = opencode_file(p);
             // V1 lists servers directly under `mcp`; V2 under `mcp.servers`. A file shows which one
             // it is; a new file gets V2's shape.
             let v1 = read_optional(&file)?.as_deref().is_some_and(opencode_v1);
@@ -128,7 +127,7 @@ pub fn plan(c: Client, p: &Paths, exe: &Path, a: Action) -> Result<Vec<Change>, 
                 edit: yaml::edit_hermes(text.as_deref(), exe, a),
             }])
         }
-        Client::Pi => Ok(pi::edit_pi(pi::pi_version(p), p, exe, a)
+        Client::Pi => Ok(pi::edit_pi(pi::pi_version(), p, exe, a)
             .into_iter()
             .map(|(file, edit)| Change { client: c, file, edit })
             .collect()),
@@ -137,12 +136,15 @@ pub fn plan(c: Client, p: &Paths, exe: &Path, a: Action) -> Result<Vec<Change>, 
 }
 
 fn claude_file(p: &Paths) -> PathBuf {
-    p.home.join(".claude.json")
+    p.claude_config_dir.as_ref().unwrap_or(&p.home).join(".claude.json")
 }
 
 /// The hooks live in the user settings, not next to the MCP servers in `.claude.json`.
 fn claude_settings(p: &Paths) -> PathBuf {
-    p.home.join(".claude").join("settings.json")
+    match &p.claude_config_dir {
+        Some(dir) => dir.join("settings.json"),
+        None => p.home.join(".claude").join("settings.json"),
+    }
 }
 
 const PRE_TOOL_USE: &[&str] = &["hooks", "PreToolUse"];
@@ -194,23 +196,23 @@ fn edit_claude_hook(file: &Path, exe: &Path, a: Action) -> Edit {
 }
 
 /// Whichever OpenCode file already holds qx, else the first that exists, else `opencode.json`.
-fn opencode_file(p: &Paths) -> (PathBuf, Option<PathBuf>) {
+fn opencode_file(p: &Paths) -> PathBuf {
     let dir = p.home.join(".config").join("opencode");
     let json = dir.join("opencode.json");
     let jsonc = dir.join("opencode.jsonc");
     for file in [&json, &jsonc] {
         if let Ok(text) = std::fs::read_to_string(file) {
             if has_qx(&text) {
-                return (file.clone(), None);
+                return file.clone();
             }
         }
     }
     for file in [&json, &jsonc] {
         if file.exists() {
-            return (file.clone(), None);
+            return file.clone();
         }
     }
-    (json, Some(jsonc))
+    json
 }
 
 fn has_qx(text: &str) -> bool {
@@ -254,7 +256,7 @@ fn edit_json_file(
             Action::Remove => Edit::Unchanged,
             Action::Install => match jsonc::set_member("{}", path, &entry(None)) {
                 Ok(text) => Edit::Changed(text),
-                Err(e) => Edit::Refuse(e),
+                Err(e) => Edit::Refuse(format!("{}: {e}", file.display())),
             },
         },
         Some(current) => {
@@ -276,7 +278,7 @@ fn edit_json_file(
                         file.display()
                     )),
                 },
-                Err(e) => Edit::Refuse(e),
+                Err(e) => Edit::Refuse(format!("{}: {e}", file.display())),
             }
         }
     }
@@ -305,39 +307,47 @@ fn merge_env(existing: Option<&Value>, client: &str, extra: &[(String, Value)]) 
     Value::Object(env)
 }
 
+/// The user's entry with ours laid over it: keys qx does not own (`enabled`, `cwd`, comments' siblings)
+/// survive a re-run.
+fn overlay(existing: Option<&Value>, ours: Value) -> Value {
+    let mut entry = existing.and_then(Value::as_object).cloned().unwrap_or_default();
+    if let Value::Object(ours) = ours {
+        entry.extend(ours);
+    }
+    Value::Object(entry)
+}
+
 fn claude_entry(exe: &Path, existing: Option<&Value>) -> Value {
-    json!({
+    overlay(existing, json!({
         "type": "stdio",
         "command": exe.to_string_lossy(),
         "args": ["mcp"],
         "env": merge_env(existing, "claude-code", &[]),
-    })
+    }))
 }
 
 /// OpenCode V1's local server: no `codemode`, and `timeout` there is the tool-listing timeout, so
 /// none is written (a user's own stays).
 fn opencode_entry_v1(exe: &Path, existing: Option<&Value>) -> Value {
-    let mut entry = json!({
+    let mut entry = overlay(existing, json!({
         "type": "local",
         "command": [exe.to_string_lossy(), "mcp"],
         "environment": merge_env(existing, "opencode", &[]),
-        "enabled": true,
-    });
-    if let Some(t) = existing.and_then(|e| e.get("timeout")) {
-        entry["timeout"] = t.clone();
-    }
+    }));
+    // A user who disabled the server keeps it disabled.
+    entry["enabled"] = existing.and_then(|e| e.get("enabled")).cloned().unwrap_or(json!(true));
     entry
 }
 
 fn opencode_entry(exe: &Path, existing: Option<&Value>) -> Value {
-    let mut entry = json!({
+    let mut entry = overlay(existing, json!({
         "type": "local",
         "command": [exe.to_string_lossy(), "mcp"],
         "environment": merge_env(existing, "opencode", &[]),
         // Without this, OpenCode hides the qx tools behind its own `execute` tool.
         "codemode": false,
         "timeout": { "execution": 600000 },
-    });
+    }));
     // A user's own timeout object may carry other keys; keep them.
     if let Some(t) = existing.and_then(|e| e.get("timeout")).and_then(Value::as_object) {
         let mut timeouts = t.clone();
@@ -354,16 +364,12 @@ pub fn apply(ch: &Change) -> std::io::Result<()> {
     let Edit::Changed(text) = &ch.edit else {
         return Ok(());
     };
-    if text.is_empty() {
-        return match std::fs::remove_file(&ch.file) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        };
+    if !text.is_empty() {
+        if let Some(parent) = ch.file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
     }
-    if let Some(parent) = ch.file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    // Removing a file keeps the first backup too: the file may be one the user edited.
     if ch.file.exists() {
         let backup = ch.file.with_extension(format!(
             "{}qx-bak",
@@ -372,15 +378,36 @@ pub fn apply(ch: &Change) -> std::io::Result<()> {
                 .map(|e| format!("{}.", e.to_string_lossy()))
                 .unwrap_or_default()
         ));
-        std::fs::copy(&ch.file, &backup)?;
+        // The first backup is the user's own file; a later run must not replace it with qx's edit.
+        if !backup.exists() {
+            std::fs::copy(&ch.file, &backup)?;
+        }
+    }
+    if text.is_empty() {
+        return match std::fs::remove_file(&ch.file) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
     }
     let tmp = ch
         .file
         .with_extension(format!("qx-tmp-{}", std::process::id()));
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, &ch.file).inspect_err(|_| {
+    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(text.as_bytes())?;
+        // On disk before the rename, so a crash leaves the old file or the whole new one.
+        f.sync_all()
+    });
+    written.and_then(|()| std::fs::rename(&tmp, &ch.file)).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// Two spellings of one file: slashes and case do not matter on Windows.
+pub fn same_path(a: &str, b: &Path) -> bool {
+    let norm = |s: &str| s.replace('/', "\\").to_ascii_lowercase();
+    norm(a) == norm(&b.to_string_lossy())
 }
 
 pub struct Status {
@@ -396,17 +423,25 @@ pub fn status(c: Client, p: &Paths) -> Status {
         Client::ClaudeCode => {
             let file = claude_file(p);
             let command = read_json_command(&file, &["mcpServers", "qx", "command"]);
-            let hooked = std::fs::read_to_string(claude_settings(p))
+            let hook = std::fs::read_to_string(claude_settings(p))
                 .ok()
                 .and_then(|text| jsonc::elements(&text, PRE_TOOL_USE).ok())
-                .is_some_and(|groups| groups.iter().any(is_qx_hook));
-            if !hooked {
-                notes.push("no `qx hook claude` PreToolUse hook: Claude's own Bash/PowerShell bypass qx".into());
+                .and_then(|groups| groups.into_iter().find(is_qx_hook));
+            match hook.as_ref().and_then(|g| g["hooks"][0]["command"].as_str()) {
+                None => notes.push("no `qx hook claude` PreToolUse hook: Claude's own Bash/PowerShell bypass qx".into()),
+                Some(cmd) if !Path::new(cmd).is_file() => {
+                    notes.push(format!("the PreToolUse hook points at a missing binary ({cmd}): run `qx setup claude`"));
+                }
+                Some(cmd) => {
+                    if let Some(want) = crate::deploy::canonical().filter(|w| !same_path(cmd, w)) {
+                        notes.push(format!("the PreToolUse hook runs {cmd}, not {}: run `qx setup claude`", want.display()));
+                    }
+                }
             }
             (Some(file), command)
         }
         Client::OpenCode => {
-            let (file, _) = opencode_file(p);
+            let file = opencode_file(p);
             let v1 = std::fs::read_to_string(&file).ok().as_deref().is_some_and(opencode_v1);
             let at: &[&str] = if v1 { &["mcp", "qx"] } else { &["mcp", "servers", "qx"] };
             let command = std::fs::read_to_string(&file)
@@ -463,7 +498,7 @@ pub fn status(c: Client, p: &Paths) -> Status {
                 .join("qx.js");
             let mut command = read_json_command(&mcp, &["mcpServers", "qx", "command"]);
             let mut file = mcp;
-            match pi::pi_version(p) {
+            match pi::pi_version() {
                 None => notes.push("pi not found on PATH".into()),
                 Some(version) if version < (0, 99) => {
                     // No MCP client in this pi: the extension is the registration.
@@ -510,12 +545,12 @@ fn read_json_command(file: &Path, path: &[&str]) -> Option<String> {
 /// `pi` command answers). Explicitly named clients are configured either way.
 fn installed(c: Client, p: &Paths) -> bool {
     match c {
-        Client::ClaudeCode => p.home.join(".claude.json").is_file() || p.home.join(".claude").is_dir(),
+        Client::ClaudeCode => claude_file(p).is_file() || claude_settings(p).parent().is_some_and(Path::is_dir),
         Client::OpenCode => p.home.join(".config").join("opencode").is_dir(),
         Client::Codex => p.codex_home.is_dir(),
         Client::Dsh => p.dsh_home.is_dir(),
         Client::Hermes => p.hermes_home.is_dir(),
-        Client::Pi => pi::pi_version(p).is_some(),
+        Client::Pi => pi::pi_version().is_some(),
         Client::Generic => false,
     }
 }
@@ -567,6 +602,13 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
+    // Registering a binary that is not there leaves every client with a dead entry.
+    if action == Action::Install && !exe.is_file() {
+        eprintln!("qx setup: {} does not exist: run `qx deploy` first", exe.display());
+        if !dry {
+            return 2;
+        }
+    }
     let mut refused = false;
     let mut dsh_seen = false;
     let mut dsh_refused = false;
@@ -634,10 +676,10 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         Paths {
             home: root.clone(),
-            local_app_data: root.join("local"),
             dsh_home: root.join("dsh"),
             hermes_home: root.join("hermes"),
             codex_home: root.join("codex"),
+            claude_config_dir: None,
         }
     }
 
@@ -646,6 +688,61 @@ mod tests {
             Edit::Changed(text) => Some(text),
             _ => None,
         }
+    }
+
+    #[test]
+    fn claude_config_dir_moves_both_claude_files() {
+        let dir = PathBuf::from(r"D:\cfg");
+        let p = Paths::from_lookup(|k| match k {
+            "USERPROFILE" => Some(r"C:\u".into()),
+            "CLAUDE_CONFIG_DIR" => Some(dir.clone().into_os_string()),
+            _ => None,
+        });
+        assert_eq!(claude_file(&p), dir.join(".claude.json"));
+        assert_eq!(claude_settings(&p), dir.join("settings.json"));
+        let q = Paths::from_lookup(|k| (k == "USERPROFILE").then(|| r"C:\u".into()));
+        assert_eq!(claude_file(&q), PathBuf::from(r"C:\u\.claude.json"));
+        assert_eq!(claude_settings(&q), PathBuf::from(r"C:\u\.claude\settings.json"));
+    }
+
+    #[test]
+    fn the_first_backup_is_the_users_own_file() {
+        let p = paths("backup");
+        let file = p.home.join("config.toml");
+        std::fs::write(&file, "mine").unwrap();
+        for text in ["first edit", "second edit"] {
+            let ch = Change { client: Client::Codex, file: file.clone(), edit: Edit::Changed(text.into()) };
+            apply(&ch).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "second edit");
+        assert_eq!(std::fs::read_to_string(p.home.join("config.toml.qx-bak")).unwrap(), "mine");
+    }
+
+    #[test]
+    fn json_entries_keep_the_keys_qx_does_not_own() {
+        let exe = Path::new(r"C:\q\qx.exe");
+        let old = json!({"enabled": false, "cwd": "D:\\w", "command": ["old", "mcp"], "environment": {"K": "v"}});
+        let v2 = opencode_entry(exe, Some(&old));
+        assert_eq!((&v2["enabled"], &v2["cwd"], &v2["environment"]["K"]), (&json!(false), &json!("D:\\w"), &json!("v")));
+        assert_eq!(v2["command"][0], exe.to_string_lossy().as_ref());
+        let v1 = opencode_entry_v1(exe, Some(&old));
+        assert_eq!((&v1["enabled"], &v1["cwd"]), (&json!(false), &json!("D:\\w")));
+        assert_eq!(opencode_entry_v1(exe, None)["enabled"], json!(true));
+        let claude = claude_entry(exe, Some(&json!({"cwd": "D:\\w", "env": {"K": "v"}})));
+        assert_eq!((&claude["cwd"], &claude["env"]["K"]), (&json!("D:\\w"), &json!("v")));
+    }
+
+    #[test]
+    fn doctor_notes_a_hook_that_points_at_a_missing_binary() {
+        let p = paths("hookmissing");
+        let settings = claude_settings(&p);
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let ghost = p.home.join("gone").join("qx.exe");
+        let text = json!({"hooks": {"PreToolUse": [claude_hook(&ghost)]}}).to_string();
+        std::fs::write(&settings, text).unwrap();
+        let notes = status(Client::ClaudeCode, &p).notes;
+        assert!(notes.iter().any(|n| n.contains("missing binary")), "{notes:?}");
+        assert!(same_path("C:/A/qx.EXE", Path::new("c:\\a\\qx.exe")));
     }
 
     #[test]
@@ -779,6 +876,21 @@ ew\qx.exe");
                 .to_string();
             assert!(!removed.contains("qx.exe"), "{removed}");
         }
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn removing_a_file_keeps_the_users_copy_as_a_backup() {
+        let p = paths("apply-remove");
+        std::fs::create_dir_all(&p.home).unwrap();
+        let file = p.home.join("qx.js");
+        std::fs::write(&file, "// the user's own edit\n").unwrap();
+        let ch = Change { client: Client::Pi, file: file.clone(), edit: Edit::Changed(String::new()) };
+        apply(&ch).unwrap();
+        assert!(!file.exists());
+        assert_eq!(std::fs::read_to_string(p.home.join("qx.js.qx-bak")).unwrap(), "// the user's own edit\n");
+        // A file that is already gone is not an error.
+        apply(&ch).unwrap();
         let _ = std::fs::remove_dir_all(&p.home);
     }
 

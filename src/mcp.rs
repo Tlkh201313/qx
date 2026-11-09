@@ -21,16 +21,16 @@ struct Limits {
 
 impl Limits {
     fn from_env() -> Self {
-        let workers = std::env::var("QX_MCP_WORKERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8)
-            .clamp(1, 32);
-        let queue = std::env::var("QX_MCP_QUEUE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(64)
-            .min(1024);
+        // A set value that does not parse is ignored; say so once instead of silently using the default.
+        let num = |key: &str, default: usize| match std::env::var(key) {
+            Ok(v) => v.trim().parse::<usize>().unwrap_or_else(|_| {
+                eprintln!("[qx] {key}={v:?} is not a number; using {default}");
+                default
+            }),
+            Err(_) => default,
+        };
+        let workers = num("QX_MCP_WORKERS", 8).clamp(1, 32);
+        let queue = num("QX_MCP_QUEUE", 64).min(1024);
         Limits { workers, queue, drain: Duration::from_secs(3) }
     }
 }
@@ -106,9 +106,11 @@ fn serve_io<R: BufRead, W: Write + Send + 'static>(mut reader: R, out: W, limits
             });
             continue;
         }
-        let out = out.clone();
-        let active = active.clone();
-        std::thread::spawn(move || {
+        let req = Arc::new(req);
+        let (out_w, active_w, req_w) = (out.clone(), active.clone(), req.clone());
+        // A refused spawn (memory pressure) answers this call instead of unwinding the reader loop.
+        let spawned = std::thread::Builder::new().name("qx-call".into()).spawn(move || {
+            let (out, active, req) = (out_w, active_w, req_w);
             let _active = Active(active);
             if SHUTDOWN.load(Ordering::SeqCst) {
                 // The client is gone: never start work nobody will read, but still answer
@@ -127,6 +129,10 @@ fn serve_io<R: BufRead, W: Write + Send + 'static>(mut reader: R, out: W, limits
                 }
             }
         });
+        if spawned.is_err() {
+            active.fetch_sub(1, Ordering::SeqCst);
+            send_all(&out, &req, |id| tool_text(Some(id), "could not start a worker thread; retry shortly", true));
+        }
     }
 
     // The client closed stdin. Stop the work rather than let it run to its own timeout: children
@@ -448,22 +454,22 @@ fn run_schema() -> Value {
         "name": "run",
         "title": "qx run",
         "description": format!(
-            "Run a local command (like {}, but faster). `program` + `args` execs directly; `command` is a shell line: auto picks PowerShell for cmdlets, `$var`, `a; b` and single quotes, Git Bash for POSIX pipelines, else cmd. Common tools run in-process (ls cat head tail wc grep sed mkdir rm cp mv touch which ...). Stdin is empty; output is compacted (errors kept) and secrets redacted; a cut output is saved to `full_output`. After `timeout_ms` (default 120000, max 270000) a running command becomes a background job: reply names its id; follow with `job`.",
+            "Run a local command (like {}, but faster). `program` + `args` execs directly; `command` is a shell line (auto: PowerShell for cmdlets, `$var`, `a; b`, single quotes; Git Bash for POSIX pipelines; else cmd). Common tools (ls cat head tail wc grep sed mkdir rm cp mv touch which) run in-process. Stdin is empty; output is compacted and secrets redacted; a cut output is saved to `full_output`. After `timeout_ms` (default 120000, max 270000) a command keeps running as a background job; follow it with `job`.",
             c.native(Native::Shell)
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "program": { "type": "string", "description": "Executable name or path, e.g. git, cargo, python, node." },
-                "args": { "type": "array", "items": { "type": "string" }, "description": "JSON array of strings for program, e.g. [\"-n\",\"foo\",\"src\"]. Never a bare string." },
-                "command": { "type": "string", "description": "Full shell command line for pipes/redirects/chaining." },
-                "shell": { "type": "string", "enum": ["auto", "cmd", "bash", "powershell"], "default": "auto", "description": "auto picks PowerShell for cmdlet/variable syntax, Git Bash when a pipeline runs a POSIX utility, else cmd. PowerShell runs -NoProfile -NonInteractive." },
+                "program": { "type": "string", "description": "Executable name or path." },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "Array of strings, never a bare string." },
+                "command": { "type": "string", "description": "Shell line for pipes, redirects, chaining." },
+                "shell": { "type": "string", "enum": ["auto", "cmd", "bash", "powershell"], "default": "auto" },
                 "cwd": { "type": "string", "description": "Working directory." },
-                "timeout_ms": { "type": "integer", "default": 120000, "description": "Wait this long (max 270000). A command still running then keeps going as a background job and the reply names its id." },
+                "timeout_ms": { "type": "integer", "default": 120000, "description": "Max 270000." },
                 "mode": { "type": "string", "enum": ["compact", "full"], "default": "compact" },
-                "background": { "type": "boolean", "description": "Start and return a job id at once." },
-                "job": { "type": "string", "description": "Follow up a background job by id (or `list`) instead of running a command." },
-                "wait_ms": { "type": "integer", "description": "With `job`: wait this long for it to finish (default 15000)." },
+                "background": { "type": "boolean", "description": "Return a job id at once." },
+                "job": { "type": "string", "description": "Follow a background job by id, or `list`." },
+                "wait_ms": { "type": "integer", "description": "With `job`: wait for it (default 15000)." },
                 "kill": { "type": "boolean", "description": "With `job`: stop it." }
             }
         },
@@ -497,31 +503,30 @@ fn fs_schema() -> Value {
     let mut schema = json!({
         "name": "fs",
         "title": "qx fs",
-        "description": "In-process files in the workspace. op=read (path, offset?, limit?; also reads a dir, any path, files of any size); write (path, content; replacing a file needs a prior read); edit (path, old_string, new_string, replace_all?; exact unique match, no prior read); glob (pattern, path?; newest first); grep (pattern is a REGEX, path?, include?, ignore_case?, literal?; output grouped by file); list; stat. BATCH to save round trips: `ops:[{op,...},...]` runs up to 32 in order (cwd is shared), `paths:[..]` reads/stats many files, `edits:[{old_string,new_string,replace_all?}]` applies several edits to one file atomically. Pass `cwd` (the session directory). Writes stay inside cwd; reads can go anywhere. Generated dirs (node_modules, target, build, dist, vendor...) are skipped unless named in the path/pattern or all=true; the reply says what was skipped.",
+        "description": "In-process files in the workspace. op=read (path, offset?, limit?; also dirs, any path, any size); write (path, content; replacing a file needs a prior read); edit (path, old_string, new_string, replace_all?; unique exact match, no prior read); glob (pattern, path?; newest first); grep (pattern REGEX, path?, include?, ignore_case?, literal?); list; stat. Batch: `ops:[{op,...}]` (max 32, in order, shared cwd), `paths:[..]` reads/stats many, `edits:[{old_string,new_string,replace_all?}]` atomic on one path. Pass `cwd`. Writes stay inside cwd or %TEMP%\\claude; reads can go anywhere. Generated dirs (node_modules, target, build, dist, vendor) are skipped unless named or all=true.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "op": { "type": "string", "enum": ["read", "write", "edit", "glob", "grep", "list", "stat"] },
-                "cwd": { "type": "string", "description": "Session working directory (writes stay inside it). Omitted: the last one given." },
-                "path": { "type": "string", "description": "File or directory (default '.'). Alias: file_path." },
-                "file_path": { "type": "string", "description": "Alias for path." },
-                "content": { "type": "string", "description": "write: complete new file content." },
-                "old_string": { "type": "string", "description": "edit: literal text to replace." },
-                "new_string": { "type": "string", "description": "edit: replacement text." },
-                "replace_all": { "type": "boolean", "default": false },
-                "ops": { "type": "array", "items": { "type": "object" }, "description": "Batch: [{op, path, ...}, ...] in one call; each item takes the same arguments as a single call." },
-                "paths": { "type": "array", "items": { "type": "string" }, "description": "read/stat: many files in one call." },
-                "edits": { "type": "array", "items": { "type": "object" }, "description": "edit: [{old_string, new_string, replace_all?}, ...] on one path, all or nothing." },
+                "cwd": { "type": "string", "description": "Session working directory. Omitted: the last one given." },
+                "path": { "type": "string", "description": "File or directory (default '.')." },
+                "content": { "type": "string" },
+                "old_string": { "type": "string" },
+                "new_string": { "type": "string" },
+                "replace_all": { "type": "boolean" },
+                "ops": { "type": "array", "items": { "type": "object" } },
+                "paths": { "type": "array", "items": { "type": "string" } },
+                "edits": { "type": "array", "items": { "type": "object" } },
                 "pattern": { "type": "string", "description": "glob: path glob (*, **, ?, [class], {a,b}). grep: regex." },
-                "include": { "type": "string", "description": "grep: one glob limiting which files are searched." },
-                "offset": { "type": "integer", "default": 1, "description": "read: 1-based first line." },
-                "limit": { "type": "integer", "default": 2000, "description": "read: maximum lines (cap 2000)." },
-                "max_results": { "type": "integer", "default": 100, "description": "glob: maximum paths (cap 1000)." },
-                "max_matches": { "type": "integer", "default": 250, "description": "grep: maximum matches (cap 1000)." },
-                "max_line_chars": { "type": "integer", "default": 2000, "description": "read/grep: clip each line (cap 8000)." },
-                "ignore_case": { "type": "boolean", "default": false },
-                "literal": { "type": "boolean", "description": "grep: match pattern as plain text." },
-                "all": { "type": "boolean", "description": "glob/grep: also search node_modules, target, build, dist, vendor..." }
+                "include": { "type": "string", "description": "grep: glob limiting the files searched." },
+                "offset": { "type": "integer", "description": "read: 1-based first line." },
+                "limit": { "type": "integer", "description": "read: max lines (default and cap 2000)." },
+                "max_results": { "type": "integer", "description": "glob: default 100, cap 1000." },
+                "max_matches": { "type": "integer", "description": "grep: default 250, cap 1000." },
+                "max_line_chars": { "type": "integer", "description": "read/grep: clip each line (default 2000, cap 8000)." },
+                "ignore_case": { "type": "boolean" },
+                "literal": { "type": "boolean", "description": "grep: plain text, not regex." },
+                "all": { "type": "boolean", "description": "glob/grep: include node_modules, target, build, dist, vendor." }
             },
             "required": []
         },
@@ -631,14 +636,18 @@ impl JobRec {
         self.result.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
-    /// Wait until the command finishes, `until` passes, or the client cancels the waiting call
-    /// (which stops the command and gives it 3 s to report). `None` means still running.
-    fn wait(&self, until: std::time::Instant, call: &Inflight) -> Option<RunResult> {
+    /// Wait until the command finishes, `until` passes, or the client cancels the waiting call.
+    /// With `stop_on_cancel` (the call that started the command) a cancel stops the command and gives
+    /// it 3 s to report; a status poll that is cancelled just stops waiting. `None` means still running.
+    fn wait(&self, until: std::time::Instant, call: &Inflight, stop_on_cancel: bool) -> Option<RunResult> {
         let mut grace: Option<std::time::Instant> = None;
         let mut guard = self.result.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(r) = guard.take() {
                 return Some(r);
+            }
+            if call.cancelled() && !stop_on_cancel {
+                return None;
             }
             if call.cancelled() && grace.is_none() {
                 self.cancel.store(true, Ordering::Relaxed);
@@ -744,7 +753,8 @@ fn running_reply(id: Option<Value>, rec: &JobRec, headline: &str) -> Value {
     let (so, se) = (tidy(so), tidy(se));
     let job = rec.id();
     let mut text = format!(
-        "[qx] {headline}\nFollow: {{job:\"{job}\", wait_ms:60000}}; stop: {{job:\"{job}\", kill:true}}\n"
+        "[qx] {headline}\nFollow: {{job:\"{job}\", wait_ms:{}}}; stop: {{job:\"{job}\", kill:true}}\n",
+        soft_ms()
     );
     if !so.is_empty() {
         text.push_str("\n[stdout, newest]\n");
@@ -802,7 +812,7 @@ fn job_call(id: Option<Value>, job: &str, wait_ms: u64, kill: bool) -> Value {
     } else {
         std::time::Instant::now() + Duration::from_millis(wait_ms.min(soft_ms()))
     };
-    match rec.wait(until, &call) {
+    match rec.wait(until, &call, kill) {
         Some(res) => {
             forget_job(job);
             let prefix = format!("[qx] job {job} finished after {}\n", human(rec.started.elapsed()));
@@ -1040,7 +1050,7 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
 
     // `background` still gives a command that ends at once a plain answer.
     let wait = if background { Duration::from_millis(300) } else { window + Duration::from_millis(400) };
-    match rec.wait(std::time::Instant::now() + wait, &inflight) {
+    match rec.wait(std::time::Instant::now() + wait, &inflight, true) {
         Some(res) => finish(id, res, &ctx, ""),
         None if inflight.cancelled() => tool_result(
             id,
@@ -1053,7 +1063,7 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
                 // No job to hand over to: stop it, as a timeout always did.
                 rec.cancel.store(true, Ordering::Relaxed);
                 let until = std::time::Instant::now() + Duration::from_secs(5);
-                return match rec.wait(until, &inflight) {
+                return match rec.wait(until, &inflight, true) {
                     Some(res) => finish(id, res, &ctx, ""),
                     None => tool_result(id, "exit_code: 124\ntimed_out: true\n(stopped; too many background jobs)\n", true, json!({"timed_out": true, "exit_code": 124})),
                 };
@@ -1107,21 +1117,29 @@ fn render(id: Option<Value>, outcome: exec::Outcome, source: &str, ctx: &RunCtx,
                 compact::relative_to_cwd(&mut so, &mut se, cwd);
             }
         } else {
-            let (a, cut) = compact::compact(&so, 200, 80, 60);
+            let (max, head, tail) = digest::plain_budget(label, (200, 80, 60));
+            let (a, cut) = compact::compact(&so, max, head, tail);
             let (b, cut_err) = compact::compact(&se, 120, 50, 40);
             original = (std::mem::replace(&mut so, a), std::mem::replace(&mut se, b));
             truncated |= cut | cut_err;
         }
+        // Long lines (minified code, a JSON blob) pass the line budget yet not the client's reply cap.
+        let (cap_so, cap_se) = stream_caps(so.len(), se.len());
+        truncated |= cap_text(&mut so, cap_so);
+        truncated |= cap_text(&mut se, cap_se);
         // A cut or a digest that dropped content must never lose facts for good: the agent can grep the full text.
         if truncated || lossy {
             spool = compact::spool(&original.0, &original.1);
         }
-    } else if so.len() > FULL_TEXT_CAP || se.len() > FULL_TEXT_CAP {
-        // "Full" is still bounded: millions of characters in one reply cost more than they help. The
+    } else {
+        // "Full" is still bounded by what the client accepts (the same limit `fs read` works to). The
         // end is kept (that is where a failure is), the whole text goes to a file.
-        spool = compact::spool(&so, &se);
-        truncated |= cap_text(&mut so, FULL_TEXT_CAP);
-        truncated |= cap_text(&mut se, FULL_TEXT_CAP);
+        let (cap_so, cap_se) = stream_caps(so.len(), se.len());
+        if so.len() > cap_so || se.len() > cap_se {
+            spool = compact::spool(&so, &se);
+            truncated |= cap_text(&mut so, cap_so);
+            truncated |= cap_text(&mut se, cap_se);
+        }
     }
 
     let mut text = String::from(prefix);
@@ -1194,8 +1212,26 @@ fn render(id: Option<Value>, outcome: exec::Outcome, source: &str, ctx: &RunCtx,
     tool_result(id, &text, fault, meta)
 }
 
-/// The most text one `mode:"full"` reply carries.
-const FULL_TEXT_CAP: usize = 96 * 1024;
+/// Room in a reply for the prefix, section headers and notes around the two output streams.
+const REPLY_FRAME_BYTES: usize = 1_500;
+
+/// How many bytes stdout and stderr may each keep so both together stay under the client's reply
+/// limit (`fsops::CLIENT_REPLY_BYTES`). A short stream leaves its room to the other one. A client that
+/// also gets the text in `structuredContent` sees it twice, so it gets half.
+fn stream_caps(stdout: usize, stderr: usize) -> (usize, usize) {
+    let mut room = crate::fsops::CLIENT_REPLY_BYTES - REPLY_FRAME_BYTES;
+    if matches!(client::current().structured(), Structured::Full) {
+        room /= 2;
+    }
+    let half = room / 2;
+    if stdout <= half {
+        (stdout, room - stdout)
+    } else if stderr <= half {
+        (room - stderr, stderr)
+    } else {
+        (half, half)
+    }
+}
 
 /// Keep the first fifth and the last four fifths of `s` within `max` bytes. True when it cut.
 fn cap_text(s: &mut String, max: usize) -> bool {
@@ -1406,6 +1442,43 @@ mod tests {
     }
 
     #[test]
+    fn wide_lines_within_the_line_budget_cannot_push_a_reply_past_the_client_cap() {
+        // `call` runs a real tool call, which a server test's `SHUTDOWN` would cancel.
+        let _server = server_lock();
+        let dir = std::env::temp_dir().join(format!("qx-longline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), (0..150).map(|i| format!("{i} {}\n", "y".repeat(900))).collect::<String>()).unwrap();
+        let cwd = dir.to_string_lossy().to_string();
+        let r = client::scoped(Client::ClaudeCode, || call(json!({"program":"cmd","args":["/c","type","a.txt"],"cwd":cwd})));
+        let text = r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
+        assert!(text.len() < 48_000, "{} bytes", text.len());
+        assert!(text.contains("bytes omitted") && text.contains("full output:"), "{} bytes, tail {:?}", text.len(), &text[text.len().saturating_sub(300)..]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_mode_returns_what_the_client_accepts_and_caps_the_rest() {
+        let _server = server_lock();
+        let dir = std::env::temp_dir().join(format!("qx-fullmode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 40 KB in 400 lines: past the old 22 KB cap, under the client's limit.
+        std::fs::write(dir.join("a.txt"), (0..400).map(|i| format!("{i:04} {}\n", "z".repeat(94))).collect::<String>()).unwrap();
+        std::fs::write(dir.join("b.txt"), (0..800).map(|i| format!("{i:04} {}\n", "z".repeat(94))).collect::<String>()).unwrap();
+        let cwd = dir.to_string_lossy().to_string();
+        let text_of = |file: &str| {
+            let r = client::scoped(Client::ClaudeCode, || {
+                call(json!({"program":"cmd","args":["/c","type",file],"cwd":cwd,"mode":"full"}))
+            });
+            r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap().to_string()
+        };
+        let t = text_of("a.txt");
+        assert!(t.contains("0399 ") && !t.contains("bytes omitted"), "40 KB was cut: {} bytes", t.len());
+        let t = text_of("b.txt"); // 80 KB: capped under the client limit, tail kept
+        assert!(t.len() < crate::fsops::CLIENT_REPLY_BYTES && t.contains("bytes omitted") && t.contains("0799 "), "{} bytes", t.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn tools_list_carries_run_and_fs() {
         let req = json!({
             "jsonrpc": "2.0",
@@ -1444,12 +1517,13 @@ mod tests {
 
     #[test]
     fn a_non_string_argument_is_an_error_not_a_different_command() {
+        let _server = server_lock();
         let r = call(json!({"program":"echo","args":["a", 5]}));
         assert_eq!(r.pointer("/result/isError"), Some(&json!(true)));
         assert!(r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap().contains("args[1]"));
         // A string is split into words (some models stringify the array); any other type is refused.
         let r = call(json!({"program":"echo","args":"a b"}));
-        assert_ne!(r.pointer("/result/isError"), Some(&json!(true)));
+        assert_ne!(r.pointer("/result/isError"), Some(&json!(true)), "{r}");
         assert!(r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap().contains("a b"));
         let r = call(json!({"program":"echo","args":7}));
         assert_eq!(r.pointer("/result/isError"), Some(&json!(true)));
@@ -1759,6 +1833,27 @@ mod tests {
         (guard, global)
     }
 
+    #[test]
+    fn cancelled_status_poll_stops_waiting_but_leaves_the_job_running() {
+        let _server = server_lock();
+        let ctx = RunCtx { label: "t".into(), cwd: None, full: false, guard_warning: None, cwd_note: None };
+        let rec = spawn_runner(ctx, || {
+            std::thread::sleep(Duration::from_millis(600));
+            Err("finished".to_string())
+        });
+        let id = json!(987_654_321u64);
+        let poll = Inflight::begin(&Some(id.clone()));
+        cancel(&id);
+        let t = std::time::Instant::now();
+        let got = rec.wait(t + Duration::from_secs(5), &poll, false);
+        assert!(got.is_none(), "a cancelled poll reports nothing");
+        assert!(t.elapsed() < Duration::from_millis(400), "and returns at once");
+        assert!(!rec.cancel.load(Ordering::Relaxed), "the job itself was not cancelled");
+        let live = Inflight(None, None);
+        let r = rec.wait(std::time::Instant::now() + Duration::from_secs(5), &live, false);
+        assert_eq!(r.map(|x| x.err()), Some(Some("finished".to_string())));
+    }
+
     #[cfg(windows)]
     #[test]
     fn qx_npm_run_plain_script_end_to_end() {
@@ -1878,7 +1973,8 @@ mod tests {
         let code = serve_io(src, sink.clone(), limits);
         assert!(t.elapsed() < Duration::from_secs(6), "shutdown took {:?}", t.elapsed());
         assert_eq!(code, 0);
-        // The call that took the only slot is killed; the one still queued never starts.
+        // The call that took the only slot is killed. The queued one is cancelled before it starts, or, when it
+        // won the freed slot before its own cancel landed, started and killed at once: both answer an error.
         let running_id = started.lock().unwrap_or_else(|e| e.into_inner()).clone().expect("a call took the slot");
         let queued_id = if running_id == "11" { 12 } else { 11 };
         let running = sink.reply(running_id.parse::<u64>().unwrap()).expect("the running call answers");
@@ -1886,7 +1982,10 @@ mod tests {
         let queued = sink.reply(queued_id).expect("the queued call answers");
         assert_eq!(queued.pointer("/result/isError"), Some(&json!(true)));
         let text = queued.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
-        assert!(text.contains("cancelled") || text.contains("shutting down"), "queued call text: {text}");
+        assert!(
+            text.contains("cancelled") || text.contains("shutting down") || text.contains("timed_out: true"),
+            "queued call text: {text}"
+        );
     }
 
     #[cfg(windows)]

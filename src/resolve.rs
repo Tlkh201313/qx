@@ -565,6 +565,8 @@ fn norm_path(p: &Path) -> String {
 }
 
 fn norm_path_str(s: &str) -> String {
+    // rustup and canonicalize hand out `\\?\C:\x`; it is the same place as `C:\x`.
+    let s = s.strip_prefix(r"\\?\").unwrap_or(s);
     let mut s = s.replace('\\', "/").to_ascii_lowercase();
     while s.contains("//") {
         s = s.replace("//", "/");
@@ -884,6 +886,11 @@ pub fn git_bash() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_verbatim_path_is_the_same_place_as_the_plain_one() {
+        assert_eq!(norm_path_str(r"\\?\C:\Users\Me\"), norm_path_str(r"c:/users/me"));
+    }
     use std::fs;
 
     fn tmp(tag: &str) -> PathBuf {

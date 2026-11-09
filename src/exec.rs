@@ -426,7 +426,7 @@ pub fn build_command_env(
     if matches!(program.to_ascii_lowercase().as_str(), "bash" | "bash.exe" | "sh" | "sh.exe") {
         if let Some(b) = resolve::git_bash() {
             let mut c = Command::new(b);
-            c.args(args);
+            add_args(&mut c, args);
             prepare(&mut c);
             apply_python_fast(&mut c);
             apply_child_defaults(&mut c, false);
@@ -736,6 +736,9 @@ pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
             Ok(c)
         }
         "cmd" => {
+            if command.trim_end().contains('\n') {
+                return Err("cmd.exe runs only the first line of a multi-line command; use shell=powershell or one line".to_string());
+            }
             if command.len() > CMD_LINE_CAP {
                 return Err(format!(
                     "command line is {} characters; cmd.exe stops near {CMD_LINE_CAP}. \
@@ -821,6 +824,8 @@ fn pick_shell(s: &str) -> &'static str {
         } else {
             "powershell"
         }
+    } else if s.trim_end().contains('\n') {
+        "powershell" // cmd.exe would run only the first line and exit 0
     } else {
         "cmd"
     }
@@ -1110,10 +1115,12 @@ fn peek_tail(c: &Capture, max_bytes: usize) -> String {
     decode_output(all)
 }
 
+type ProgressSlot = std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Progress>>>>;
+
 thread_local! {
     /// Where `collect` publishes a running command's `Progress`: set by the MCP runner thread of a
     /// call that may become a background job.
-    static PROGRESS_SLOT: std::cell::RefCell<Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Progress>>>>>> = const { std::cell::RefCell::new(None) };
+    static PROGRESS_SLOT: std::cell::RefCell<Option<ProgressSlot>> = const { std::cell::RefCell::new(None) };
 }
 
 pub(crate) fn set_progress_slot(slot: Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Progress>>>>>) {
@@ -1665,6 +1672,7 @@ mod warm {
     }
 
     /// Idle refill: a parked PowerShell that died (or was never started) is replaced before a call needs it.
+    #[cfg_attr(test, allow(dead_code))] // only the warm-up thread calls it, and tests do not start that
     pub fn top_up() {
         if ENABLED.load(Ordering::Relaxed) {
             if let Ok(mut slot) = PARKED.lock() {
@@ -1726,7 +1734,7 @@ mod warm {
             return;
         }
         std::thread::spawn(|| {
-            while PARKED.lock().map_or(false, |s| s.len() < PARKED_TARGET) {
+            while PARKED.lock().is_ok_and(|s| s.len() < PARKED_TARGET) {
                 let mut c = powershell(BOOT.to_string());
                 let env = env_of(&c);
                 let Ok(child) = c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() else {
@@ -2027,9 +2035,22 @@ mod tests {
             ("powershell -NoProfile -Command \"1+1\"", "cmd"),
             ("node -e \"console.log(1+1)\"", "cmd"),
             ("python -c \"print(1+1)\"", "cmd"),
+            ("cargo build\ncargo test", "powershell"),
+            ("cargo build\n", "cmd"),
         ] {
             assert_eq!(pick_shell(line), want, "{line}");
         }
+        assert!(build_shell("echo a\necho b", "cmd").is_err());
+    }
+
+    #[test]
+    fn bash_as_a_program_gets_its_arguments_back_unchanged() {
+        if resolve::git_bash().is_none() {
+            return;
+        }
+        let args: Vec<String> = ["-c", "printf %s \"$1\"", "_", "a \"b\" c"].map(String::from).to_vec();
+        let o = run_captured(build_command("bash", &args).unwrap(), Some(Duration::from_secs(20))).unwrap();
+        assert_eq!(o.stdout, "a \"b\" c", "stderr: {}", o.stderr);
     }
 
     #[test]
@@ -2397,8 +2418,10 @@ mod tests {
             let (pid, rest) = err.split_once(';').unwrap();
             (pid[4..].parse::<u32>().unwrap(), (code, out, rest.to_string()))
         };
+        // One time limit for the whole test: 20 retries of a 60 s wait each could hang a run for 20 minutes.
+        let overall = Instant::now() + Duration::from_secs(120);
         let wait_parked = || {
-            let deadline = Instant::now() + Duration::from_secs(60);
+            let deadline = (Instant::now() + Duration::from_secs(20)).min(overall);
             while warm::parked_pid().is_none() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -2407,14 +2430,14 @@ mod tests {
         // A parked one that went stale (its environment no longer matches) is dropped and
         // refilled, so wait and try again.
         let parked = |script: &str| {
-            for _ in 0..20 {
+            while Instant::now() < overall {
                 let pid = wait_parked();
                 let (ran_on, out) = run(script);
                 if pid == Some(ran_on) {
                     return out;
                 }
             }
-            panic!("never ran on the parked PowerShell");
+            panic!("never ran on the parked PowerShell within 120 s");
         };
         let cases = [
             "echo a; Write-Error 'e1'; echo b",

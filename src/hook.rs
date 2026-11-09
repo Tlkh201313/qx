@@ -41,9 +41,10 @@ fn respond(event: &Value) -> Option<Value> {
         return None;
     }
     let command = input.get("command")?.as_str()?;
+    let budget = tool_budget_secs(input.get("timeout").and_then(Value::as_u64));
     let mut rewritten = match tool {
-        "Bash" => rewrite_bash(command)?,
-        "PowerShell" => rewrite_powershell(command)?,
+        "Bash" => rewrite_bash_within(command, Some(budget))?,
+        "PowerShell" => rewrite_powershell(command, Some(budget))?,
         _ => return None,
     };
     let rules = Rules::load(event["cwd"].as_str().map(Path::new))?;
@@ -57,7 +58,7 @@ fn respond(event: &Value) -> Option<Value> {
         match rtk_rewrite(command) {
             Rtk::Keep => {}
             Rtk::Rewritten(line) => {
-                rewritten = rewrite_bash(&line)?;
+                rewritten = rewrite_bash_within(&line, Some(budget))?;
                 base = line;
             }
             Rtk::Unknown => return None,
@@ -72,6 +73,15 @@ fn respond(event: &Value) -> Option<Value> {
     let mut updated = input.clone();
     updated.insert("command".into(), Value::String(rewritten));
     Some(json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": updated}}))
+}
+
+/// Seconds qx may spend on a captured command: Claude kills the tree at its own timeout and whatever qx
+/// still held in its buffer is lost, so qx stops 2 s earlier and prints what it has.
+fn tool_budget_secs(timeout_ms: Option<u64>) -> u64 {
+    let ms = timeout_ms
+        .or_else(|| std::env::var("BASH_DEFAULT_TIMEOUT_MS").ok().and_then(|v| v.trim().parse().ok()))
+        .unwrap_or(120_000);
+    (ms / 1000).saturating_sub(2).max(1)
 }
 
 /// Builtins and keywords run inside the shell for free (and `cd`/`export` must stay there);
@@ -154,11 +164,17 @@ impl Scan {
 
 /// `cmd` with `qx ` before each stage qx should run, or `None` when nothing qualifies or the
 /// line uses syntax this scanner does not follow (substitutions, groups, functions).
+#[cfg(test)]
 fn rewrite_bash(cmd: &str) -> Option<String> {
-    Some(apply(cmd, bash_edits(cmd)?))
+    rewrite_bash_within(cmd, None)
 }
 
-fn bash_edits(cmd: &str) -> Option<Vec<(Range<usize>, String)>> {
+/// `budget`: the `--timeout` given to a captured stage that has none of its own.
+fn rewrite_bash_within(cmd: &str, budget: Option<u64>) -> Option<String> {
+    Some(apply(cmd, bash_edits(cmd, budget)?))
+}
+
+fn bash_edits(cmd: &str, budget: Option<u64>) -> Option<Vec<(Range<usize>, String)>> {
     let stages = bash_stages(cmd)?;
     let first = |s: &Stage| {
         // `time ( ... ) | wc` and `! { ...; }` still pipe the group as a whole.
@@ -172,7 +188,7 @@ fn bash_edits(cmd: &str) -> Option<Vec<(Range<usize>, String)>> {
         return None;
     }
     let compound = stages.iter().any(|s| first(s).is_some_and(|w| COMPOUND_WORDS.contains(&w)));
-    let edits: Vec<(Range<usize>, String)> = stages.iter().filter_map(|s| plan(cmd, s, compound)).collect();
+    let edits: Vec<(Range<usize>, String)> = stages.iter().filter_map(|s| plan(cmd, s, compound, budget)).collect();
     (!edits.is_empty()).then_some(edits)
 }
 
@@ -461,7 +477,7 @@ fn skip_heredocs(cmd: &str, mut i: usize, heredocs: &mut Vec<(String, bool)>) ->
 
 /// The edit that routes one stage through qx: `qx ` (or `qx --stream `) before its program,
 /// replacing a leading `timeout N` with qx's own `--timeout`.
-fn plan(cmd: &str, stage: &Stage, compound: bool) -> Option<(Range<usize>, String)> {
+fn plan(cmd: &str, stage: &Stage, compound: bool, budget: Option<u64>) -> Option<(Range<usize>, String)> {
     if stage.background {
         return None;
     }
@@ -511,7 +527,8 @@ fn plan(cmd: &str, stage: &Stage, compound: bool) -> Option<(Range<usize>, Strin
         return None;
     }
     let mut text = String::from(if whole { "qx " } else { "qx --stream " });
-    if let Some(secs) = timeout {
+    // Only a captured stage: a streamed one has already shown its output when Claude kills it.
+    if let Some(secs) = timeout.or(budget.filter(|_| whole)) {
         text.push_str(&format!("--timeout {secs} "));
     }
     Some((start..at, text))
@@ -663,7 +680,7 @@ const POWERSHELL_WORDS: &[&str] = &[
 
 /// `qx ` before each `;`/newline separated PowerShell statement that is one plain native command,
 /// or `None` when no statement qualifies.
-fn rewrite_powershell(cmd: &str) -> Option<String> {
+fn rewrite_powershell(cmd: &str, budget: Option<u64>) -> Option<String> {
     let mut out = String::with_capacity(cmd.len() + 8);
     let mut last = 0;
     let mut changed = false;
@@ -682,6 +699,9 @@ fn rewrite_powershell(cmd: &str) -> Option<String> {
             let at = stmt.start + (text.len() - text.trim_start().len());
             out.push_str(&cmd[last..at]);
             out.push_str("qx ");
+            if let Some(secs) = budget {
+                out.push_str(&format!("--timeout {secs} "));
+            }
             last = at;
             changed = true;
         }
@@ -1225,10 +1245,28 @@ mod tests {
         }
         assert_eq!(powershell_statements("cd x; git status").map(|v| v.len()), Some(2));
         assert!(powershell_statements("Get-Process | % { $_.Id }").is_none());
-        assert_eq!(rewrite_powershell("Get-Date; Set-Location x"), None);
-        assert_eq!(rewrite_powershell("Set-Alias git x; git status"), None);
+        assert_eq!(rewrite_powershell("Get-Date; Set-Location x", None), None);
+        assert_eq!(rewrite_powershell("Set-Alias git x; git status", None), None);
         assert_eq!(powershell_target("which git"), None);
         assert_eq!(powershell_target("nohup.exe git status"), None);
+    }
+
+    #[test]
+    fn captured_stages_stop_before_claude_kills_the_tree() {
+        // Claude's own timeout (ms) minus 2 s, at least 1 s; a stage with its own `timeout N` keeps it.
+        assert_eq!(tool_budget_secs(Some(30_000)), 28);
+        assert_eq!(tool_budget_secs(Some(1_000)), 1);
+        assert_eq!(tool_budget_secs(Some(0)), 1);
+        assert_eq!(rewrite_bash_within("cargo test", Some(28)).as_deref(), Some("qx --timeout 28 cargo test"));
+        assert_eq!(rewrite_bash_within("timeout 5 cargo test", Some(28)).as_deref(), Some("qx --timeout 5 cargo test"));
+        assert_eq!(
+            rewrite_bash_within("git status && cargo test", Some(28)).as_deref(),
+            Some("qx --timeout 28 git status && qx --timeout 28 cargo test")
+        );
+        assert_eq!(rewrite_powershell("cargo test", Some(28)).as_deref(), Some("qx --timeout 28 cargo test"));
+        // A streamed stage has shown its output already: no limit added.
+        let piped = rewrite_bash_within("cargo test | grep ok", Some(28)).unwrap();
+        assert!(!piped.contains("--timeout"), "{piped}");
     }
 
     #[test]
@@ -1321,12 +1359,12 @@ mod tests {
                 let (tool, cmd) = (it["tool"].as_str()?, it["command"].as_str()?);
                 let (out, scanned) = match tool {
                     "Bash" => (rewrite_bash(cmd), bash_stages(cmd).is_some()),
-                    "PowerShell" => (rewrite_powershell(cmd), powershell_statements(cmd).is_some()),
+                    "PowerShell" => (rewrite_powershell(cmd, None), powershell_statements(cmd).is_some()),
                     _ => return None,
                 };
                 // Each edit as one marker word, for a shell parser to check where it landed.
                 let marked = (tool == "Bash")
-                    .then(|| bash_edits(cmd))
+                    .then(|| bash_edits(cmd, None))
                     .flatten()
                     .map(|e| apply(cmd, e.into_iter().map(|(r, _)| (r, "QXMARK ".to_string())).collect()));
                 Some(json!({"tool": tool, "command": cmd, "rewritten": out, "scanned": scanned, "marked": marked}))

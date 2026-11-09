@@ -19,6 +19,7 @@ mod python;
 mod redact;
 mod resolve;
 mod setup;
+#[cfg_attr(test, allow(dead_code))] // `mcp::serve` starts it outside tests only
 mod warmup;
 
 use std::io::{IsTerminal, Write};
@@ -112,6 +113,9 @@ fn parse_num(v: Option<&String>, fallback: usize) -> usize {
 fn run_cli(args: &[String], force_raw: bool) -> i32 {
     let mut o = RunOpts::default();
     // `echo data | qx grep x`: the command reads qx's stdin. At a terminal it already does.
+    // Not in tests: they share one process, and a test run's stdin is never a terminal, so this
+    // would switch off the parked PowerShell (which refuses a call that reads stdin) for every test.
+    #[cfg(not(test))]
     exec::INHERIT_STDIN.store(!std::io::stdin().is_terminal(), std::sync::atomic::Ordering::Relaxed);
     let tty = o.stream;
     let mut explicit_stream: Option<bool> = None;
@@ -250,8 +254,8 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
             if std::env::var_os("QX_TRACE").is_some() {
                 eprintln!("[trace] split: {prog:?} {sargs:?}");
             }
-            if let Some(b) = builtin::try_exec(&prog, &sargs, o.cwd.as_deref(), &envs) {
-                return emit(b.into(), &o, &sh);
+            if let Some(out) = run_builtin(&prog, &sargs, &envs, &o) {
+                return emit(out, &o, &sh);
             }
             if let Some(code) = direct_exec(&prog, &sargs, &envs, &o, &sh) {
                 return code;
@@ -284,8 +288,8 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
             return code;
         }
         let full_env: Vec<(String, String)> = if o.compact { Vec::new() } else { vec![("QX_LS_FULL".into(), "1".into())] };
-        if let Some(b) = builtin::try_exec(program, rest, o.cwd.as_deref(), &full_env) {
-            return emit(b.into(), &o, &label);
+        if let Some(out) = run_builtin(program, rest, &full_env, &o) {
+            return emit(out, &o, &label);
         }
         match exec::build_command_at(program, rest, o.cwd.as_deref()) {
             Ok(c) => (c, label),
@@ -298,6 +302,21 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
 
     exec::apply_cwd(&mut cmd, &o.cwd);
     execute(vec![cmd], &o, &label)
+}
+
+/// A built-in runs in this process, so `--timeout` is its deadline too (a child is killed by it).
+fn run_builtin(program: &str, args: &[String], envs: &[(String, String)], o: &RunOpts) -> Option<exec::Outcome> {
+    exec::set_deadline(o.timeout.map(|t| Instant::now() + t));
+    let b = builtin::try_exec(program, args, o.cwd.as_deref(), envs);
+    let stopped = exec::should_stop();
+    exec::set_deadline(None);
+    let mut out: exec::Outcome = b?.into();
+    // A built-in that finished its work right at the deadline did the work: it is reported done.
+    if stopped && out.code != 0 {
+        out.timed_out = true;
+        out.code = 124;
+    }
+    Some(out)
 }
 
 /// `npm run/test/start` and local-bin `npx` without npm's ~100 ms CLI startup.
@@ -419,7 +438,8 @@ fn emit(out: exec::Outcome, o: &RunOpts, label: &str) -> i32 {
             // unless the caller asked for a cut with --max-lines, --head or --tail.
             None if !o.limited && claude_shows_whole(so.len() + se.len()) => (std::mem::take(&mut so), std::mem::take(&mut se), false, ""),
             None => {
-                let (a, cut) = compact::compact(&so, o.max_lines, o.head, o.tail);
+                let (max, head, tail) = if o.limited { (o.max_lines, o.head, o.tail) } else { digest::plain_budget(label, (o.max_lines, o.head, o.tail)) };
+                let (a, cut) = compact::compact(&so, max, head, tail);
                 let (b, cut_err) = compact::compact(&se, o.max_lines.min(120), o.head.min(50), o.tail.min(40));
                 (a, b, cut | cut_err, "")
             }
@@ -707,7 +727,10 @@ SAFETY GATE
   QX_NODE_CACHE=off          disable Node's compile cache
   QX_PYTHON_FAST=1|off       default skips startup hooks keeping system certs; 1 drops certs (fastest), off disables
   QX_PS_PROFILE=1            keep the PowerShell profile (qx adds -NoProfile by default)
-  QX_MCP_WORKERS=N           parallel MCP tool calls (default 4)
+  QX_MCP_WORKERS=N           parallel MCP processes (default 8, max 32)
+  QX_MCP_QUEUE=N             calls allowed to wait for a slot (default 64, max 1024)
+  QX_WARM=off                no startup warm-up; QX_PS_WARM=off: no parked PowerShell
+  QX_INDEX=off               no workspace file index for fs glob/grep
   QX_FS_THREADS=N            fs grep scan threads (default CPUs/2, max 8)
   QX_TRACE=1                 print phase timings and the -c split to stderr
 
@@ -736,6 +759,7 @@ EXAMPLES
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
@@ -748,6 +772,21 @@ mod tests {
         assert_eq!(run_cli(&s(&["--capture", "-c", "exit 3", "--cwd", &missing.to_string_lossy()]), false), 2);
         assert_eq!(run_cli(&s(&["--capture", "-c", "exit 0", "stray"]), false), 2);
         assert_eq!(run_cli(&s(&["--capture", "-c", "exit 3"]), false), 3);
+    }
+
+    #[test]
+    fn a_builtin_run_from_the_command_line_stops_at_the_timeout_flag() {
+        let d = std::env::temp_dir().join("qx-cli-builtin-timeout-test");
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("a")).unwrap();
+        fs::write(d.join("a").join("f"), "x").unwrap();
+        let cwd = d.to_string_lossy().to_string();
+        assert_eq!(run_cli(&s(&["--capture", "--cwd", &cwd, "cp", "-r", "a", "kept"]), false), 0);
+        assert!(d.join("kept").join("f").exists());
+        // A timeout already over: the copy stops before it starts instead of running without a limit.
+        assert_eq!(run_cli(&s(&["--capture", "--timeout", "0", "--cwd", &cwd, "cp", "-r", "a", "never"]), false), 124);
+        assert!(!d.join("never").join("f").exists());
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
