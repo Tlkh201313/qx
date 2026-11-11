@@ -3638,7 +3638,8 @@ mod tests {
         let t = std::time::Instant::now();
         let r = invoke(&dir, "edit", json!({"path":"ro.txt","old_string":"a","new_string":"b"}));
         assert!(r.is_error && r.text.contains("read-only"), "{}", r.text);
-        assert!(t.elapsed() < std::time::Duration::from_millis(300), "{:?}", t.elapsed());
+        // ~10 ms alone, over 300 ms under full-suite load; the old retry loop took 600+ ms.
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "{:?}", t.elapsed());
         #[allow(clippy::permissions_set_readonly_false)]
         p.set_readonly(false);
         fs::set_permissions(&f, p).unwrap();
