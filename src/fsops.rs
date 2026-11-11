@@ -325,6 +325,7 @@ fn run_batch(items: &[Value]) -> Reply {
     let mut text = String::new();
     let mut results = Vec::with_capacity(n);
     let (mut failed, mut stopped) = (0usize, false);
+    let mut capped: Vec<usize> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         let op = op_of(item);
         let what = path_arg(item)
@@ -342,6 +343,7 @@ fn run_batch(items: &[Value]) -> Reply {
         if text.len() > MAX_BATCH_BYTES {
             text.push_str("skipped: batch output cap reached; ask for the rest in another call\n\n");
             results.push(json!({ "op": op, "path": what, "ok": false, "skipped": true }));
+            capped.push(i + 1);
             failed += 1;
             continue;
         }
@@ -356,6 +358,11 @@ fn run_batch(items: &[Value]) -> Reply {
         results.push(json!({ "op": op, "path": what, "ok": !r.is_error }));
         text.push_str(r.text.trim_end());
         text.push_str("\n\n");
+    }
+    // The reply may be cut at the client cap, taking the per-op skip lines with it: say it first.
+    if let (Some(a), Some(b)) = (capped.first(), capped.last()) {
+        let ops = if a == b { format!("op {a}") } else { format!("ops {a}-{b}") };
+        text.insert_str(0, &format!("[qx] {ops} of {n} not run (batch output cap); ask for them in another call\n\n"));
     }
     Reply {
         text: text.trim_end().to_string(),
@@ -691,6 +698,18 @@ impl Root {
                     ));
                 }
             }
+        }
+        // The places `run` refuses to write (system folders, the startup folder, .ssh): the same rule,
+        // so `fs` is not the way around it. The guard compares lowercase `\` paths.
+        let mut s = path.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            s = rest.to_string();
+        }
+        if let Some(what) = crate::guard::write_protected(s.trim_end_matches('\\')) {
+            return Err(FsError::new(
+                "FS_PROTECTED",
+                format!("refusing to modify {what}: {}", path.display()),
+            ));
         }
         Ok(())
     }
@@ -1057,6 +1076,10 @@ fn atomic_replace(path: &Path, bytes: &[u8], expected: Version) -> Result<(), Fs
                 path.display()
             ),
         ));
+    }
+    // Read-only fails with the same error 5 a brief lock gives; say so instead of retrying for 600 ms.
+    if md.permissions().readonly() {
+        return Err(FsError::new("FS_IO", format!("cannot modify \"{}\": the file is read-only", path.display())));
     }
     // An editor, indexer or virus scanner may hold the file for a moment without delete sharing.
     let mut attempt = 0;
@@ -1769,6 +1792,24 @@ fn carry_over_encoding<'a>(before: &[u8], content: &'a str) -> Result<std::borro
 
 fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
     let pattern = req_str(args, "pattern")?;
+    let reply = glob_once(root, args, pattern)?;
+    // `app/[id]/*.tsx` names a folder called `[id]`, which as a pattern is a one-letter class. When
+    // that finds nothing, the brackets of the folder part are tried as plain characters.
+    if reply.structured["count"] == 0 {
+        if let Some((dirs, file)) = pattern.rsplit_once('/') {
+            if dirs.contains('[') {
+                let literal = format!("{}/{file}", dirs.replace('[', "[[]"));
+                let retry = glob_once(root, args, &literal)?;
+                if retry.structured["count"] != 0 {
+                    return Ok(retry);
+                }
+            }
+        }
+    }
+    Ok(reply)
+}
+
+fn glob_once(root: &Root, args: &Value, pattern: &str) -> Result<Reply, FsError> {
     if pattern.starts_with('!') {
         return Err(FsError::new(
             "FS_UNSUPPORTED",
@@ -1984,7 +2025,10 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     )?;
     // `context`, `-A`, `-B` and `-C` are grep and Claude Code's own names: models send them unprompted,
     // so they are honoured though the schema does not advertise them.
-    let ctx = |k: &str| args.get(k).and_then(Value::as_u64).map_or(0, |v| (v as usize).min(MAX_GREP_CONTEXT));
+    let ctx = |k: &str| {
+        let n = args.get(k).and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())));
+        n.map_or(0, |v| (v as usize).min(MAX_GREP_CONTEXT))
+    };
     let c = ctx("context").max(ctx("-C"));
     let (before, after) = (c.max(ctx("-B")), c.max(ctx("-A")));
 
@@ -2021,9 +2065,12 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     }
     // No sort here: matching files are sorted by path below, which fixes the output order.
     if let Some(patterns) = &include_patterns {
+        // Below a folder, `include` is relative to it. A single file has nothing below it: its path from
+        // the workspace is what `include` is then matched against.
+        let rel_to = if md.is_file() { root.cwd.as_path() } else { root_path.as_path() };
         files.retain(|(p, _)| {
             let rel = p
-                .strip_prefix(&root_path)
+                .strip_prefix(rel_to)
                 .unwrap_or(p)
                 .to_string_lossy()
                 .replace('\\', "/");
@@ -2106,8 +2153,7 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
         }
         out.push('\n');
         out.push_str(&root.display(&sf.path));
-        let text = (before + after > 0).then(|| fs::read(&sf.path).ok().map(|b| decode_text(&b).to_string())).flatten();
-        let lines: Vec<&str> = text.as_deref().map(|t| t.split('\n').map(|l| l.trim_end_matches('\r')).collect()).unwrap_or_default();
+        let lines = if before + after > 0 { context_lines(&sf.path, &sf.matches, before, after, max_line_chars) } else { HashMap::new() };
         let mut next = 1usize; // the first line of this file not yet printed
         for (i, m) in sf.matches.iter().enumerate() {
             if shown >= max_matches {
@@ -2118,7 +2164,7 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
                 out.push_str("\n--");
             }
             for n in from..m.line {
-                if let Some(l) = lines.get(n - 1) {
+                if let Some(l) = lines.get(&n) {
                     out.push('\n');
                     push_usize(&mut out, n);
                     out.push_str("- ");
@@ -2132,14 +2178,18 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
             shown += 1;
             next = m.line + 1;
             let stop = sf.matches.get(i + 1).map_or(usize::MAX, |n| n.line);
-            let last = (m.line + after).min(stop.saturating_sub(1)).min(lines.len());
+            let last = (m.line + after).min(stop.saturating_sub(1));
+            let mut printed_to = next;
             for n in next..=last {
+                // Past the end of the file there is no line: the window simply has none.
+                let Some(l) = lines.get(&n) else { break };
                 out.push('\n');
                 push_usize(&mut out, n);
                 out.push_str("- ");
-                push_clipped(&mut out, lines[n - 1], max_line_chars);
+                push_clipped(&mut out, l, max_line_chars);
+                printed_to = n + 1;
             }
-            next = next.max(last + 1);
+            next = printed_to;
         }
     }
     if total == 0 {
@@ -2530,6 +2580,64 @@ fn scan_stream(path: &Path, matcher: &Matcher, fast: Option<&regex::Regex>, max_
             sf.matches.push(Match { line: idx, text: clip_match(line, max_line_chars, matcher) });
         }
     }
+}
+
+/// The lines around a file's matches, by line number: only those, never the whole file. A file over
+/// `MAX_GREP_FILE_BYTES` is streamed (as `scan_stream` read it) and the read stops at the last wanted line.
+fn context_lines(path: &Path, matches: &[Match], before: usize, after: usize, max_chars: usize) -> HashMap<usize, String> {
+    use std::io::{BufReader, Cursor, Read};
+    let ranges: Vec<(usize, usize)> = matches.iter().map(|m| (m.line.saturating_sub(before).max(1), m.line + after)).collect();
+    let Ok(mut f) = fs::File::open(path) else { return HashMap::new() };
+    if f.metadata().is_ok_and(|m| m.len() > MAX_GREP_FILE_BYTES) {
+        return collect_lines(BufReader::with_capacity(1 << 20, f), &ranges, max_chars);
+    }
+    let mut bytes = Vec::new();
+    if f.read_to_end(&mut bytes).is_err() {
+        return HashMap::new();
+    }
+    let text = decode_text(&bytes);
+    collect_lines(Cursor::new(text.as_bytes()), &ranges, max_chars)
+}
+
+/// Lines `(first, last)`, 1-based and both included, read from `r` and kept by number; reading stops after
+/// the last wanted line. `ranges` ascend in both ends. A kept line is cut to one char past `max_chars`
+/// (`push_clipped` then says it was cut), so a huge line is never held whole.
+fn collect_lines(mut r: impl std::io::BufRead, ranges: &[(usize, usize)], max_chars: usize) -> HashMap<usize, String> {
+    let mut out = HashMap::new();
+    let Some(last) = ranges.iter().map(|r| r.1).max() else { return out };
+    let keep = (max_chars + 1) * 4;
+    let (mut ri, mut buf) = (0usize, Vec::new());
+    for n in 1..=last {
+        buf.clear();
+        let mut any = false;
+        loop {
+            let (done, used) = match r.fill_buf() {
+                Ok([]) | Err(_) => break,
+                Ok(b) => {
+                    any = true;
+                    let (upto, done) = b.iter().position(|&c| c == b'\n').map_or((b.len(), false), |i| (i + 1, true));
+                    buf.extend_from_slice(&b[..upto.min(keep.saturating_sub(buf.len()))]);
+                    (done, upto)
+                }
+            };
+            r.consume(used);
+            if done {
+                break;
+            }
+        }
+        if !any {
+            break;
+        }
+        while ri < ranges.len() && ranges[ri].1 < n {
+            ri += 1;
+        }
+        if ri < ranges.len() && ranges[ri].0 <= n {
+            let line = String::from_utf8_lossy(&buf);
+            let line = line.trim_end_matches(['\n', '\r']);
+            out.insert(n, line.chars().take(max_chars + 1).collect());
+        }
+    }
+    out
 }
 
 /// What a search left out on purpose, so "no matches" is never mistaken for "searched everywhere".
@@ -3066,20 +3174,66 @@ fn skip_dir(name: &str, all: bool) -> bool {
 
 type IgnoredDirs = std::sync::Arc<std::collections::HashSet<String>>;
 
+static IGNORED_CACHE: Mutex<Vec<(PathBuf, Instant, IgnoredDirs)>> = Mutex::new(Vec::new());
+
+/// Forget what git said about ignored folders: an ignore rule changed, so the next walk asks again.
+pub(crate) fn drop_ignored_cache() {
+    if let Ok(mut cache) = IGNORED_CACHE.lock() {
+        cache.clear();
+    }
+}
+
+/// Whether git ignores the existing folder `rel` below `root`. `None` when git is missing, `root` is no
+/// repository, or git takes over three seconds: the caller then has no answer to rely on.
+pub(crate) fn git_ignores_dir(root: &Path, rel: &str) -> Option<bool> {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new("git");
+    cmd.args(["-c", "core.fsmonitor=false", "-C"])
+        .arg(root)
+        .args(["check-ignore", "-q", "--"])
+        .arg(rel)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = cmd.spawn().ok()?;
+    let end = Instant::now() + std::time::Duration::from_secs(3);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if Instant::now() < end => std::thread::sleep(std::time::Duration::from_millis(2)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    match status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
 /// Folders below `root` that git ignores (`scratch`, `.worktrees`, `a/out`: `/`-separated, relative to
 /// `root`), so a search does not read old copies and build output that `skip_dir` has no name for.
 /// Git is asked once per root per half minute. Empty when git is missing, `root` is no repository,
 /// `root` is itself ignored (it was asked for by name), or git takes over three seconds.
 pub(crate) fn git_ignored_dirs(root: &Path) -> IgnoredDirs {
-    static CACHE: Mutex<Vec<(PathBuf, Instant, IgnoredDirs)>> = Mutex::new(Vec::new());
     const FRESH: std::time::Duration = std::time::Duration::from_secs(30);
-    if let Ok(cache) = CACHE.lock() {
+    if let Ok(cache) = IGNORED_CACHE.lock() {
         if let Some((_, _, hit)) = cache.iter().find(|(p, at, _)| p == root && at.elapsed() < FRESH) {
             return hit.clone();
         }
     }
     let found: IgnoredDirs = std::sync::Arc::new(ask_git_for_ignored_dirs(root));
-    if let Ok(mut cache) = CACHE.lock() {
+    if let Ok(mut cache) = IGNORED_CACHE.lock() {
         cache.retain(|(p, at, _)| p != root && at.elapsed() < FRESH);
         if cache.len() >= 8 {
             cache.remove(0);
@@ -3094,7 +3248,8 @@ fn ask_git_for_ignored_dirs(root: &Path) -> std::collections::HashSet<String> {
     use std::process::{Command, Stdio};
     let none = std::collections::HashSet::new();
     let mut cmd = Command::new("git");
-    cmd.arg("-C")
+    // `core.fsmonitor` is a command the searched repo names in its own config: not one to run for a search.
+    cmd.args(["-c", "core.fsmonitor=false", "-C"])
         .arg(root)
         .args(["ls-files", "-z", "-o", "-i", "--exclude-standard", "--directory"])
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -3455,6 +3610,39 @@ mod tests {
             }
         }
         call(&args)
+    }
+
+    #[test]
+    fn a_batch_cut_at_the_output_cap_names_the_ops_it_did_not_run_first() {
+        let dir = tmp("batch-cap");
+        fs::write(dir.join("big.txt"), ("x".repeat(60) + "\n").repeat(800)).unwrap();
+        let mut ops = vec![json!({"op":"read","path":"big.txt"})];
+        for i in 0..12 {
+            fs::write(dir.join(format!("e{i}.txt")), "a\n").unwrap();
+            ops.push(json!({"op":"edit","path":format!("e{i}.txt"),"old_string":"a","new_string":"b"}));
+        }
+        let r = call(&json!({"cwd": dir.to_string_lossy(), "ops": ops}));
+        assert!(r.text.starts_with("[qx] ops 2-13 of 13 not run (batch output cap)"), "{}", &r.text[..200]);
+        assert_eq!(fs::read_to_string(dir.join("e0.txt")).unwrap(), "a\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editing_a_read_only_file_says_so_at_once() {
+        let dir = tmp("readonly");
+        let f = dir.join("ro.txt");
+        fs::write(&f, "a\n").unwrap();
+        let mut p = fs::metadata(&f).unwrap().permissions();
+        p.set_readonly(true);
+        fs::set_permissions(&f, p.clone()).unwrap();
+        let t = std::time::Instant::now();
+        let r = invoke(&dir, "edit", json!({"path":"ro.txt","old_string":"a","new_string":"b"}));
+        assert!(r.is_error && r.text.contains("read-only"), "{}", r.text);
+        assert!(t.elapsed() < std::time::Duration::from_millis(300), "{:?}", t.elapsed());
+        #[allow(clippy::permissions_set_readonly_false)]
+        p.set_readonly(false);
+        fs::set_permissions(&f, p).unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4476,13 +4664,148 @@ mod tests {
                     want.extend(p);
                 }
                 want.sort();
-                let (snap, _) = crate::index::snapshot(&canon).expect("index stays valid");
+                // None is a correct answer (the walk serves): parallel tests can evict this root
+                // (MAX_ROOTS) or a watcher overflow can mark it broken. Rebuild and compare that.
+                let (snap, _) = crate::index::snapshot(&canon)
+                    .or_else(|| {
+                        crate::index::ensure(&canon);
+                        crate::index::snapshot(&canon)
+                    })
+                    .expect("index answers after a rebuild");
                 let got: Vec<String> = snap.files.iter().map(|e| e.rel.clone()).collect();
                 assert_eq!(got, want, "after step {step}");
             }
         }
         let _ = fs::remove_dir_all(&dir);
     }
+    #[cfg(windows)]
+    #[test]
+    fn a_file_named_like_a_generated_folder_is_indexed_and_its_deletion_follows() {
+        let dir = tmp("index-vendor-file");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/a.rs"), "").unwrap();
+        crate::index::ensure(&dir);
+        let canon = fs::canonicalize(&dir).unwrap();
+        let rels = || -> Vec<String> {
+            let (snap, _) = crate::index::snapshot(&canon).expect("index stays valid");
+            snap.files.iter().map(|e| e.rel.clone()).collect()
+        };
+        fs::write(dir.join("vendor"), "x").unwrap();
+        fs::write(dir.join("src/dist"), "x").unwrap();
+        assert_eq!(rels(), ["src/a.rs", "src/dist", "vendor"]);
+        fs::remove_file(dir.join("vendor")).unwrap();
+        assert_eq!(rels(), ["src/a.rs", "src/dist"]);
+        // A folder of that name is still left out, with what it holds.
+        fs::create_dir_all(dir.join("vendor")).unwrap();
+        fs::write(dir.join("vendor/x.rs"), "").unwrap();
+        assert_eq!(rels(), ["src/a.rs", "src/dist"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deleting_by_a_short_8_3_name_does_not_leave_the_file_in_the_index() {
+        let dir = tmp("index-short");
+        fs::write(dir.join("a.rs"), "").unwrap();
+        fs::write(dir.join("longfilename.txt"), "").unwrap();
+        let short = dir.join("LONGFI~1.TXT");
+        if !short.exists() {
+            let _ = fs::remove_dir_all(&dir);
+            return; // 8.3 names are off on this volume: nothing to check
+        }
+        crate::index::ensure(&dir);
+        let canon = fs::canonicalize(&dir).unwrap();
+        assert!(crate::index::snapshot(&canon).is_some(), "an index was built");
+        fs::remove_file(&short).unwrap();
+        // The kernel reports the short name, which names no entry: the index is dropped, not left wrong.
+        let r = invoke(&dir, "glob", json!({"pattern": "**/*.txt"}));
+        assert!(!r.text.contains("longfilename"), "{}", r.text);
+        crate::index::ensure(&dir);
+        let (snap, _) = crate::index::snapshot(&canon).expect("rebuilt");
+        let rels: Vec<&str> = snap.files.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(rels, ["a.rs"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_index_leaves_out_what_git_ignores_also_a_folder_made_or_ignored_after_it_started() {
+        let dir = tmp("index-gitignore");
+        if !git_init(&dir) {
+            let _ = fs::remove_dir_all(&dir);
+            return; // no git on this machine: nothing to check
+        }
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join(".gitignore"), "gen/\n").unwrap();
+        fs::write(dir.join("src/a.rs"), "needle\n").unwrap();
+        crate::index::ensure(&dir);
+        let canon = fs::canonicalize(&dir).unwrap();
+        assert!(crate::index::snapshot(&canon).is_some(), "an index was built");
+        let grep = || invoke(&dir, "grep", json!({"pattern": "needle"})).text;
+        // A folder git ignores, made after the index started.
+        fs::create_dir_all(dir.join("gen/deep")).unwrap();
+        fs::write(dir.join("gen/deep/x.rs"), "needle\n").unwrap();
+        let r = grep();
+        assert!(r.contains("src/a.rs") && !r.contains("gen/deep/x.rs"), "{r}");
+        // A folder that is searched until the ignore file is edited.
+        fs::create_dir_all(dir.join("late")).unwrap();
+        fs::write(dir.join("late/y.rs"), "needle\n").unwrap();
+        assert!(grep().contains("late/y.rs"));
+        fs::write(dir.join(".gitignore"), "gen/\nlate/\n").unwrap();
+        let r = grep();
+        assert!(r.contains("src/a.rs") && !r.contains("late/y.rs"), "{r}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The indexed `glob` and `grep` answer what a walk of the disk finds, after the changes the index
+    /// has to read from names alone: a file called `vendor`, a short 8.3 name, a folder git ignores.
+    #[cfg(windows)]
+    #[test]
+    fn indexed_glob_and_grep_equal_a_walk_after_changes_to_names_and_ignore_rules() {
+        let dir = tmp("index-vs-walk");
+        if !git_init(&dir) {
+            let _ = fs::remove_dir_all(&dir);
+            return; // no git on this machine: nothing to check
+        }
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join(".gitignore"), "gen/\n").unwrap();
+        fs::write(dir.join("src/a.rs"), "needle\n").unwrap();
+        crate::index::ensure(&dir);
+        let canon = fs::canonicalize(&dir).unwrap();
+        assert!(crate::index::snapshot(&canon).is_some(), "an index was built");
+        let all = [
+            "src/a.rs", "vendor", "src/dist", "gen/x.rs", "late/y.rs", "longfilename.txt", "lib/z.rs",
+        ];
+        fs::write(dir.join("vendor"), "needle\n").unwrap();
+        fs::write(dir.join("src/dist"), "needle\n").unwrap();
+        fs::create_dir_all(dir.join("gen")).unwrap();
+        fs::write(dir.join("gen/x.rs"), "needle\n").unwrap();
+        fs::create_dir_all(dir.join("late")).unwrap();
+        fs::write(dir.join("late/y.rs"), "needle\n").unwrap();
+        fs::write(dir.join("longfilename.txt"), "needle\n").unwrap();
+        fs::create_dir_all(dir.join("lib")).unwrap();
+        fs::write(dir.join("lib/z.rs"), "needle\n").unwrap();
+        fs::write(dir.join(".gitignore"), "gen/\nlate/\n").unwrap();
+        fs::remove_file(dir.join("src/a.rs")).unwrap();
+        let short = dir.join("LONGFI~1.TXT");
+        fs::remove_file(if short.exists() { short } else { dir.join("longfilename.txt") }).unwrap();
+
+        let globbed = invoke(&dir, "glob", json!({"pattern": "**/*"})).text;
+        let mut got: Vec<&str> = globbed.lines().filter(|l| all.contains(l)).collect();
+        got.sort();
+        let (parts, _) = walk_live(&canon, false, Vec::<String>::new, |v, p, _| {
+            v.push(p.strip_prefix(&canon).unwrap().to_string_lossy().replace('\\', "/"));
+        });
+        let mut want: Vec<String> = parts.into_iter().flatten().filter(|r| !r.starts_with('.')).collect();
+        want.sort();
+        assert_eq!(got, want, "glob: {globbed}");
+        let grepped = invoke(&dir, "grep", json!({"pattern": "needle"})).text;
+        for f in all {
+            assert_eq!(grepped.contains(&format!("{f}:")) || grepped.contains(&format!("{f}\n")), want.iter().any(|w| w == f), "{f} in grep: {grepped}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore = "micro-benchmark: cargo test --release bench_fs -- --ignored --nocapture"]
     fn bench_fs() {
@@ -4728,4 +5051,147 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let _ = fs::remove_dir_all(&dir);
-    }}
+    }
+
+    // ---- batch 4 / FS7 ----
+
+    #[test]
+    fn git_ignored_dirs_does_not_run_the_repos_fsmonitor_command() {
+        let dir = tmp("fsmonitor");
+        if !git_init(&dir) {
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+        let marker = dir.join("MARKER.txt");
+        let hook = format!("echo ran > \"{}\"", marker.to_string_lossy().replace('\\', "/"));
+        git(&["config", "core.fsmonitor", &hook]);
+        fs::write(dir.join("b.txt"), "x\n").unwrap();
+        let _ = git_ignored_dirs(&dir);
+        assert!(!marker.exists(), "the searched repo's core.fsmonitor command ran");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_of_one_file_matches_include_against_its_path() {
+        let dir = tmp("grep-file-include");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/one.rs"), "needle\n").unwrap();
+        for inc in ["**/*.rs", "src/*.rs", "*.rs", "src/one.rs"] {
+            let r = invoke(&dir, "grep", json!({"pattern":"needle","path":"src/one.rs","include":inc}));
+            assert!(r.text.contains("Found 1 match"), "include {inc}: {}", r.text);
+        }
+        let r = invoke(&dir, "grep", json!({"pattern":"needle","path":"src/one.rs","include":"**/*.txt"}));
+        assert!(r.text.contains("No matches"), "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_context_given_as_a_string_is_honoured() {
+        let dir = tmp("grep-ctx-string");
+        fs::write(dir.join("a.txt"), "one\nneedle\nthree\n").unwrap();
+        let num = invoke(&dir, "grep", json!({"pattern":"needle","context":1}));
+        let txt = invoke(&dir, "grep", json!({"pattern":"needle","context":"1"}));
+        assert!(num.text.contains("1- one") && num.text.contains("3- three"), "{}", num.text);
+        assert_eq!(num.text, txt.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_brackets_in_a_folder_name_are_literal_when_nothing_else_matches() {
+        let dir = tmp("glob-brackets");
+        fs::create_dir_all(dir.join("app/[id]")).unwrap();
+        fs::write(dir.join("app/[id]/page.tsx"), "").unwrap();
+        let r = invoke(&dir, "glob", json!({"pattern":"app/[id]/*.tsx"}));
+        assert!(r.text.contains("app/[id]/page.tsx"), "{}", r.text);
+        assert_eq!(r.structured["count"], 1, "{}", r.text);
+        // A real class still works and is not reinterpreted.
+        fs::create_dir_all(dir.join("app/i")).unwrap();
+        fs::write(dir.join("app/i/x.tsx"), "").unwrap();
+        let r = invoke(&dir, "glob", json!({"pattern":"app/[id]/*.tsx"}));
+        assert!(r.text.contains("app/i/x.tsx") && !r.text.contains("page.tsx"), "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct CountingReader<R> {
+        inner: R,
+        read: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+    impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.set(self.read.get() + n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn context_windows_come_from_a_stream_that_stops_at_the_last_wanted_line() {
+        let text: String = (1..=200_000).map(|i| format!("line {i} padding padding padding\n")).collect();
+        let total = text.len();
+        let read = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let r = std::io::BufReader::with_capacity(8192, CountingReader { inner: text.as_bytes(), read: read.clone() });
+        let got = collect_lines(r, &[(99, 103), (101, 105)], 2000);
+        let mut keys: Vec<_> = got.keys().copied().collect();
+        keys.sort();
+        assert_eq!(keys, (99..=105).collect::<Vec<_>>());
+        assert_eq!(got[&100], "line 100 padding padding padding");
+        assert!(read.get() < total / 100, "read {} of {total} bytes", read.get());
+    }
+
+    #[test]
+    fn grep_context_on_a_streamed_file_gives_the_same_lines() {
+        let dir = tmp("grep-ctx-stream");
+        let mut text = String::new();
+        for i in 1..=200_000 {
+            if i == 150_000 {
+                text.push_str("UNIQUE_NEEDLE_LINE\n");
+            } else {
+                text.push_str(&format!("filler line number {i} with some padding text\n"));
+            }
+        }
+        assert!(text.len() as u64 > MAX_GREP_FILE_BYTES);
+        fs::write(dir.join("big.log"), &text).unwrap();
+        let r = invoke(&dir, "grep", json!({"pattern":"UNIQUE_NEEDLE_LINE","path":"big.log","context":2}));
+        assert!(r.text.contains("149998- filler line number 149998 with some padding text\n"), "{}", r.text);
+        assert!(r.text.contains("149999- filler line number 149999"), "{}", r.text);
+        assert!(r.text.contains("150000: UNIQUE_NEEDLE_LINE"), "{}", r.text);
+        assert!(r.text.contains("150001- filler line number 150001"), "{}", r.text);
+        assert!(r.text.contains("150002- filler line number 150002"), "{}", r.text);
+        assert!(!r.text.contains("150003-") && !r.text.contains("149997-"), "{}", r.text);
+        // A match on the last line has no after-context and does not fail.
+        fs::write(dir.join("tail.log"), format!("{text}UNIQUE_NEEDLE_TAIL\n")).unwrap();
+        let r = invoke(&dir, "grep", json!({"pattern":"UNIQUE_NEEDLE_TAIL","path":"tail.log","context":2}));
+        assert!(r.text.contains("200001: UNIQUE_NEEDLE_TAIL") && r.text.contains("200000- filler"), "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_write_and_edit_refuse_the_places_the_guard_protects() {
+        let dir = tmp("fs-protected");
+        fs::create_dir_all(dir.join(".ssh")).unwrap();
+        fs::create_dir_all(dir.join("Start Menu/Programs/Startup")).unwrap();
+        fs::write(dir.join(".ssh/known"), "old\n").unwrap();
+        for rel in [".ssh/authorized_keys", "Start Menu/Programs/Startup/a.cmd", "Start Menu\\Programs\\Startup\\b.cmd", "sub/.ssh/id"] {
+            let r = invoke(&dir, "write", json!({"path":rel,"content":"x\n"}));
+            assert!(r.is_error && r.structured["code"] == "FS_PROTECTED", "{rel}: {}", r.text);
+            assert!(!dir.join(rel).exists(), "{rel} was created");
+        }
+        assert!(!dir.join("sub").exists(), "a refused write left a folder behind");
+        let r = invoke(&dir, "edit", json!({"path":".ssh/known","old_string":"old","new_string":"new"}));
+        assert!(r.is_error && r.structured["code"] == "FS_PROTECTED", "{}", r.text);
+        assert_eq!(fs::read_to_string(dir.join(".ssh/known")).unwrap(), "old\n");
+        // The protected-path rules themselves, without touching a real system folder.
+        let root = Root { cwd: dir.clone() };
+        let sys = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        let e = root.check_mutable(&Path::new(&sys).join("System32").join("x.dll")).unwrap_err();
+        assert_eq!(e.code, "FS_PROTECTED");
+        let e = root.check_mutable(&dir.join("owner/.git/hooks/pre-commit")).unwrap_err();
+        assert_eq!(e.code, "FS_PROTECTED");
+        // A normal path still writes.
+        let r = invoke(&dir, "write", json!({"path":"src/ok.txt","content":"fine\n"}));
+        assert!(!r.is_error, "{}", r.text);
+        assert_eq!(fs::read_to_string(dir.join("src/ok.txt")).unwrap(), "fine\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

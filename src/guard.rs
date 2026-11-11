@@ -229,7 +229,31 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
         }
         "git" => check_git(args, &mut d),
         "find" => check_find(args, cwd, &mut d),
-        "cp" | "copy" | "mv" | "move" | "copy-item" | "cpi" | "move-item" | "mi" => {
+        // `forfiles /p DIR /m MASK /c "cmd /c del @path"` runs the payload once per file under DIR.
+        "forfiles" => {
+            let (mut dir, mut mask, mut payload) = (".".to_string(), "*".to_string(), None);
+            let mut it = args.iter();
+            while let Some(a) = it.next() {
+                let slot = match op(a).as_str() {
+                    "p" => &mut dir,
+                    "m" => &mut mask,
+                    "c" => {
+                        payload = it.next().cloned();
+                        continue;
+                    }
+                    _ => continue,
+                };
+                if let Some(v) = it.next() {
+                    *slot = v.clone();
+                }
+            }
+            if let Some(p) = payload {
+                let target = format!("\"{}\\{mask}\"", dir.trim_end_matches(['\\', '/']));
+                let p = ["@path", "@relpath", "@file", "@fname"].iter().fold(p, |p, v| replace_ci(&p, v, &target));
+                merge(&mut d, check_shell_mode(m, &p, cwd));
+            }
+        }
+        "cp" | "copy" | "mv" | "move" | "copy-item" | "cpi" | "move-item" | "mi" | "ren" | "rename" | "rename-item" | "rni" => {
             // cmd's `copy`/`move` take `/Y`-style switches after the destination; for `cp`/`mv`
             // `/c` is a Git Bash drive root, so only these two names skip them.
             let cmd_style = matches!(name.as_str(), "copy" | "move");
@@ -242,13 +266,15 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
                 deny_if_protected(dir, cwd, &mut d);
             }
             // Moving a protected path away destroys it just like deleting it (cmd's `/Y` is a switch).
-            if matches!(name.as_str(), "mv" | "move" | "move-item" | "mi") {
+            let rename = matches!(name.as_str(), "ren" | "rename" | "rename-item" | "rni");
+            if rename || matches!(name.as_str(), "mv" | "move" | "move-item" | "mi") {
                 let pos: Vec<&String> = ops
                     .into_iter()
                     .filter(|a| !((a.starts_with('/') && a.len() == 2) || (cmd_style && cmd_switch(a))))
                     .collect();
                 // With `-t DIR` every operand is a source; otherwise the last one is the destination.
-                let srcs = if dirs.is_empty() { pos.split_last().map_or(&[][..], |(_, s)| s) } else { &pos[..] };
+                // A rename's new name is a bare name (and `-NewName` may come first): judge every operand.
+                let srcs = if rename || !dirs.is_empty() { &pos[..] } else { pos.split_last().map_or(&[][..], |(_, s)| s) };
                 for s in srcs {
                     if let Some(r) = protected(&absolutize(s, cwd), cwd) {
                         d.deny(format!("refusing to move {r}: {s}"));
@@ -322,12 +348,15 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
         | "mkfs.ext4"
         | "fdisk"
         | "parted"
-        | "bcdedit"
         | "clear-disk"
         | "format-volume"
         | "initialize-disk"
         | "remove-partition" => {
             d.deny(format!("{name} can destroy disks or boot configuration"));
+        }
+        // No argument, `/enum` and `/v` only list the boot entries.
+        "bcdedit" if !args.iter().all(|a| matches!(a.to_ascii_lowercase().as_str(), "/enum" | "/v" | "all" | "active")) => {
+            d.deny("bcdedit can destroy disks or boot configuration");
         }
         "new-localuser" | "remove-localuser" | "add-localgroupmember" | "enable-psremoting"
         | "winrm" => {
@@ -393,11 +422,12 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
                 d.warn("recursively deletes S3 objects");
             }
         }
+        "shutdown" if args.iter().any(|a| a.eq_ignore_ascii_case("/a") || a.eq_ignore_ascii_case("-a")) => {} // aborts one
         "shutdown" | "restart-computer" | "stop-computer" => {
             d.deny("system shutdown/restart is not an agent action");
         }
         "reg" => {
-            let w = first_word(args);
+            let w = op_word(args);
             if w.as_deref() == Some("delete") {
                 d.deny("deleting registry keys");
             }
@@ -409,13 +439,14 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
             }
         }
         "schtasks" => {
-            let w = first_word(args);
-            if matches!(w.as_deref(), Some("create") | Some("delete") | Some("change")) {
+            // The operation is a switch (`/create`, `-delete`) that may follow `/s host`.
+            let switch = |a: &String| (a.starts_with('/') || a.starts_with('-')) && matches!(op(a).as_str(), "create" | "delete" | "change");
+            if args.iter().any(switch) || matches!(op_word(args).as_deref(), Some("create" | "delete" | "change")) {
                 d.deny("scheduled-task persistence");
             }
         }
         "sc" => {
-            let w = first_word(args);
+            let w = op_word(args);
             if matches!(w.as_deref(), Some("create") | Some("delete") | Some("config")) {
                 d.deny("service create/delete/config");
             }
@@ -428,7 +459,45 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
             if joined.to_ascii_lowercase().contains("/w") => {
                 d.deny("wiping free disk space");
             }
-        "takeown" => d.warn("changing file ownership"),
+        "takeown" => {
+            let target = args.windows(2).find(|w| op(&w[0]) == "f").map(|w| w[1].as_str());
+            match target.and_then(|t| protected(&absolutize(t, cwd), cwd)) {
+                Some(r) => d.deny(format!("refusing to take ownership of {r}")),
+                None => d.warn("changing file ownership"),
+            }
+        }
+        // `dd of=\\.\PhysicalDrive0` overwrites a disk; `of=` a system file overwrites it.
+        "dd" => {
+            for v in args.iter().filter_map(|a| a.strip_prefix("of=")) {
+                let l = v.to_ascii_lowercase().replace('/', "\\");
+                if l.starts_with(r"\\.\") || (l.starts_with(r"\dev\") && !matches!(l.as_str(), r"\dev\null" | r"\dev\stdout" | r"\dev\stderr")) {
+                    d.deny(format!("dd writes to a raw device: {v}"));
+                } else {
+                    deny_if_protected(v, cwd, &mut d);
+                }
+            }
+        }
+        // `Clear-Content` empties files in place: no recycle bin, no undo.
+        "clear-content" | "clc" => {
+            d.warn("Clear-Content empties files");
+            for v in args.iter().filter(|a| !a.starts_with('-')) {
+                deny_if_protected(v, cwd, &mut d);
+            }
+        }
+        // `at 10:00 x.exe` schedules a task like `schtasks /create`; a bare `at` only lists jobs.
+        "at" if !args.is_empty() => d.deny("scheduled-task persistence"),
+        "rsync" if args.iter().any(|a| a.starts_with("--delete") || a == "--remove-source-files") => {
+            match args.iter().rfind(|a| !a.starts_with('-')).map(|t| absolutize(t, cwd)) {
+                Some(p) if protected(&p, cwd).is_some() => d.deny(format!("rsync --delete removes files in {}", p.display())),
+                _ => d.warn("rsync --delete removes files from the destination"),
+            }
+        }
+        // `alias x='rm -rf /'` runs its value whenever `x` is typed.
+        "alias" => {
+            for v in args.iter().filter_map(|a| a.split_once('=').map(|(_, v)| v)) {
+                merge(&mut d, check_shell_mode(m, v, cwd));
+            }
+        }
         "icacls" => d.warn("changing file permissions"),
         "wmic" => {
             if joined.to_ascii_lowercase().contains("call create") {
@@ -476,13 +545,13 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
             }
         }
         "npm" | "cargo"
-            if joined.to_ascii_lowercase().split_whitespace().any(|w| w == "publish") => {
+            if joined.to_ascii_lowercase().split_whitespace().any(|w| w == "publish") && !args.iter().any(|a| a == "--dry-run") => {
                 d.warn("publishing a package is irreversible");
             }
         "twine" => d.warn("uploading a package is irreversible"),
-        "python" | "python3" | "py" | "node" => {
+        "python" | "python3" | "py" | "node" | "perl" | "ruby" | "php" => {
             if let Some(code) = inline_code(&name, args) {
-                check_code(&code, &mut d);
+                check_code(m, &code, cwd, &mut d);
             }
         }
         _ => {}
@@ -547,7 +616,154 @@ pub fn check_shell_mode(m: Mode, command: &str, cwd: Option<&Path>) -> Decision 
     if plain != command {
         merge(&mut d, judge_line(m, &plain, cwd, true));
     }
+    // cmd's `for %i in (set) do body` runs the body once per item with `%i` replaced: judge it that way.
+    for (var, items, body) in for_loops(command) {
+        match items {
+            Some(items) => {
+                for item in items {
+                    if !spend() {
+                        merge(&mut d, too_deep());
+                        break;
+                    }
+                    merge(&mut d, check_shell_mode(m, &bind_loop_var(&body, var, &item), cwd));
+                }
+            }
+            // `for /f` reads its values from a file or a command's output, which qx cannot list.
+            None => {
+                let r = check_shell_mode(m, &bind_loop_var(&body, var, FOR_VALUE), cwd);
+                if r.reasons.iter().any(|x| x.contains(FOR_VALUE)) {
+                    d.deny("a `for /f` loop deletes values qx cannot list");
+                }
+                merge(&mut d, r);
+            }
+        }
+    }
     finalize(m, d)
+}
+
+/// Stands in for the values of a `for /f` loop; a delete of it reports this text as unresolved.
+const FOR_VALUE: &str = "%QX_FOR_VALUE%";
+
+/// cmd `for` loops in a line: the loop variable's letter, the items of the set (`None` for `for /f`,
+/// whose values come from a file or command), and the body after `do`. `for /l` counts numbers and
+/// is skipped. The body runs to the end of the line, as in cmd.
+fn for_loops(line: &str) -> Vec<(char, Option<Vec<String>>, String)> {
+    const MAX_ITEMS: usize = 64;
+    let lower = line.to_ascii_lowercase();
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = lower[from..].find("for").map(|i| i + from) {
+        from = i + 3;
+        let starts = i == 0 || matches!(b[i - 1], b' ' | b'\t' | b'(' | b'&' | b'|' | b'@' | b';');
+        if !starts || !b.get(i + 3).is_some_and(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let mut rest = &line[i + 3..];
+        let word = |rest: &mut &str| -> String {
+            let t = rest.trim_start();
+            let end = if let Some(q) = t.strip_prefix('"') {
+                q.find('"').map_or(t.len(), |j| j + 2)
+            } else {
+                t.find(char::is_whitespace).unwrap_or(t.len())
+            };
+            *rest = &t[end..];
+            t[..end].to_string()
+        };
+        let (mut kind, mut root) = (String::new(), None);
+        let mut w = word(&mut rest);
+        while w.starts_with('/') {
+            kind = w.to_ascii_lowercase();
+            let next = word(&mut rest);
+            match kind.as_str() {
+                "/r" if !next.starts_with('%') => root = Some(next.trim_matches('"').to_string()),
+                "/f" if next.starts_with('"') => {}
+                _ => {
+                    w = next;
+                    continue;
+                }
+            }
+            w = word(&mut rest);
+        }
+        let Some(var) = w.strip_prefix("%%").or_else(|| w.strip_prefix('%')).filter(|v| v.chars().count() == 1).and_then(|v| v.chars().next()) else {
+            continue;
+        };
+        if !word(&mut rest).eq_ignore_ascii_case("in") {
+            continue;
+        }
+        let Some(set_start) = rest.trim_start().strip_prefix('(') else {
+            continue;
+        };
+        // The set ends at the first `)` outside quotes (`('dir /b')`, `("a b")`).
+        let mut quote = None;
+        let Some(close) = set_start.char_indices().find_map(|(j, c)| {
+            match (quote, c) {
+                (None, '"' | '\'') => quote = Some(c),
+                (Some(q), c) if c == q => quote = None,
+                (None, ')') => return Some(j),
+                _ => {}
+            }
+            None
+        }) else {
+            continue;
+        };
+        let set = &set_start[..close];
+        let mut after = &set_start[close + 1..];
+        if !word(&mut after).eq_ignore_ascii_case("do") {
+            continue;
+        }
+        let body = after.trim_start().to_string();
+        let items = match kind.as_str() {
+            "/l" => continue,
+            "/f" => None,
+            _ => Some(
+                set.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '='))
+                    .map(|s| s.trim_matches('"'))
+                    .filter(|s| !s.is_empty())
+                    .take(MAX_ITEMS)
+                    .map(|s| match &root {
+                        Some(r) => format!("{}\\{s}", r.trim_end_matches(['\\', '/'])),
+                        None => s.to_string(),
+                    })
+                    .collect(),
+            ),
+        };
+        out.push((var, items, body));
+    }
+    out
+}
+
+/// Replace a cmd loop variable in `body` with `value`: `%i`, `%%i` and the `%~fi` / `%%~dpnxi`
+/// forms (the modifiers only trim the value, so the whole value is the safe reading). The letter is
+/// case-sensitive, as in cmd. A value with a space is quoted.
+fn bind_loop_var(body: &str, var: char, value: &str) -> String {
+    const MODS: &str = "fdpnxsatz";
+    let value = if value.contains(' ') && !value.starts_with('"') { format!("\"{value}\"") } else { value.to_string() };
+    let c: Vec<char> = body.chars().collect();
+    let (mut out, mut i) = (String::with_capacity(body.len()), 0);
+    while i < c.len() {
+        if c[i] == '%' {
+            let mut j = i + 1;
+            if c.get(j) == Some(&'%') {
+                j += 1;
+            }
+            let end = if c.get(j) == Some(&'~') {
+                // The longest run of modifier letters that ends in the variable's letter.
+                let run = c[j + 1..].iter().take_while(|&&x| x == var || MODS.contains(x)).count();
+                c[j + 1..j + 1 + run].iter().rposition(|&x| x == var).map(|k| j + 1 + k)
+            } else {
+                (c.get(j) == Some(&var)).then_some(j)
+            };
+            if let Some(end) = end {
+                out.push_str(&value);
+                i = end + 1;
+                continue;
+            }
+        }
+        out.push(c[i]);
+        i += 1;
+    }
+    out
 }
 
 /// What cmd and PowerShell make of the escape characters they swallow: `r^d` is `rd`, `` Remo`ve `` is
@@ -653,9 +869,17 @@ fn judge_line(m: Mode, command: &str, cwd: Option<&Path>, sq: bool) -> Decision 
                     w.splice(1..1, switches);
                 }
             }
+            // bash drops a backslash before a plain letter: `r\m` runs `rm`. cmd reads it as a path; judge both.
+            let posix = w.first().filter(|f| f.contains('\\') && !f.contains([':', '/'])).map(|f| f.replace('\\', ""));
+            let alt = posix.filter(|p| !p.is_empty()).map(|p| {
+                let mut alt = w.clone();
+                alt[0] = p;
+                alt
+            });
             if !w.is_empty() {
                 segments.push((w, piped));
             }
+            segments.extend(alt.map(|a| (a, piped)));
         }
     }
 
@@ -738,6 +962,11 @@ fn split_blocks(words: Vec<String>) -> Vec<Vec<String>> {
             body = &body[1..];
         }
         if !expansion && body.len() > 1 && body.ends_with('}') && !body.contains('{') {
+            close = true;
+            body = &body[..body.len() - 1];
+        }
+        // `f(){ rm ..; }`: the body after `f(){` is its own command.
+        if !expansion && body.len() > 1 && body.ends_with('{') {
             close = true;
             body = &body[..body.len() - 1];
         }
@@ -1043,6 +1272,17 @@ fn first_word(args: &[String]) -> Option<String> {
         .map(|s| s.to_ascii_lowercase())
 }
 
+/// A switch word without its one leading `/` or `-`, lowercased: `/Create` is `create`.
+fn op(a: &str) -> String {
+    a.strip_prefix(['/', '-']).unwrap_or(a).to_ascii_lowercase()
+}
+
+/// The operation word of `reg`, `schtasks` and `sc`: the first argument that is not a `\\server`
+/// target, read without a leading `/` or `-` (`sc \\host create`, `schtasks /delete`).
+fn op_word(args: &[String]) -> Option<String> {
+    args.iter().find(|a| !a.starts_with(r"\\")).map(|a| op(a))
+}
+
 fn shell_payload(args: &[String]) -> Option<String> {
     for (i, a) in args.iter().enumerate() {
         let l = a.to_ascii_lowercase();
@@ -1102,13 +1342,15 @@ fn inline_code(name: &str, args: &[String]) -> Option<String> {
     let flags: &[&str] = match name {
         "python" | "python3" | "py" => &["-c"],
         "node" => &["-e", "--eval", "-p", "--print"],
+        "perl" | "ruby" => &["-e", "-E"],
+        "php" => &["-r"],
         _ => return None,
     };
     let i = args.iter().position(|a| flags.contains(&a.as_str()))?;
     Some(args[i + 1..].join(" "))
 }
 
-fn write_protected(s: &str) -> Option<&'static str> {
+pub(crate) fn write_protected(s: &str) -> Option<&'static str> {
     for (dir, label) in system_dirs() {
         if under(s, dir) {
             return Some(label);
@@ -1376,6 +1618,22 @@ fn has_secret_ref(s: &str) -> bool {
 fn unwrap_wrapper(name: &str, args: &[String]) -> Option<(String, Vec<String>)> {
     match name {
         "env" => {
+            // `env -S "rm -rf /"` splits its value into the command's words.
+            let mut split = Vec::new();
+            let mut it = args.iter();
+            while let Some(a) = it.next() {
+                if !a.starts_with('-') {
+                    split.push(a.clone());
+                    split.extend(it.cloned());
+                    break;
+                }
+                match a.strip_prefix("--split-string").or_else(|| a.strip_prefix("-S")) {
+                    Some("") => split.extend(it.next().map(|v| tokenize(v)).unwrap_or_default()),
+                    Some(v) => split.extend(tokenize(v.strip_prefix('=').unwrap_or(v))),
+                    None => split.push(a.clone()),
+                }
+            }
+            let args = &split[..];
             let mut cur = after_flags(args, &["-u", "--unset", "-C", "--chdir"], &["--"])?;
             while cur.0.contains('=') {
                 cur = after_flags(&cur.1, &[], &[])?; // `env A=1 B=2 prog`
@@ -1438,7 +1696,8 @@ fn unwrap_wrapper(name: &str, args: &[String]) -> Option<(String, Vec<String>)> 
             let (_duration, rest) = after_flags(args, &["-s", "--signal", "-k", "--kill-after"], &["--"])?;
             Some((rest.first()?.clone(), rest[1..].to_vec()))
         }
-        "nohup" | "time" => after_flags(args, &[], &["--"]),
+        "nohup" | "time" | "winpty" | "setsid" | "busybox" | "builtin" => after_flags(args, &[], &["--"]),
+        "stdbuf" => after_flags(args, &["-i", "-o", "-e", "--input", "--output", "--error"], &["--"]),
         "nice" => after_flags(args, &["-n", "--adjustment"], &["--"]),
         "sudo" | "doas" => after_flags(
             args,
@@ -1584,6 +1843,10 @@ fn check_git(args: &[String], d: &mut Decision) {
             if args.iter().any(|a| a == "." || a == "--") => {
                 d.warn("discards working-tree changes");
             }
+        Some("stash") if args.iter().any(|a| a == "clear" || a == "drop") => d.warn("drops stashed work for good"),
+        Some("reflog") if args.iter().any(|a| a == "expire" || a == "delete") => d.warn("expires reflog entries, the way back to lost commits"),
+        Some("filter-branch" | "filter-repo") => d.warn("rewrites the repository's history"),
+        Some("gc") if joined.contains("--prune=now") => d.warn("prunes unreachable commits for good"),
         Some("config")
             if joined.contains("--global") => {
                 d.warn("modifies global git configuration");
@@ -1632,7 +1895,7 @@ fn check_ps_exfil(text: &str, d: &mut Decision) {
     }
 }
 
-fn check_code(text: &str, d: &mut Decision) {
+fn check_code(m: Mode, text: &str, cwd: Option<&Path>, d: &mut Decision) {
     let l = text.to_ascii_lowercase();
     let network = l.contains("fetch(")
         || l.contains("requests.")
@@ -1644,28 +1907,81 @@ fn check_code(text: &str, d: &mut Decision) {
     if network && has_secret_ref(&l) {
         d.deny("inline code can upload credentials to the network");
     }
-    let destructive = l.contains("rmtree")
-        || l.contains("rm_sync")
-        || l.contains("rmsync")
-        || l.contains("rmdirsync")
-        || l.contains("unlink")
-        || l.contains("rm -rf")
-        || l.contains("del /f");
-    let rootish = l.contains("'/'")
-        || l.contains("\"/\"")
-        || l.contains("c:/")
-        || l.contains("c:\\\\");
-    let spawn = l.contains("os.system")
-        || l.contains("subprocess")
-        || l.contains("child_process")
-        || l.contains("execsync");
-    if destructive && (rootish || spawn) {
-        d.deny("inline code performs a destructive filesystem operation");
-    } else if destructive {
+    // A call that runs a command line is judged as that line; a call that deletes, by the path it is given.
+    const SPAWN: &[&str] = &["system", "subprocess", "child_process", "execsync", "exec", "popen", "spawn", "shell_exec", "passthru"];
+    const DELETE: &[&str] = &["rmtree", "rmsync", "rmdirsync", "unlink", "rm_rf", "rm_r", "rmdir", "os.remove", "remove_dir_all", "rimraf"];
+    let (mut spawn, mut deletes) = (false, l.contains("rm -rf") || l.contains("del /f"));
+    for (marks, runs) in [(SPAWN, true), (DELETE, false)] {
+        for mk in marks {
+            for (i, _) in l.match_indices(mk) {
+                let Some(lits) = call_literals(&text[i + mk.len()..]) else { continue };
+                if runs {
+                    spawn = true;
+                    if !lits.is_empty() {
+                        merge(d, check_shell_mode(m, &lits.join(" "), cwd));
+                    }
+                    continue;
+                }
+                deletes = true;
+                let Some(raw) = lits.first().map(String::as_str) else { continue };
+                if raw == "/" || raw == "\\" || is_drive_root(raw) {
+                    d.deny("inline code deletes a filesystem root");
+                } else if let Some(r) = protected(&absolutize(raw, cwd), cwd) {
+                    d.deny(format!("inline code deletes {r}: {raw}"));
+                }
+            }
+        }
+    }
+    if deletes {
         d.warn("inline code performs recursive deletion");
     } else if spawn {
         d.warn("inline code spawns a subprocess");
     }
+}
+
+/// The string literals of the call that starts `rest` (`.run(['rm','-rf','/'])`, `('rm -rf x')`, or
+/// perl's paren-less `system 'rm -rf x';`); `None` when no call follows.
+fn call_literals(rest: &str) -> Option<Vec<String>> {
+    let rest = rest.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.').trim_start();
+    let (body, paren) = match rest.strip_prefix('(') {
+        Some(b) => (b, true),
+        None if rest.starts_with(['\'', '"']) => (rest, false),
+        None => return None,
+    };
+    let (mut depth, mut out, mut chars) = (usize::from(paren), Vec::new(), body.chars());
+    while let Some(c) = chars.next() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                if paren && depth == 0 {
+                    break;
+                }
+            }
+            ';' | '\n' if !paren && depth == 0 => break,
+            '\'' | '"' => {
+                let mut lit = String::new();
+                while let Some(x) = chars.next() {
+                    if x == c {
+                        break;
+                    }
+                    if x == '\\' {
+                        // `\\` and `\'` are escapes; `C:\Windows` keeps its backslash.
+                        match chars.next() {
+                            Some(n) if n == c || n == '\\' => lit.push(n),
+                            Some(n) => lit.extend(['\\', n]),
+                            None => lit.push('\\'),
+                        }
+                        continue;
+                    }
+                    lit.push(x);
+                }
+                out.push(lit);
+            }
+            _ => {}
+        }
+    }
+    Some(out)
 }
 
 fn destructive(name: &str, args: &[String], cwd: Option<&Path>, d: &mut Decision) {
@@ -1692,7 +2008,8 @@ fn destructive(name: &str, args: &[String], cwd: Option<&Path>, d: &mut Decision
         return;
     }
 
-    for t in targets {
+    let targets: Vec<String> = targets.iter().flat_map(|t| braces(t)).collect();
+    for t in &targets {
         // `$(pwd)`, `` `pwd` ``: peeled below to a bare word, but the shell runs it and deletes its output.
         let t_trim = t.trim();
         let sub = t_trim.starts_with("$(") || t_trim.starts_with("@(") || t_trim.starts_with('`');
@@ -1745,16 +2062,69 @@ fn destructive(name: &str, args: &[String], cwd: Option<&Path>, d: &mut Decision
             d.deny(format!("refusing to delete {reason}: {}", path.display()));
             continue;
         }
+        if path.file_name().is_some_and(|n| n.eq_ignore_ascii_case(".git")) {
+            d.warn("deleting .git loses the repository's history");
+        }
 
         if let Some(c) = cwd {
             let ps = norm(&path);
             let cs = norm(c);
             let inside = ps == cs || ps.starts_with(&(cs.clone() + "\\")) || ps.starts_with(&(cs.clone() + "/"));
-            if !inside && !allowed_root(&path) {
+            let tmp = norm(&std::env::temp_dir());
+            let in_temp = ps.starts_with(&(tmp.trim_end_matches('\\').to_string() + "\\"));
+            if !inside && !in_temp && !allowed_root(&path) {
                 d.warn(format!("deleting outside the workspace: {}", path.display()));
             }
         }
     }
+}
+
+/// Bash brace expansion of a word: `/c/{Windows,Users}` is `/c/Windows` and `/c/Users` (capped at 64).
+fn braces(s: &str) -> Vec<String> {
+    let mut out = vec![s.to_string()];
+    for _ in 0..4 {
+        let mut changed = false;
+        let mut next = Vec::new();
+        for w in &out {
+            match brace_group(w) {
+                Some((pre, alts, post)) => {
+                    changed = true;
+                    next.extend(alts.iter().map(|a| format!("{pre}{a}{post}")));
+                }
+                None => next.push(w.clone()),
+            }
+        }
+        next.truncate(64);
+        out = next;
+        if !changed {
+            break;
+        }
+    }
+    out
+}
+
+/// The first `{a,b}` group of a word (not `${..}`): what comes before, the alternatives, what comes after.
+fn brace_group(w: &str) -> Option<(&str, Vec<&str>, &str)> {
+    let open = w.char_indices().find(|&(i, c)| c == '{' && !w[..i].ends_with('$'))?.0;
+    let (mut depth, mut start, mut parts) = (0usize, open + 1, Vec::new());
+    for (i, c) in w.char_indices().skip_while(|&(i, _)| i < open) {
+        match c {
+            '{' => depth += 1,
+            ',' if depth == 1 => {
+                parts.push(&w[start..i]);
+                start = i + 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    parts.push(&w[start..i]);
+                    return (parts.len() > 1).then(|| (&w[..open], parts, &w[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// PowerShell registry drives: `Remove-Item HKLM:\SOFTWARE\x` deletes registry keys.
@@ -1836,6 +2206,11 @@ fn protected(path: &Path, cwd: Option<&Path>) -> Option<&'static str> {
         if h.starts_with(&(s.clone() + "\\")) || h.starts_with(&(s.clone() + "/")) {
             return Some("a parent of the home directory");
         }
+        // Your own data: `~/.ssh`, `~/Documents`, `~/AppData`. What is inside them is ordinary.
+        const KEEP: &[&str] = &[".ssh", "documents", "desktop", "downloads", "pictures", "appdata", ".claude", ".cargo", ".config"];
+        if s.strip_prefix(&(h + "\\")).is_some_and(|n| KEEP.contains(&n)) && !allowed_root(path) {
+            return Some("a folder of your own data in the home directory");
+        }
     }
     let parent_of = |inner: &str| inner.starts_with(&(s.clone() + "\\")) || inner.starts_with(&(s.clone() + "/"));
     if let Some(c) = cwd {
@@ -1894,14 +2269,26 @@ fn peel(raw: &str) -> &str {
 }
 
 fn absolutize(raw: &str, cwd: Option<&Path>) -> PathBuf {
-    let mut expanded = expand_dollar_env(&expand_home(peel(raw)));
+    let raw = peel(raw);
+    // NTFS streams: `C:\Windows::$INDEX_ALLOCATION` and `x:s:$DATA` name `C:\Windows` and `x`.
+    let raw = match raw.get(2..).and_then(|t| t.find(":$")) {
+        Some(i) => {
+            let head = &raw[..2 + i];
+            head.rfind(':').filter(|&j| j > 1).map_or(head, |j| &raw[..j])
+        }
+        None => raw,
+    };
+    let mut expanded = expand_dollar_env(&expand_home(raw));
     // cmd's dynamic `%CD%` is the directory the line runs in; no environment holds it.
     if std::env::var_os("CD").is_none() {
         if let Some(here) = cwd.map(Path::to_path_buf).or_else(|| std::env::current_dir().ok()) {
             expanded = replace_cmd_var(&expanded, "cd", &here.to_string_lossy());
         }
     }
-    let expanded = msys_to_windows(&expand_env(&expanded));
+    let mut expanded = msys_to_windows(&expand_env(&expanded));
+    if expanded.starts_with("//") && !expanded.starts_with("///") {
+        expanded = expanded.replace('/', "\\"); // `//host/share` is UNC
+    }
     let p = PathBuf::from(&expanded);
     let joined = if p.is_absolute() {
         p
@@ -1916,7 +2303,8 @@ fn absolutize(raw: &str, cwd: Option<&Path>) -> PathBuf {
 
 /// Git Bash and WSL spell `C:\Users` as `/c/Users` or `/mnt/c/Users`; the real target is the Windows path.
 fn msys_to_windows(s: &str) -> String {
-    let rest = s.strip_prefix("/mnt").unwrap_or(s);
+    // Cygwin and MSYS also spell it `/cygdrive/c` and `/proc/cygdrive/c`.
+    let rest = ["/proc/cygdrive", "/cygdrive", "/mnt"].iter().find_map(|p| s.strip_prefix(p)).unwrap_or(s);
     match rest.as_bytes() {
         [b'/', d, tail @ ..] if d.is_ascii_alphabetic() && matches!(tail.first(), None | Some(b'/')) => {
             format!("{}:\\{}", (*d as char).to_ascii_uppercase(), rest[2..].trim_start_matches('/').replace('/', "\\"))
@@ -1936,6 +2324,17 @@ fn expand_home(s: &str) -> String {
     }
     if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
         return format!("{home}\\{rest}");
+    }
+    // `~name` is that user's home, a sibling of ours (Git Bash turns `~USER` into the home folder).
+    // Bash leaves `~nosuchuser` as a literal name, so only a folder that exists counts.
+    if let Some(after) = s.strip_prefix('~') {
+        let (name, rest) = after.split_once(['/', '\\']).unwrap_or((after, ""));
+        let plain = name.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if let Some(dir) = Path::new(home).parent().map(|p| p.join(name)).filter(|d| plain && d.is_dir()) {
+            let dir = dir.to_string_lossy();
+            return if rest.is_empty() { dir.into_owned() } else { format!("{dir}\\{rest}") };
+        }
     }
     s.to_string()
 }
@@ -2006,6 +2405,27 @@ fn expand_dollar_env(s: &str) -> String {
         out.replace_range(pos..pos + len, &val);
         search = pos + val.len();
     }
+    // Any other set `$NAME`/`${NAME}` in the POSIX spelling of an environment variable (upper case;
+    // a lower-case `$path` is more likely a PowerShell variable of the script's own).
+    let mut search = 0usize;
+    while let Some(rel) = out[search..].find('$') {
+        let pos = search + rel;
+        let after = &out[pos + 1..];
+        let braced = after.starts_with('{');
+        let body = if braced { &after[1..] } else { after };
+        let end = body.find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')).unwrap_or(body.len());
+        let name = &body[..end];
+        let closed = !braced || body[end..].starts_with('}');
+        // `$PWD` is the shell's own, not qx's.
+        let ok = closed && name.starts_with(|c: char| c.is_ascii_uppercase() || c == '_') && !matches!(name, "PWD" | "OLDPWD");
+        match std::env::var(name).ok().filter(|_| ok) {
+            Some(val) => {
+                out.replace_range(pos..pos + 1 + usize::from(braced) * 2 + end, &val);
+                search = pos + val.len();
+            }
+            None => search = pos + 1,
+        }
+    }
     out
 }
 
@@ -2059,11 +2479,50 @@ fn clean(p: &Path) -> PathBuf {
     out
 }
 
+/// `canonicalize` the longest part of `p` that exists and append the rest: a file not yet made under
+/// `C:\PROGRA~1` is still under `C:\Program Files`. A UNC path is left as written (no network calls).
+fn canonical(p: &Path) -> PathBuf {
+    let cleaned = clean(p);
+    let s = cleaned.to_string_lossy();
+    if s.starts_with(r"\\") || s.starts_with("//") {
+        return cleaned;
+    }
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    let mut tail = Vec::new();
+    let mut cur = cleaned.as_path();
+    while let (Some(parent), Some(name)) = (cur.parent(), cur.file_name()) {
+        tail.push(name);
+        if let Ok(mut c) = std::fs::canonicalize(parent) {
+            c.extend(tail.iter().rev());
+            return c;
+        }
+        cur = parent;
+    }
+    cleaned
+}
+
 fn norm(p: &Path) -> String {
-    let canon = std::fs::canonicalize(p).unwrap_or_else(|_| clean(p));
+    let canon = canonical(p);
     let mut s = canon.to_string_lossy().to_ascii_lowercase();
-    if let Some(rest) = s.strip_prefix(r"\\?\") {
+    if s.starts_with("//") {
+        s = s.replace('/', "\\");
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\unc\") {
+        s = format!(r"\\{rest}");
+    } else if let Some(rest) = s.strip_prefix(r"\\?\").or_else(|| s.strip_prefix(r"\\.\")) {
         s = rest.to_string();
+    }
+    // `\\localhost\C$\Windows` is `C:\Windows`: an admin share of this machine is a local path.
+    let local = s.strip_prefix(r"\\").and_then(|r| r.split_once('\\')).and_then(|(host, rest)| {
+        let own = std::env::var("COMPUTERNAME").is_ok_and(|n| n.eq_ignore_ascii_case(host));
+        let b = rest.as_bytes();
+        let share = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b'$' && matches!(b.get(2), None | Some(b'\\'));
+        ((own || matches!(host, "localhost" | "127.0.0.1" | ".")) && share).then(|| format!("{}:{}", b[0] as char, &rest[2..]))
+    });
+    if let Some(l) = local {
+        s = l;
     }
     s.trim_end_matches(['\\', '/']).to_string()
 }
@@ -2171,7 +2630,13 @@ fn tokenize_with(s: &str, sq: bool) -> Vec<String> {
             }
             None => match c {
                 '\'' if !sq => cur.push(c),
-                '\'' | '"' => quote = Some(c),
+                '\'' | '"' => {
+                    // bash's `$'rm'` is `rm`
+                    if c == '\'' && cur.ends_with('$') {
+                        cur.pop();
+                    }
+                    quote = Some(c);
+                }
                 c if c.is_whitespace() => {
                     if !cur.is_empty() {
                         out.push(std::mem::take(&mut cur));
@@ -3194,4 +3659,242 @@ mod tests {
         assert_eq!(args_from_text(r#"log -n 1 "two words""#), ["log", "-n", "1", "two words"]);
         assert_eq!(args_from_text(r"C:\x\y -q"), [r"C:\x\y", "-q"]);
         assert!(args_from_text("  ").is_empty());
-    }}
+    }
+
+    #[test]
+    fn schtasks_with_slash_switches_is_denied() {
+        for bad in [
+            "schtasks /create /tn x /tr calc.exe /sc onlogon",
+            "schtasks /Delete /tn x /f",
+            "schtasks -change /tn x /tr y",
+            "schtasks /s host /create /tn x /tr calc.exe /sc daily",
+            "schtasks create /tn x",
+            r"sc \\localhost create svc binPath= C:\x.exe",
+            "sc delete svc",
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        for ok in ["schtasks /query /fo list", "schtasks /run /tn backup", "sc query svc", r"reg query HKCU\Software\x"] {
+            assert!(!denied(ok), "{ok}");
+        }
+    }
+
+    /// `C:\PROGRA~1\new.bat` names a file under `C:\Program Files` even though the file does not exist
+    /// yet, so `canonicalize` cannot expand the short name of the whole path.
+    #[cfg(windows)]
+    #[test]
+    fn short_name_of_a_new_file_is_still_protected() {
+        use std::os::windows::process::CommandExt;
+        let Some(pf) = std::env::var_os("ProgramFiles").map(|p| p.to_string_lossy().into_owned()) else {
+            return;
+        };
+        let out = std::process::Command::new("cmd")
+            .raw_arg(format!("/d /c for %I in (\"{pf}\") do @echo %~sI"))
+            .output()
+            .expect("cmd runs");
+        let short = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if short.is_empty() || short.eq_ignore_ascii_case(&pf) {
+            println!("skip: this volume has no 8.3 names");
+            return;
+        }
+        let id = std::process::id();
+        for bad in [
+            format!(r"echo x > {short}\qx-new-{id}.bat"),
+            format!(r"copy a.bat {short}\qx-new-dir-{id}\a.bat"),
+            format!("rd /s /q {short}"),
+        ] {
+            assert!(denied(&bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn tilde_user_is_the_home_directory() {
+        let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from) else {
+            return;
+        };
+        let Some(name) = home.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            return;
+        };
+        assert!(denied(&format!("rm -rf ~{name}")), "~{name}");
+        assert!(denied(&format!("rm -rf ~{name}/")), "~{name}/");
+        // No such user: bash keeps the word as a literal relative name.
+        assert!(!denied("rm -rf ~qx-no-such-user-dir"));
+    }
+
+    #[test]
+    fn cmd_for_loops_judge_each_item_in_place_of_the_variable() {
+        for bad in [
+            r"for /d %i in (C:\Users\*) do rd /s /q %i",
+            r"for /d %i in (C:\Windows) do rd /s /q %i",
+            r"for %i in (C:\Windows\*) do del /q %i",
+            r"for /D %%G in (C:\Users\*) do @rd /s /q %%G",
+            r"for /r C:\Windows %i in (*) do del /q %i",
+            r"for /d %i in (a C:\Windows) do (rd /s /q %~fi)",
+            r"echo start & for /d %i in (C:\Windows) do rd /s /q %i",
+            "for /f %i in (list.txt) do rd /s /q %i",
+            r#"for /f "delims=" %i in ('dir /b /ad') do rd /s /q %i"#,
+            r#"forfiles /p C:\Windows /c "cmd /c del @path""#,
+            r#"forfiles /P C:\Users /S /C "cmd /c rd /s /q @path""#,
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        for ok in [
+            "for %i in (a b) do echo %i",
+            "for /d %i in (build dist) do rd /s /q %i",
+            r#"for /f "tokens=*" %i in ('git branch') do echo %i"#,
+            "for /l %i in (1,1,3) do echo %i",
+            r#"forfiles /p logs /m *.log /c "cmd /c echo @file""#,
+        ] {
+            assert!(!denied(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn admin_shares_of_this_machine_are_local_paths() {
+        let mut bad = vec![
+            r"rm -rf \\localhost\C$\Windows".to_string(),
+            r"rm -rf \\127.0.0.1\c$\Windows".into(),
+            "rm -rf //localhost/C$/Windows".into(),
+            r"rm -rf \\?\UNC\localhost\C$\Windows".into(),
+            r"echo x > \\localhost\C$\Windows\x.bat".into(),
+            r"rd /s /q \\.\C:\Windows".into(),
+        ];
+        if let Ok(host) = std::env::var("COMPUTERNAME") {
+            bad.push(format!(r"rm -rf \\{host}\C$\Windows"));
+        }
+        for b in &bad {
+            assert!(denied(b), "{b}");
+        }
+        assert!(!denied(r"rm -rf \\fileserver\share\build"));
+    }
+
+    #[test]
+    fn cygwin_drive_paths_are_windows_paths() {
+        for bad in ["rm -rf /proc/cygdrive/c/Windows", "rm -rf /cygdrive/c/Windows"] {
+            assert!(denied(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn renaming_a_protected_folder_is_denied() {
+        for bad in [
+            r"ren C:\Windows Windows.old",
+            r"rename C:\Windows x",
+            r"Rename-Item C:\Windows x",
+            r"Rename-Item -NewName x -Path C:\Windows",
+            r"rni C:\Windows x",
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        for ok in ["ren old.txt new.txt", "Rename-Item a.txt b.txt"] {
+            assert!(!denied(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn launchers_and_quoting_tricks_still_reach_the_command() {
+        for bad in [
+            "stdbuf -o0 rm -rf /c/Windows",
+            "stdbuf -o 0 rm -rf /c/Windows",
+            "winpty rm -rf /c/Windows",
+            "setsid -f rm -rf /c/Windows",
+            r#"env -S "rm -rf /c/Windows""#,
+            "busybox rm -rf /c/Windows",
+            "builtin command rm -rf /c/Windows",
+            r"r\m -rf /c/Windows",
+            "$'rm' -rf /c/Windows",
+            "alias x='rm -rf /c/Windows'; x",
+            "f(){ rm -rf /c/Windows; }; f",
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        for ok in [r"bin\tool --version", "alias ll='ls -la'", "git commit -S -m x"] {
+            assert!(!denied(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn inline_code_is_judged_by_the_paths_and_commands_it_names() {
+        for bad in [
+            r#"perl -e "system('rm -rf /c/Windows')""#,
+            r#"ruby -e "system('rm -rf /c/Windows')""#,
+            r#"ruby -e "require 'fileutils'; FileUtils.rm_rf('C:/Windows')""#,
+            r#"php -r "system('rm -rf /c/Windows');""#,
+            r#"python -c "import shutil; shutil.rmtree('C:/Windows')""#,
+            r#"python -c "import shutil,os; shutil.rmtree(os.path.expanduser('~'))""#,
+            r#"node -e "require('fs').rmSync('/', {recursive: true})""#,
+            r#"python -c "import subprocess; subprocess.run(['rm','-rf','/c/Windows'])""#,
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        for ok in [
+            r#"python -c "import os; os.system('rm -rf build')""#,
+            r#"python -c "import shutil; shutil.rmtree('build')""#,
+            r#"node -e "require('fs').rmSync('dist', {recursive: true})""#,
+        ] {
+            assert!(!denied(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn dd_onto_a_disk_or_system_file_is_denied() {
+        for bad in [r"dd if=/dev/zero of=\\.\PhysicalDrive0", "dd if=/dev/zero of=/dev/sda", r"dd if=x of=C:\Windows\System32\x.dll"] {
+            assert!(denied(bad), "{bad}");
+        }
+        assert!(!denied("dd if=/dev/zero of=blank.img bs=1M count=1"));
+    }
+
+    #[test]
+    fn deleting_git_history_warns() {
+        assert_eq!(level("rm -rf .git"), Level::Warn);
+        assert_eq!(level("rm -rf ./.git/"), Level::Warn);
+        assert_eq!(level("rm -rf .github"), Level::Allow);
+    }
+
+    #[test]
+    fn set_variables_braces_and_streams_are_expanded() {
+        if std::env::var_os("LOCALAPPDATA").is_some() {
+            let d = check_shell_mode(Mode::Safe, "rm -rf $LOCALAPPDATA/qx-x", Some(Path::new(r"C:\work\proj")));
+            assert!(!d.summary().contains("cannot resolve"), "{}", d.summary());
+        }
+        for bad in [
+            "rm -rf /c/{Windows,Users}",
+            r"rd /s /q C:\Windows::$INDEX_ALLOCATION",
+            r"rm -rf C:\Windows::$INDEX_ALLOCATION",
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        assert!(!denied("rm -rf {build,dist}"));
+    }
+
+    #[test]
+    fn deleting_a_well_known_home_folder_is_denied() {
+        for name in [".ssh", "Documents", "Desktop", "Downloads", "Pictures", "AppData", ".claude", ".cargo", ".config"] {
+            assert!(denied(&format!("rm -rf ~/{name}")), "{name}");
+        }
+        assert!(!denied("rm -rf ~/Documents/old-notes"));
+        assert!(!denied("rm -rf ~/.cargo/registry/cache"));
+    }
+
+    #[test]
+    fn takeown_of_a_protected_path_is_denied() {
+        assert!(denied(r"takeown /f C:\Windows /r /d y"));
+        assert_eq!(level(r"takeown /f build\x.txt"), Level::Warn);
+    }
+
+    #[test]
+    fn history_loss_warns_and_harmless_admin_commands_are_allowed() {
+        for c in ["git stash clear", "git stash drop", "git reflog expire --expire=now --all", "git filter-branch --tree-filter x HEAD", "git gc --prune=now", "rsync -a --delete src/ dst/", "npm publish", "Clear-Content notes.txt"] {
+            assert_eq!(level(c), Level::Warn, "{c}");
+        }
+        for c in ["git stash list", "git gc", "npm publish --dry-run", "cargo publish --dry-run", "shutdown /a", "bcdedit", "bcdedit /enum", "rsync -a src/ dst/", "at"] {
+            assert_eq!(level(c), Level::Allow, "{c}");
+        }
+        let tmp = std::env::temp_dir().join("qx-build-cache");
+        assert_eq!(level(&format!("rm -rf {}", tmp.display())), Level::Allow);
+        assert_eq!(level(&format!("rm -rf {}", std::env::temp_dir().display())), Level::Warn);
+        for c in ["shutdown /s /t 0", "bcdedit /set testsigning on", "bcdedit /delete {current}", r"rsync -a --delete src/ C:\Windows\", "at 10:00 calc.exe", r"Clear-Content C:\Windows\win.ini"] {
+            assert!(denied(c), "{c}");
+        }
+    }
+}

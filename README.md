@@ -417,7 +417,7 @@ the line: PowerShell for `$x = 1`, `[T]::Method()`, `try { }`, `& $exe`, `@'…'
 and `Verb-Noun` cmdlets (no profile, UTF-8 output, exit code preserved); Git Bash
 when a pipeline or redirect runs a POSIX utility (`ls cat head tail wc grep sed awk
 uniq xargs …`; not `find` or `sort`, which Windows has too); otherwise cmd. A cmd
-line over 8 KiB fails with a message naming the limit. PowerShell 5.1 has no
+line over 8,000 characters fails with a message naming the limit. PowerShell 5.1 has no
 `&&`/`||`, so those stay on cmd.
 
 Children never prompt: stdin is empty, PowerShell runs `-NonInteractive` (so
@@ -597,17 +597,21 @@ real server and prints `pi bridge ok`.
 |---|---|
 | `program` + `args` | direct exec, fastest |
 | `command` | full shell line for pipes / redirects / `&&` |
-| `shell` | `auto` (default), `cmd`, `bash` |
+| `shell` | `auto` (default), `cmd`, `bash`, `powershell` |
 | `cwd` | working directory |
-| `timeout_ms` | default 120000, max 270000 (100000 under Claude Code, which would otherwise move the call into a task of its own at 120 s): then a running command becomes a background job |
+| `timeout_ms` | default 120000, 1000 to 3600000; the call answers after 270000 at most (100000 under Claude Code, which would otherwise move the call into a task of its own at 120 s): then a running command becomes a background job |
+| `kill_on_timeout` | stop the command at `timeout_ms` instead of moving it to a job |
+| `env` | object of extra environment variables (strings) |
 | `background` / `job` / `wait_ms` / `kill` | start in the background; follow up, wait for, or stop a job by id |
 | `mode` | `compact` (default) or `full` |
+
+Any other key is an error that lists the valid ones (a typo such as `cwdd` would otherwise run in the wrong place).
 
 `fs` (always pass `cwd`):
 
 | `op` | key fields | behavior |
 |---|---|---|
-| `read` | `path` (or `file_path`), `offset?`, `limit?` | line-numbered UTF-8 window; 50 KiB / 2000 lines; observes the file for a later qx write/edit |
+| `read` | `path` (or `file_path`), `offset?`, `limit?` | line-numbered UTF-8 window; 48,000 bytes / 2000 lines; observes the file for a later qx write/edit |
 | `write` | `path`, `content` | create, or replace after a qx read; parents created; atomic |
 | `edit` | `path`, `old_string`, `new_string`, `replace_all?` | literal replace, no prior read needed; unique unless `replace_all`; UTF-8 only (UTF-16 / legacy code pages get `FS_ENCODING` and are left untouched) |
 | `glob` | `pattern`, `path?` | `*`, `**`, `?`, `[class]`, `{a,b}`; newest first; generated dirs skipped |

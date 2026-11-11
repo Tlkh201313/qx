@@ -315,6 +315,12 @@ fn git_log(text: &str) -> Option<(String, usize)> {
     let mut commits: Vec<Commit> = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("commit ") {
+            // `--parents` puts more hashes here; only a decoration may follow the hash.
+            let mut w = rest.split_whitespace();
+            w.next();
+            if w.next().is_some_and(|x| !x.starts_with('(')) {
+                return None;
+            }
             commits.push(Commit {
                 hash: rest.split_whitespace().next().unwrap_or("").chars().take(7).collect(),
                 deco: rest.find('(').map(|i| rest[i..].to_string()).unwrap_or_default(),
@@ -340,6 +346,9 @@ fn git_log(text: &str) -> Option<(String, usize)> {
             } else if !t.trim().is_empty() {
                 c.body += 1;
             }
+        } else if !(line.is_empty() || line.starts_with("Merge:") || line.starts_with("    ")) {
+            // A patch, stat, reflog or other line this shape does not know: leave the text whole.
+            return None;
         }
     }
     if commits.is_empty() || commits.iter().any(|c| c.hash.is_empty() || c.subject.is_empty()) {
@@ -464,9 +473,7 @@ fn traceback(text: &str) -> Option<(String, usize, bool)> {
     if py && lines.iter().any(|l| l.starts_with("Ran ") && l.contains(" test")) {
         return None;
     }
-    let mut out = String::new();
-    let mut kept = 0usize;
-    let mut clipped = false;
+    let mut keep = vec![false; lines.len()];
     let mut in_py = false;
     let mut frames = false; // a frame was seen, so the next unindented line is the exception
     let mut msg_left = 0usize; // continuation lines of the exception message still to keep
@@ -474,7 +481,7 @@ fn traceback(text: &str) -> Option<(String, usize, bool)> {
     while i < lines.len() {
         let t = lines[i].trim();
         let indented = lines[i].starts_with(char::is_whitespace);
-        let keep = if t.starts_with("Traceback (most recent call last):") {
+        keep[i] = if t.starts_with("Traceback (most recent call last):") {
             in_py = true;
             frames = false;
             msg_left = 0;
@@ -513,8 +520,27 @@ fn traceback(text: &str) -> Option<(String, usize, bool)> {
         } else {
             false
         };
-        if keep {
-            if kept < 120 {
+        i += 1;
+    }
+    if !keep.contains(&true) {
+        return None;
+    }
+    // The program's own lines around the traceback (a log line naming the cause, a warning) are kept, the
+    // first few and the last ones before the failure; a longer run is cut and says so.
+    let outside: Vec<usize> = (0..lines.len()).filter(|&i| !keep[i] && !lines[i].trim().is_empty()).collect();
+    let (n, mut clipped) = (outside.len(), false);
+    for (k, &i) in outside.iter().enumerate() {
+        if n <= 40 || k < 10 || k >= n - 30 {
+            keep[i] = true;
+        } else {
+            clipped = true;
+        }
+    }
+    let mut out = String::new();
+    let mut kept = 0usize;
+    for i in 0..lines.len() {
+        if keep[i] {
+            if kept < 160 {
                 out.push_str(lines[i]);
                 out.push('\n');
                 kept += 1;
@@ -522,10 +548,6 @@ fn traceback(text: &str) -> Option<(String, usize, bool)> {
                 clipped = true;
             }
         }
-        i += 1;
-    }
-    if out.is_empty() {
-        return None;
     }
     Some((out, lines.len().saturating_sub(kept), clipped))
 }
@@ -712,8 +734,13 @@ fn git_status(text: &str) -> Option<(String, usize)> {
             omitted += 1;
             continue;
         }
+        if t.starts_with("Your stash currently has ") {
+            state.push(t.to_string()); // `--show-stash`; a note, not a file of the section above
+            continue;
+        }
         if let Some(i) = cur {
-            if matches!(sections[i].0, "untracked" | "ignored") {
+            // git indents a listed path with one TAB; any other line here is a note this digest does not know.
+            if matches!(sections[i].0, "untracked" | "ignored") && raw.starts_with('\t') {
                 sections[i].1.push(t.to_string());
                 continue;
             }
@@ -877,7 +904,14 @@ fn fail_line(t: &str, build: bool) -> bool {
     }
     t.starts_with("FAILED")
         || t.starts_with("FAIL ")
+        || t.starts_with("FAIL\t")
+        || t == "FAIL"
         || t.starts_with("FAIL:")
+        // node:test `✖ name`, dotnet `Failed Name [3 ms]`, maven `[ERROR] ...`, mocha `1) name`
+        || t.starts_with('\u{2716}')
+        || t.starts_with("Failed ")
+        || t.starts_with("[ERROR]")
+        || mocha_item(t)
         || t.starts_with("ERROR:")
         || t.starts_with("ERROR ")
         || t.starts_with("Jest: ")
@@ -943,8 +977,28 @@ fn go_detail(lines: &[&str], at: usize, header: &str, keep: &mut [bool]) {
     }
 }
 
+/// mocha's numbered failure list: `1) Suite name`.
+fn mocha_item(t: &str) -> bool {
+    let n = t.bytes().take_while(u8::is_ascii_digit).count();
+    n > 0 && t[n..].starts_with(") ")
+}
+
+/// mocha's `1 passing (5ms)` / `2 failing` counts.
+fn mocha_count(t: &str) -> bool {
+    let mut w = t.split_whitespace();
+    w.next().is_some_and(|n| n.parse::<u64>().is_ok()) && w.next().is_some_and(|k| matches!(k, "passing" | "failing" | "pending"))
+}
+
 fn summary_line(t: &str) -> bool {
     t.starts_with("test result:")
+        || mocha_count(t)
+        // dotnet `Failed!  - Failed: 1, Passed: 1 ...`; node:test `ℹ tests 3` / `ℹ pass 1` / `ℹ fail 2`
+        || t.starts_with("Failed!")
+        || t.starts_with("Passed!")
+        || t.strip_prefix('\u{2139}').is_some_and(|r| {
+            let r = r.trim_start();
+            r.starts_with("tests ") || r.starts_with("pass ") || r.starts_with("fail ")
+        })
         || t.starts_with("Tests:")
         || t.starts_with("Test Suites:")
         || t.starts_with("Snapshots:")
@@ -992,9 +1046,10 @@ fn routine_line(t: &str) -> bool {
         "Snapshots:", "Time:", "Duration", "Test Files", "Start at", "RUN ", "PASS ", "ok ", "--- PASS", "=== RUN",
         "=== PAUSE", "=== CONT", "npm warn deprecated", "up to date", "added ", "removed ", "changed ", "audited ",
         "found 0 vulnerabilities", "To address", "npm audit", "Run `npm audit", "npm fund", "run `npm fund`",
-        "Build succeeded", "0 Warning(s)", "0 Error(s)", "\u{2713}", "\u{221a}",
+        "Build succeeded", "0 Warning(s)", "0 Error(s)", "\u{2713}", "\u{221a}", "\u{2714}", "\u{2139}", "Passed ",
     ];
     t.is_empty()
+        || (t.starts_with('_') && t.chars().all(|c| c == '_'))
         // progress dots (`cargo test -q`, pytest) and pytest's `file.py .... [ 50%]`
         || t.chars().all(|c| matches!(c, '.' | 's' | 'x' | 'S' | 'X'))
         || t.ends_with("%]")
@@ -1006,6 +1061,12 @@ fn routine_line(t: &str) -> bool {
         || (t.starts_with('-') && t.chars().all(|c| c == '-'))
         || t.contains(" -> ")
         || STARTS.iter().any(|p| t.starts_with(p))
+}
+
+fn failure_word(t: &str) -> bool {
+    let t = t.to_ascii_lowercase();
+    // `fail` only opens a word, so a file named test_fail.py is not a failure.
+    ["error", "panic", "exception", "fatal"].iter().any(|w| t.contains(w)) || t.split_whitespace().any(|w| w.starts_with("fail"))
 }
 
 fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool)> {
@@ -1098,6 +1159,24 @@ fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool
             } else if l.starts_with("E   ") && (i == 0 || !lines[i - 1].starts_with("E   ")) {
                 if let Some(src) = (i.saturating_sub(2)..i).rev().find(|&k| lines[k].starts_with("> ")) {
                     keep[src] = true;
+                }
+            }
+        }
+    }
+
+    // A red run keeps what it cannot call routine and an agent may need: a line at column 0 (a package, a
+    // log line, a compiler note) or one that names a failure. Indented detail stays cut, and is spooled.
+    // They only fill the room the recognised lines leave, failure words first, so they never push a
+    // recognised failure out of the 240-line window.
+    if code != 0 {
+        let mut room = 240usize.saturating_sub(keep.iter().filter(|&&k| k).count());
+        for words in [true, false] {
+            for (i, l) in lines.iter().enumerate() {
+                let t = l.trim();
+                let want = if words { failure_word(t) } else { !l.starts_with(char::is_whitespace) };
+                if room > 0 && !keep[i] && !routine_line(t) && want {
+                    keep[i] = true;
+                    room -= 1;
                 }
             }
         }
@@ -1211,6 +1290,7 @@ fn grep(text: &str) -> Option<(String, usize, bool)> {
     let mut parsed = 0usize;
     let mut kept = 0usize;
     let mut clipped = false;
+    let mut cut_lines = 0usize;
 
     for line in text.lines() {
         let Some((path, num, content)) = split_match(line) else {
@@ -1232,8 +1312,13 @@ fn grep(text: &str) -> Option<(String, usize, bool)> {
             continue;
         }
         let content = content.trim_end();
+        // A minified line is cut in the middle, not at the end: its tail (where a stack, a path or the
+        // match often sits) stays, and the flag spools the whole line.
         let content = if content.len() > 500 {
-            format!("{}…", &content[..(0..=500).rev().find(|&i| content.is_char_boundary(i)).unwrap_or(0)])
+            let head = (0..=250).rev().find(|&i| content.is_char_boundary(i)).unwrap_or(0);
+            let tail = (content.len() - 250..=content.len()).find(|&i| content.is_char_boundary(i)).unwrap_or(content.len());
+            cut_lines += 1;
+            format!("{} … {}", &content[..head], &content[tail..])
         } else {
             content.to_string()
         };
@@ -1272,7 +1357,10 @@ fn grep(text: &str) -> Option<(String, usize, bool)> {
     if clipped {
         out.push_str(&format!("[qx] match cap reached: {hidden} matches not shown\n"));
     }
-    Some((out, hidden, clipped))
+    if cut_lines > 0 {
+        out.push_str(&format!("[qx] {cut_lines} long lines cut to their first and last 250 bytes; full text: {FULL}\n"));
+    }
+    Some((out, hidden, clipped || cut_lines > 0))
 }
 
 /// Minify a JSON reply. Never a file the agent asked to read: `cat package.json` is read to be edited.
@@ -1430,21 +1518,21 @@ mod tests {
     }
 
     #[test]
-    fn python_traceback_drops_noise() {
+    fn python_traceback_keeps_the_log_line_before_it() {
         let raw = "warning: something\nTraceback (most recent call last):\n  File \"a.py\", line 3, in <module>\n    boom()\nValueError: bad\n";
         let (out, _, _) = traceback(raw).unwrap();
         assert!(out.contains("Traceback"));
         assert!(out.contains("ValueError: bad"));
-        assert!(!out.contains("warning:"));
+        assert!(out.contains("warning: something"));
     }
 
     #[test]
-    fn node_stack_drops_noise() {
+    fn node_stack_keeps_the_log_line_before_it() {
         let raw = "log line\nTypeError: x is not a function\n    at foo (a.js:1:2)\n    at bar (b.js:3:4)\n";
         let (out, _, _) = traceback(raw).unwrap();
         assert!(out.contains("TypeError"));
         assert!(out.contains("at foo"));
-        assert!(!out.contains("log line"));
+        assert!(out.contains("log line"));
     }
 
     #[test]
@@ -1843,5 +1931,132 @@ mod tests {
         }
         let d = digest("git log", &raw, "", 0).unwrap();
         assert!(d.stdout.contains("--raw (CLI)") && d.stdout.contains("mode:\"full\" (MCP)"), "{}", d.stdout);
+    }
+
+    /// What the caller sees: the digest's two streams, or `None` (generic compaction keeps the text).
+    fn reply(d: Option<Digest>) -> Option<String> {
+        d.map(|d| format!("{}{}", d.stdout, d.stderr))
+    }
+
+    #[test]
+    fn go_test_keeps_the_package_that_did_not_build_and_its_compiler_error() {
+        let so = "--- FAIL: TestAdd (0.00s)\n    a_test.go:8: got 3, want 4\nFAIL\nFAIL\texample.com/m/a\t0.003s\nok  \texample.com/m/b\t(cached)\nFAIL\texample.com/m/c [build failed]\n";
+        let se = "# example.com/m/c [example.com/m/c.test]\nc\\c_test.go:6:14: undefined: nope\n";
+        let (out, _, _) = diagnostic(&merge(so, se), 1, false).unwrap();
+        for want in ["--- FAIL: TestAdd", "FAIL\texample.com/m/a", "FAIL\texample.com/m/c [build failed]", "c_test.go:6:14: undefined: nope"] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
+        // Whatever the digest does with it, the reply must still say both packages failed.
+        if let Some(r) = reply(digest("go test ./...", so, se, 1)) {
+            assert!(r.contains("[build failed]") && r.contains("undefined: nope"), "{r}");
+        }
+    }
+
+    #[test]
+    fn node_test_runner_keeps_failing_test_names_and_the_counts() {
+        let raw = "\n> demo@1.0.0 test\n> node --test\n\n\u{2714} passes (0.5ms)\n\u{2716} adds numbers (1.2ms)\n  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n  \n  3 !== 4\n  \n      at TestContext.<anonymous> (a.test.js:5:10)\n\u{2716} also fails (0.3ms)\n  Error: nope\n      at TestContext.<anonymous> (a.test.js:9:10)\n\u{2139} tests 3\n\u{2139} suites 0\n\u{2139} pass 1\n\u{2139} fail 2\n\u{2139} cancelled 0\n\u{2139} skipped 0\n\u{2139} todo 0\n\u{2139} duration_ms 45.1\n\n\u{2716} failing tests:\n\ntest at a.test.js:3:1\n\u{2716} adds numbers (1.2ms)\n  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n";
+        let (out, _, _) = diagnostic(raw, 1, false).unwrap();
+        for want in ["\u{2716} adds numbers", "test at a.test.js:3:1", "\u{2139} tests 3", "\u{2139} fail 2", "a.test.js:5:10"] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
+        assert!(!out.contains("passes (0.5ms)") && !out.contains("duration_ms"), "{out}");
+    }
+
+    #[test]
+    fn mocha_dotnet_and_maven_failures_keep_names_counts_and_places() {
+        let mocha = "\n> demo@1.0.0 test\n> mocha\n\n\n  Calculator\n    \u{2714} adds\n    1) subtracts\n\n\n  1 passing (5ms)\n  1 failing\n\n  1) Calculator\n       subtracts:\n\n      AssertionError: expected 1 to equal 2\n      + expected - actual\n\n      -1\n      +2\n      \n      at Context.<anonymous> (test/calc.js:9:30)\n";
+        let (out, _, _) = diagnostic(mocha, 1, false).unwrap();
+        for want in ["1) subtracts", "1 failing", "1 passing", "1) Calculator", "test/calc.js:9:30"] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
+        let dotnet = "  Passed Adds [2 ms]\n  Failed Subtracts [3 ms]\n  Error Message:\n   Assert.Equal() Failure\n  Stack Trace:\n     at CalcTests.Subtracts() in /src/CalcTests.cs:line 14\n\nFailed!  - Failed:     1, Passed:     1, Skipped:     0, Total:     2\n";
+        let (out, _, _) = diagnostic(dotnet, 1, false).unwrap();
+        for want in ["Failed Subtracts [3 ms]", "CalcTests.cs:line 14", "Failed!  - Failed:     1"] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
+        let mvn = "[INFO] Running com.x.CalcTest\n[ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.05 s <<< FAILURE!\n[ERROR] subtracts  Time elapsed: 0.01 s  <<< FAILURE!\norg.opentest4j.AssertionFailedError: expected: <2> but was: <1>\n\tat com.x.CalcTest.subtracts(CalcTest.java:12)\n[INFO] Results:\n[ERROR] Failures: \n[ERROR]   CalcTest.subtracts:12 expected: <2> but was: <1>\n";
+        let (out, _, _) = diagnostic(mvn, 1, false).unwrap();
+        for want in ["Tests run: 3, Failures: 1", "CalcTest.java:12", "CalcTest.subtracts:12"] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
+    }
+
+    #[test]
+    fn a_red_run_keeps_a_line_nobody_taught_the_digest_to_recognise() {
+        // A made-up runner: the only line it knows is `FAILED`, yet the line naming the cause must stay.
+        let raw = "Compiling x v0.1.0\nrunning 2 tests\nFAILED t1\nlib.rs:9:5: left != right (3, 4)\nconnection to db:5432 refused\n\tdetail: error code 7\n";
+        let (out, _, _) = diagnostic(raw, 3, false).unwrap();
+        for want in ["lib.rs:9:5: left != right", "connection to db:5432 refused", "error code 7"] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
+        assert!(!out.contains("Compiling x"), "{out}");
+    }
+
+    #[test]
+    fn unknown_lines_of_a_red_run_never_push_out_the_failure() {
+        let log = |a: usize, b: usize| (a..b).map(|i| format!("log {i}\n")).collect::<String>();
+        let raw = format!("{}thread 't1' panicked at src/lib.rs:9:5\n{}", log(0, 300), log(300, 330));
+        let (out, _, clipped) = diagnostic(&raw, 101, false).unwrap();
+        assert!(out.contains("panicked at src/lib.rs:9:5"), "{out}");
+        assert!(clipped);
+    }
+    #[test]
+    fn a_log_line_before_a_python_traceback_is_kept() {
+        let se = "INFO:root:connecting\nERROR:root:database refused connection at 10.0.0.7:5432 (attempt 3 of 3)\nTraceback (most recent call last):\n  File \"job.py\", line 9, in <module>\n    run()\nRuntimeError: job aborted\n";
+        let (_, e, _, _) = runtime_digest("", se, 1).unwrap();
+        assert!(e.contains("ERROR:root:database refused connection"), "{e}");
+        assert!(e.contains("RuntimeError: job aborted"), "{e}");
+        // Many log lines: the traceback and the nearest lines stay, and the cut says so (so it is spooled).
+        let many: String = (0..100u8)
+            .map(|i| format!("log {}{} of the batch\n", (b'a' + i % 26) as char, (b'a' + i / 26) as char))
+            .collect();
+        let (_, e, _, clipped) = runtime_digest("", &format!("{many}{se}"), 1).unwrap();
+        assert!(e.contains("database refused") && e.contains("RuntimeError: job aborted"), "{e}");
+        assert!(clipped, "a cut that is not flagged is never spooled");
+        assert!(e.lines().count() < 100, "{}", e.lines().count());
+    }
+
+    #[test]
+    fn a_search_hit_cut_at_500_chars_is_flagged_and_keeps_its_tail() {
+        let hit = |n: usize| format!("src/a.rs:{n}:{}needle_here{}", "x".repeat(1215), "y".repeat(300));
+        let raw = format!("{}\n{}\nsrc/b.rs:3:short\n", hit(1), hit(2));
+        let (out, _, clipped) = grep(&raw).unwrap();
+        assert!(clipped, "a cut hit must make the digest lossy so it is spooled");
+        assert!(out.contains(&"x".repeat(200)) && out.contains(&"y".repeat(200)) && out.contains(" … "), "head and tail stay: {out}");
+        assert!(out.contains("full text"), "{out}");
+        let d = digest("rg -n needle_here .", &raw, "", 0).unwrap();
+        assert!(d.lossy());
+    }
+
+    #[test]
+    fn git_log_with_a_patch_stat_reflog_or_parents_is_left_alone() {
+        let head = "commit 1111111111111111111111111111111111111111\nAuthor: A <a@b.c>\nDate:   Mon Oct 19 10:00:00 2026 +0000\n\n    subject one\n";
+        let patch = format!("{head}\ndiff --git a/x.txt b/x.txt\nindex 111..222 100644\n--- a/x.txt\n+++ b/x.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+c\n d\n");
+        assert!(git_log(&patch).is_none(), "-U1 patch");
+        let stat = format!("{head}\n x.txt | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\ndiff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-b\n+c\n");
+        assert!(git_log(&stat).is_none(), "--patch-with-stat");
+        let reflog = "commit 1111111111111111111111111111111111111111 (HEAD -> main)\nReflog: HEAD@{0} (A <a@b.c>)\nReflog message: commit: subject one\nAuthor: A <a@b.c>\nDate:   Mon Oct 19 10:00:00 2026 +0000\n\n    subject one\n".to_string();
+        assert!(git_log(&reflog).is_none(), "-g");
+        let parents = "commit 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222\nAuthor: A <a@b.c>\nDate:   Mon Oct 19 10:00:00 2026 +0000\n\n    subject one\n".to_string();
+        assert!(git_log(&parents).is_none(), "--parents");
+        // The default shape (decorations, Merge:, message bodies) still condenses.
+        let plain = "commit 1111111111111111111111111111111111111111 (HEAD -> main, origin/main)\nMerge: 222 333\nAuthor: A <a@b.c>\nDate:   Mon Oct 19 10:00:00 2026 +0000\n\n    subject one\n\n    body line\n";
+        assert!(git_log(plain).is_some());
+        // Each of the four commands reaches the reply whole: the digest declines, generic compaction keeps the patch.
+        for (label, text) in [("git log -2 -U1", &patch), ("git log -2 --patch-with-stat", &stat), ("git log -g -3", &reflog), ("git log -2 --parents", &parents)] {
+            assert!(digest(label, text, "", 0).is_none(), "{label}");
+        }
+    }
+
+    #[test]
+    fn a_status_note_is_not_an_untracked_file() {
+        let raw = "On branch main\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n\tmodified:   a.txt\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tnew1.txt\n\tnew2.txt\n\nYour stash currently has 1 entry\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n";
+        let (out, _) = git_status(raw).expect("the stash note is state, not a reason to decline");
+        assert!(out.contains("untracked (2):") && !out.contains("untracked (3)"), "{out}");
+        assert!(out.contains("Your stash currently has 1 entry"), "{out}");
+        assert!(!out.contains("  Your stash"), "{out}");
+        // A note this digest does not know declines rather than becoming a file.
+        let slow = raw.replace("Your stash currently has 1 entry", "It took 5.12 seconds to enumerate untracked files.");
+        assert!(git_status(&slow).is_none());
     }
 }

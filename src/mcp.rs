@@ -90,8 +90,8 @@ fn serve_io<R: BufRead, W: Write + Send + 'static>(mut reader: R, out: W, limits
         // Admission: a call past `workers + queue` is refused at once, so a runaway client cannot
         // queue unbounded work. The wait for a slot happens on the worker thread, so this loop keeps
         // reading (cancel, ping) while every slot is busy.
-        active.fetch_add(1, Ordering::SeqCst);
-        let n = active.load(Ordering::SeqCst);
+        // One atomic step: a separate load could see a count other threads had already moved.
+        let n = active.fetch_add(1, Ordering::SeqCst) + 1;
         if n > limit {
             active.fetch_sub(1, Ordering::SeqCst);
             let text = format!(
@@ -382,6 +382,9 @@ fn guarded(req: &Value) -> Option<Value> {
     })
 }
 
+/// MCP revisions qx answers in, newest first. The tools and results here do not differ between them.
+const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
 fn handle(req: &Value) -> Option<Value> {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
     if method == "notifications/cancelled" {
@@ -394,10 +397,12 @@ fn handle(req: &Value) -> Option<Value> {
     let id = req.get("id").cloned()?;
     match method {
         "initialize" => {
+            // Echo a version qx speaks; for any other, answer with the newest and let the client decide.
             let ver = req
                 .pointer("/params/protocolVersion")
-                .and_then(|v| v.as_str())
-                .unwrap_or("2024-11-05");
+                .and_then(Value::as_str)
+                .and_then(|v| PROTOCOL_VERSIONS.iter().find(|p| **p == v))
+                .unwrap_or(&PROTOCOL_VERSIONS[0]);
             // The client names itself here; from now on every message is written for it.
             client::set_current(Client::detect(
                 req.pointer("/params/clientInfo/name").and_then(Value::as_str),
@@ -454,8 +459,9 @@ fn run_schema() -> Value {
         "name": "run",
         "title": "qx run",
         "description": format!(
-            "Run a local command (like {}, but faster). `program` + `args` execs directly; `command` is a shell line (auto: PowerShell for cmdlets, `$var`, `a; b`, single quotes; Git Bash for POSIX pipelines; else cmd). Common tools (ls cat head tail wc grep sed mkdir rm cp mv touch which) run in-process. Stdin is empty; output is compacted and secrets redacted; a cut output is saved to `full_output`. After `timeout_ms` (default 120000, max 270000) a command keeps running as a background job; follow it with `job`.",
-            c.native(Native::Shell)
+            "Run a local command (like {}, but faster). `program` + `args` execs directly; `command` is a shell line (auto: PowerShell for cmdlets, `$var`, `a; b`, single quotes; Git Bash for POSIX pipelines; else cmd). Common tools (ls cat head tail wc grep sed mkdir rm cp mv touch which) run in-process. Stdin is empty; output is compacted and secrets redacted; a cut output is saved to `full_output`. A command still running after `timeout_ms` (default 120000; this client is answered after {} at most) keeps running as a background job: follow it with `job`, `wait_ms`, `kill`. `kill_on_timeout` stops it instead.",
+            c.native(Native::Shell),
+            human(Duration::from_millis(soft_ms()))
         ),
         "inputSchema": {
             "type": "object",
@@ -465,7 +471,9 @@ fn run_schema() -> Value {
                 "command": { "type": "string", "description": "Shell line for pipes, redirects, chaining." },
                 "shell": { "type": "string", "enum": ["auto", "cmd", "bash", "powershell"], "default": "auto" },
                 "cwd": { "type": "string", "description": "Working directory." },
-                "timeout_ms": { "type": "integer", "default": 120000, "description": "Max 270000." },
+                "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Extra environment variables for the command." },
+                "timeout_ms": { "type": "integer", "default": 120000, "description": "1000 to 3600000; how long this call waits before the command becomes a job." },
+                "kill_on_timeout": { "type": "boolean", "description": "Stop the command at timeout_ms instead of moving it to a job." },
                 "mode": { "type": "string", "enum": ["compact", "full"], "default": "compact" },
                 "background": { "type": "boolean", "description": "Return a job id at once." },
                 "job": { "type": "string", "description": "Follow a background job by id, or `list`." },
@@ -480,7 +488,9 @@ fn run_schema() -> Value {
                 "source": { "type": "string" },
                 "exit_code": { "type": "integer" },
                 "duration_ms": { "type": "integer" },
+                "elapsed_ms": { "type": "integer" },
                 "timed_out": { "type": "boolean" },
+                "full_output": { "type": "string" },
                 "job": { "type": "string" },
                 "running": { "type": "boolean" },
                 "truncated": { "type": "boolean" },
@@ -593,7 +603,8 @@ fn soft_ms() -> u64 {
         _ => SOFT_MS_DEFAULT,
     }
 }
-/// A background job is killed after this long unless the call asked for less.
+/// A background job is killed after this long, whatever `timeout_ms` said: that only sets how long
+/// the first call waits (`kill_on_timeout` makes it the limit).
 const JOB_MAX_MS: u64 = 3_600_000;
 /// Live background jobs; below the process slots so a few jobs never starve ordinary commands.
 const MAX_LIVE_JOBS: usize = 6;
@@ -643,8 +654,9 @@ impl JobRec {
         let mut grace: Option<std::time::Instant> = None;
         let mut guard = self.result.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if let Some(r) = guard.take() {
-                return Some(r);
+            // Cloned, not taken: a second poll of the same job (a retry, a parallel call) gets the result too.
+            if let Some(r) = guard.as_ref() {
+                return Some(r.clone());
             }
             if call.cancelled() && !stop_on_cancel {
                 return None;
@@ -806,6 +818,8 @@ fn job_call(id: Option<Value>, job: &str, wait_ms: u64, kill: bool) -> Value {
             true,
         );
     };
+    // A job that was still running when asked to stop was stopped by the caller, not by a timeout.
+    let stopping = kill && !rec.done();
     let until = if kill {
         rec.cancel.store(true, Ordering::Relaxed);
         std::time::Instant::now() + Duration::from_secs(5)
@@ -813,9 +827,15 @@ fn job_call(id: Option<Value>, job: &str, wait_ms: u64, kill: bool) -> Value {
         std::time::Instant::now() + Duration::from_millis(wait_ms.min(soft_ms()))
     };
     match rec.wait(until, &call, kill) {
-        Some(res) => {
+        Some(mut res) => {
             forget_job(job);
-            let prefix = format!("[qx] job {job} finished after {}\n", human(rec.started.elapsed()));
+            if stopping {
+                if let Ok((o, _)) = &mut res {
+                    o.timed_out = false;
+                }
+            }
+            let how = if stopping { "stopped on request" } else { "finished" };
+            let prefix = format!("[qx] job {job} {how} after {}\n", human(rec.started.elapsed()));
             finish(id, res, &rec.ctx, &prefix)
         }
         None => {
@@ -873,18 +893,78 @@ fn flag_arg(args: &Value, keys: &[&str]) -> bool {
     })
 }
 
+/// Every key `run` reads, with the alternate spellings clients use (see `text_arg`, `number_arg`).
+const RUN_KEYS: &[&str] = &[
+    "program", "args", "command", "shell", "cwd", "workdir", "env", "timeout_ms", "timeoutMs", "kill_on_timeout", "mode",
+    "background", "run_in_background", "job", "wait_ms", "kill",
+];
+
+/// `env`: an object of strings. A name with `=` or nothing in it cannot be an environment variable.
+fn env_arg(args: &Value) -> Result<Vec<(String, String)>, String> {
+    let m = match args.get("env") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Object(m)) => m,
+        Some(other) => return Err(format!("`env` must be an object of strings, got {other}")),
+    };
+    m.iter()
+        .map(|(k, v)| match v.as_str() {
+            _ if k.is_empty() || k.contains(['=', '\0']) => Err(format!("`env` name {k:?} is not a valid variable name")),
+            Some(s) if !s.contains('\0') => Ok((k.clone(), s.to_string())),
+            _ => Err(format!("`env.{k}` must be a string, got {v}")),
+        })
+        .collect()
+}
+
+/// Run `work` on its own thread and wait for it, but stop waiting at once when the call is cancelled.
+/// The thread is left to finish alone. Err says why there is no value.
+fn cancellable<T: Send + 'static>(call: &Inflight, work: impl FnOnce() -> T + Send + 'static) -> Result<T, &'static str> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("qx-fs".into())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .map_err(|_| "could not start a worker thread")?;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(v) => return Ok(v),
+            Err(RecvTimeoutError::Disconnected) => return Err("panicked"),
+            Err(RecvTimeoutError::Timeout) if call.cancelled() => return Err("cancelled"),
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
 fn call_tool(req: &Value, id: Option<Value>) -> Value {
     let name = req.pointer("/params/name").and_then(Value::as_str).unwrap_or("");
     // Borrowed: a write's `content` can be megabytes, and cloning it per call bought nothing.
     static NO_ARGS: OnceLock<Value> = OnceLock::new();
     let args = req.pointer("/params/arguments").unwrap_or_else(|| NO_ARGS.get_or_init(|| json!({})));
     if name == "fs" {
-        let reply = crate::fsops::call(args);
-        return tool_result(id, &reply.text, reply.is_error, reply.structured);
+        // On its own thread, so a cancel is answered at once; `fsops` has no cancel hook, so the work
+        // (a big grep, a write) finishes alone.
+        let call = Inflight::begin(&id);
+        if call.cancelled() {
+            return tool_text(id, "[qx] cancelled before it started; not run", true);
+        }
+        let args = args.clone();
+        return match cancellable(&call, move || crate::fsops::call(&args)) {
+            Ok(reply) => tool_result(id, &reply.text, reply.is_error, reply.structured),
+            Err(why) => tool_text(id, &format!("[qx] fs call {why}; it may still finish in the background"), true),
+        };
     }
     if name != "run" {
         return tool_text(id, "unknown tool (expected `run` or `fs`)", true);
     }
+    // A misspelt key (`cwdd`, `timeout`) would run the command in the wrong place or for the wrong time.
+    if let Some(bad) = args.as_object().and_then(|m| m.keys().find(|k| !RUN_KEYS.contains(&k.as_str()))) {
+        return tool_text(id, &format!("unknown argument `{bad}`; `run` takes: {}", RUN_KEYS.join(", ")), true);
+    }
+    let user_env = match env_arg(args) {
+        Ok(e) => e,
+        Err(e) => return tool_text(id, &e, true),
+    };
 
     // A field of the wrong type is an error: ignoring it would run the command somewhere else
     // (`cwd`), for another time (`timeout_ms`), or as a different command (`program`).
@@ -1006,7 +1086,10 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
     let window = Duration::from_millis(if promote { timeout_ms.min(soft_ms()) } else { timeout_ms });
     let hard = if promote { Duration::from_millis(JOB_MAX_MS) } else { window };
     // mode "full" promises the untouched text: built-ins must not sample their own output either.
-    let full_env: Vec<(String, String)> = if full { vec![("QX_LS_FULL".into(), "1".into())] } else { Vec::new() };
+    let mut full_env = user_env;
+    if full {
+        full_env.push(("QX_LS_FULL".into(), "1".into()));
+    }
     let ctx = RunCtx {
         label,
         cwd: cwd.clone(),
@@ -1030,8 +1113,10 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
             } else {
                 let c = cmdline.unwrap_or_default();
                 // The guard judged the whole line; env prefixes only change what runs.
-                let (mut envs, c) = exec::peel_env(&c);
-                envs.extend(full_env);
+                // The call's own `env` first: a prefix written in the line is the more specific one.
+                let (peeled, c) = exec::peel_env(&c);
+                let mut envs = full_env;
+                envs.extend(peeled);
                 let direct = exec::split_simple(c)
                     .and_then(|(prog, sargs)| run_direct(&prog, &sargs, &envs, cwd.as_deref(), window, hard, "direct").ok());
                 match direct {
@@ -1276,7 +1361,8 @@ fn run_direct(
             return exec::run_chain(cmds, Some(hard)).map(|o| (o, "direct")).map_err(started);
         }
     }
-    // Built-ins run in this thread: the call's deadline lets them stop on time, like a child.
+    // Built-ins run in this thread and stop at the same `hard` limit as a child: past `timeout`
+    // the call turns into a job and the work goes on, it is not cut at the first answer.
     struct Deadline;
     impl Drop for Deadline {
         fn drop(&mut self) {
@@ -1284,7 +1370,7 @@ fn run_direct(
         }
     }
     let _deadline = Deadline;
-    exec::set_deadline(Some(std::time::Instant::now() + timeout));
+    exec::set_deadline(Some(std::time::Instant::now() + hard));
     let stopped = |mut o: exec::Outcome| {
         o.timed_out = true;
         o.code = 124;
@@ -1533,7 +1619,9 @@ mod tests {
     fn a_builtin_stops_on_timeout_and_on_cancel() {
         let _server = server_lock();
         let t = std::time::Instant::now();
-        let r = client::scoped(Client::Dsh, || call_id(80, json!({"program":"sleep","args":["5"],"timeout_ms":1000})));
+        let r = client::scoped(Client::Dsh, || {
+            call_id(80, json!({"program":"sleep","args":["5"],"timeout_ms":1000,"kill_on_timeout":true}))
+        });
         assert!(t.elapsed() < Duration::from_secs(3), "timeout ignored: {:?}", t.elapsed());
         assert_eq!(r.pointer("/result/structuredContent/timed_out"), Some(&json!(true)), "{r}");
         let worker = std::thread::spawn(|| {
@@ -1852,6 +1940,143 @@ mod tests {
         let live = Inflight(None, None);
         let r = rec.wait(std::time::Instant::now() + Duration::from_secs(5), &live, false);
         assert_eq!(r.map(|x| x.err()), Some(Some("finished".to_string())));
+    }
+
+    #[test]
+    fn two_polls_of_one_job_both_get_the_result() {
+        let _server = server_lock();
+        let ctx = RunCtx { label: "t".into(), cwd: None, full: false, guard_warning: None, cwd_note: None };
+        let rec = spawn_runner(ctx, || {
+            std::thread::sleep(Duration::from_millis(300));
+            Err("done".to_string())
+        });
+        let poll = |rec: Arc<JobRec>| {
+            std::thread::spawn(move || {
+                let live = Inflight(None, None);
+                rec.wait(std::time::Instant::now() + Duration::from_secs(5), &live, false).map(|r| r.err())
+            })
+        };
+        let (a, b) = (poll(rec.clone()), poll(rec.clone()));
+        assert_eq!(a.join().unwrap(), Some(Some("done".to_string())));
+        assert_eq!(b.join().unwrap(), Some(Some("done".to_string())));
+    }
+
+    #[test]
+    fn a_slow_call_that_is_cancelled_answers_at_once_and_its_worker_finishes_alone() {
+        let _server = server_lock();
+        let id = json!(987_654_322u64);
+        let call = Inflight::begin(&Some(id.clone()));
+        let done = Arc::new(AtomicBool::new(false));
+        let d = done.clone();
+        let canceller = {
+            let id = id.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                cancel(&id);
+            })
+        };
+        let t = std::time::Instant::now();
+        let got = cancellable(&call, move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            d.store(true, Ordering::SeqCst);
+            7
+        });
+        assert_eq!(got, Err("cancelled"), "a cancelled call reports nothing");
+        assert!(t.elapsed() < Duration::from_millis(500), "and returns at once: {:?}", t.elapsed());
+        assert!(!done.load(Ordering::SeqCst));
+        canceller.join().unwrap();
+        std::thread::sleep(Duration::from_millis(1700));
+        assert!(done.load(Ordering::SeqCst), "the worker was left to finish");
+        let live = Inflight(None, None);
+        assert_eq!(cancellable(&live, || 5), Ok(5));
+    }
+
+    #[test]
+    fn an_fs_call_still_answers() {
+        let _server = server_lock();
+        let cwd = std::env::temp_dir().to_string_lossy().to_string();
+        let r = client::scoped(Client::Dsh, || {
+            respond(&json!({"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"fs","arguments":{"op":"stat","path":".","cwd":cwd}}}).to_string())
+                .expect("answered")
+        });
+        assert_ne!(r.pointer("/result/isError"), Some(&json!(true)), "{r}");
+        assert_eq!(r.pointer("/result/structuredContent/op"), Some(&json!("stat")), "{r}");
+    }
+
+    #[test]
+    fn env_reaches_the_child_and_unknown_keys_are_refused() {
+        let _server = server_lock();
+        let said = |args: Value| -> (bool, String) {
+            let r = client::scoped(Client::Dsh, || call(args));
+            (
+                r.pointer("/result/isError") == Some(&json!(true)),
+                r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default().to_string(),
+            )
+        };
+        let (_, out) = said(json!({"program":"cmd","args":["/c","set","QX_T_ENV"],"env":{"QX_T_ENV":"hello-env"}}));
+        assert!(out.contains("QX_T_ENV=hello-env"), "program: {out}");
+        let (_, out) = said(json!({"command":"cmd /c set QX_T_ENV","env":{"QX_T_ENV":"hello-line"}}));
+        assert!(out.contains("QX_T_ENV=hello-line"), "command: {out}");
+        // A typo used to run the command in the wrong place, in silence.
+        let (bad, out) = said(json!({"program":"echo","args":["x"],"cwdd":"."}));
+        assert!(bad && out.contains("cwdd") && out.contains("cwd") && out.contains("timeout_ms"), "{out}");
+        for env in [json!("A=1"), json!({"A":1}), json!({"A=B":"x"}), json!({"":"x"})] {
+            let (bad, out) = said(json!({"program":"echo","args":["x"],"env":env}));
+            assert!(bad && out.contains("env"), "{env}: {out}");
+        }
+    }
+
+    #[test]
+    fn initialize_answers_with_a_protocol_version_qx_supports() {
+        let _server = server_lock();
+        let ask = |v: Option<&str>| -> String {
+            let mut params = json!({});
+            if let Some(v) = v {
+                params["protocolVersion"] = json!(v);
+            }
+            client::scoped(Client::Dsh, || handle(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":params})))
+                .and_then(|r| r.pointer("/result/protocolVersion").and_then(Value::as_str).map(str::to_string))
+                .expect("a version")
+        };
+        assert_eq!(ask(Some("2024-11-05")), "2024-11-05");
+        assert_eq!(ask(Some("2025-03-26")), "2025-03-26");
+        assert_eq!(ask(Some("2099-01-01")), PROTOCOL_VERSIONS[0]);
+        assert_eq!(ask(Some("junk")), PROTOCOL_VERSIONS[0]);
+        assert_eq!(ask(None), PROTOCOL_VERSIONS[0]);
+    }
+
+    #[test]
+    fn a_builtin_past_timeout_ms_becomes_a_job_like_a_program() {
+        let _server = server_lock();
+        let run = |args: Value| client::scoped(Client::Dsh, || call(args));
+        let r = run(json!({"program":"sleep","args":["2"],"timeout_ms":1000}));
+        let job = r
+            .pointer("/result/structuredContent/job")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("a job handle, got {r}"))
+            .to_string();
+        let r = run(json!({"job":job,"wait_ms":8000}));
+        assert_eq!(r.pointer("/result/structuredContent/exit_code"), Some(&json!(0)), "{r}");
+        assert!(r.pointer("/result/structuredContent/timed_out").is_none(), "{r}");
+    }
+
+    #[test]
+    fn a_job_stopped_on_request_says_so_and_is_not_a_timeout() {
+        let _server = server_lock();
+        let run = |args: Value| client::scoped(Client::Dsh, || call(args));
+        let r = run(json!({"program":"sleep","args":["30"],"background":true}));
+        let job = r
+            .pointer("/result/structuredContent/job")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("a job handle, got {r}"))
+            .to_string();
+        let t = std::time::Instant::now();
+        let r = run(json!({"job":job,"kill":true}));
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        let text = r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default();
+        assert!(text.contains("stopped on request"), "{text}");
+        assert!(!text.contains("timed_out"), "{text}");
+        assert!(r.pointer("/result/structuredContent/timed_out").is_none(), "{r}");
     }
 
     #[cfg(windows)]

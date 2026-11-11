@@ -1545,13 +1545,52 @@ fn cmd_sed(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut line_no = 0usize;
     // The last line printed had no newline (end of a file): GNU sed adds it once more output follows.
     let mut owed_newline = false;
+    let mut emit = |line: &str, out: &mut String| {
+        let has_nl = line.ends_with('\n');
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        // qx normalises a CRLF line ending, as head, cat and tail do here.
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if owed_newline {
+            out.push('\n');
+        }
+        out.push_str(line);
+        if has_nl {
+            out.push('\n');
+        }
+        // The last line of the input keeps whatever terminator it had.
+        owed_newline = !has_nl;
+    };
     for raw in &paths {
         let path = path_of(cwd, raw);
-        if !fs::metadata(&path).ok()?.is_file() {
+        let md = fs::metadata(&path).ok()?;
+        if !md.is_file() {
             return None;
         }
+        if md.len() > READ_CAP {
+            // Past the cap: stream the top of the file and stop at the range. A range that does not end
+            // inside the first READ_CAP bytes, or a binary file, is the real tool's.
+            let mut reader = BufReader::new(fs::File::open(&path).ok()?.take(READ_CAP));
+            let mut buf = Vec::new();
+            while line_no < to {
+                buf.clear();
+                if reader.read_until(b'\n', &mut buf).ok()? == 0 {
+                    break;
+                }
+                if buf.contains(&0) || (!buf.ends_with(b"\n") && reader.get_ref().limit() == 0) {
+                    return None;
+                }
+                line_no += 1;
+                if line_no >= from {
+                    emit(&crate::exec::decode(&buf), &mut out);
+                }
+            }
+            if line_no < to && reader.get_ref().limit() == 0 {
+                return None;
+            }
+            continue;
+        }
         let bytes = fs::read(&path).ok()?;
-        if bytes.len() as u64 > READ_CAP || bytes[..bytes.len().min(8192)].contains(&0) {
+        if bytes[..bytes.len().min(8192)].contains(&0) {
             return None;
         }
         let text = crate::exec::decode(&bytes);
@@ -1560,22 +1599,9 @@ fn cmd_sed(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             if line_no > to {
                 break;
             }
-            if line_no < from {
-                continue;
+            if line_no >= from {
+                emit(line, &mut out);
             }
-            let has_nl = line.ends_with('\n');
-            let line = line.strip_suffix('\n').unwrap_or(line);
-            // qx normalises a CRLF line ending, as head, cat and tail do here.
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            if owed_newline {
-                out.push('\n');
-            }
-            out.push_str(line);
-            if has_nl {
-                out.push('\n');
-            }
-            // The last line of the input keeps whatever terminator it had.
-            owed_newline = !has_nl;
         }
     }
     Some(ok(out))
@@ -1602,7 +1628,8 @@ fn cmd_mkdir(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut code = 0;
     for p in paths {
         let path = path_of(cwd, p);
-        let res = if parents {
+        // A `\` path only reaches here from a cmd line (bash eats it), and cmd's mkdir makes the parents.
+        let res = if parents || p.contains('\\') {
             fs::create_dir_all(&path)
         } else {
             fs::create_dir(&path)
@@ -1849,6 +1876,11 @@ fn cmd_cp(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         } else {
             dst.clone()
         };
+        if src.is_dir() && target.is_file() {
+            err.push_str(&format!("cp: cannot overwrite non-directory '{}' with directory '{}'\n", target.display(), src.display()));
+            code = 1;
+            continue;
+        }
         if into_self(&src, &target, false) {
             err.push_str(&format!(
                 "cp: {} -> {}: destination is the source or inside it\n",
@@ -1981,7 +2013,8 @@ fn cmd_touch(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         return None;
     }
     let readonly = |a: &String| fs::metadata(path_of(cwd, a)).is_ok_and(|m| m.permissions().readonly());
-    if args.iter().any(readonly) {
+    // A folder cannot be opened for append; the real touch updates its time.
+    if args.iter().any(readonly) || args.iter().any(|a| path_of(cwd, a).is_dir()) {
         return None;
     }
     let mut err = String::new();
@@ -2113,7 +2146,7 @@ fn cmd_whoami(args: &[String]) -> Option<BuiltinOut> {
         Some(d) => format!("{d}\\{user}\n"),
         None => format!("{user}\n"),
     };
-    Some(ok(line))
+    Some(ok(line.to_lowercase()))
 }
 
 fn cmd_hostname(args: &[String]) -> Option<BuiltinOut> {
@@ -2598,7 +2631,10 @@ mod tests {
             "1\n3\n5\n"
         );
         assert!(!try_exec("hostname", &[], None, &[]).unwrap().stdout.trim().is_empty());
-        assert!(!try_exec("whoami", &[], None, &[]).unwrap().stdout.trim().is_empty());
+        let me = try_exec("whoami", &[], None, &[]).unwrap().stdout;
+        // whoami.exe prints `host\user` in lower case; scripts compare that string.
+        assert!(!me.trim().is_empty());
+        assert_eq!(me, me.to_lowercase());
         let rp = try_exec("realpath", &[String::from(".")], None, &[]).unwrap();
         assert_eq!(rp.code, 0);
         assert!(rp.stdout.trim().len() > 1);
@@ -2614,6 +2650,21 @@ mod tests {
     fn run(name: &str, args: &[&str], cwd: &Path) -> Option<BuiltinOut> {
         let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         try_exec(name, &a, Some(cwd), &[])
+    }
+
+    #[test]
+    fn mkdir_touch_and_cp_match_the_tools_they_stand_in_for() {
+        let d = scratch("mkdir-touch-cp");
+        assert_eq!(run("mkdir", &[r"p\q\r"], &d).unwrap().code, 0); // cmd's mkdir makes the parents
+        assert!(d.join("p/q/r").is_dir());
+        assert_eq!(run("mkdir", &["x/y"], &d).unwrap().code, 1); // GNU without -p does not
+        assert!(run("touch", &["p"], &d).is_none()); // a folder goes to the real touch
+        fs::write(d.join("f1"), "x").unwrap();
+        let o = run("cp", &["-r", "p", "f1"], &d).unwrap();
+        assert_eq!(o.code, 1);
+        assert!(o.stderr.contains("cannot overwrite non-directory"), "{}", o.stderr);
+        assert_eq!(fs::read_to_string(d.join("f1")).unwrap(), "x");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -2854,6 +2905,22 @@ mod tests {
             let out = run("sed", &case, &d).expect("built-in declined a range it claims");
             assert_eq!((out.code, out.stdout.as_str()), (0, want), "{case:?}");
         }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A range at the top of a file past the read cap is answered from a stream that stops at the range.
+    #[test]
+    fn sed_range_of_a_file_past_the_read_cap_streams_and_stops_early() {
+        let d = scratch("sed-large");
+        let mut big = b"a\nb\nc\nd\n".to_vec();
+        big.resize(READ_CAP as usize + 4096, b'z');
+        fs::write(d.join("large.txt"), &big).unwrap();
+        let t = std::time::Instant::now();
+        let out = run("sed", &["-n", "1,3p", "large.txt"], &d).expect("built-in declined the top of a large file");
+        assert_eq!((out.code, out.stdout.as_str()), (0, "a\nb\nc\n"));
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        // A range that needs more than the cap of one line is still the real tool's.
+        assert!(run("sed", &["-n", "5p", "large.txt"], &d).is_none());
         let _ = fs::remove_dir_all(&d);
     }
 

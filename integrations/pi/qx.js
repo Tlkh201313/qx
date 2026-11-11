@@ -28,30 +28,72 @@ const RUN_PARAMETERS = Type.Object({
     ]),
   ),
   cwd: Type.Optional(Type.String({ description: "Working directory." })),
-  timeout_ms: Type.Optional(Type.Number({ description: "Default 120000." })),
+  timeout_ms: Type.Optional(
+    Type.Number({
+      description: "Default 120000 (1000 to 3600000); the call answers after 270000 at most. A command still running then becomes a background job.",
+    }),
+  ),
+  kill_on_timeout: Type.Optional(
+    Type.Boolean({ description: "Stop the command at timeout_ms instead of moving it to a job." }),
+  ),
+  env: Type.Optional(
+    Type.Record(Type.String(), Type.String(), { description: "Extra environment variables for the command." }),
+  ),
   mode: Type.Optional(
     Type.Union([Type.Literal("compact"), Type.Literal("full")], {
       description: "compact (default) or full.",
     }),
   ),
+  background: Type.Optional(Type.Boolean({ description: "Return a job id at once." })),
+  job: Type.Optional(Type.String({ description: "Follow a background job by id, or `list`." })),
+  wait_ms: Type.Optional(
+    Type.Number({ description: "With `job`: wait for it this long (default 15000)." }),
+  ),
+  kill: Type.Optional(Type.Boolean({ description: "With `job`: stop it." })),
 });
 
 const FS_PARAMETERS = Type.Object({
-  op: Type.Union(
-    ["read", "write", "edit", "glob", "grep", "list", "stat"].map((name) =>
-      Type.Literal(name),
+  op: Type.Optional(
+    Type.Union(
+      ["read", "write", "edit", "glob", "grep", "list", "stat"].map((name) =>
+        Type.Literal(name),
+      ),
     ),
   ),
-  cwd: Type.String({ description: "Session working directory; qx confines paths to it." }),
+  cwd: Type.String({ description: "Session working directory; writes stay inside it." }),
   path: Type.Optional(Type.String({ description: "File or directory. Defaults to '.'." })),
   file_path: Type.Optional(Type.String({ description: "Alias for path." })),
+  paths: Type.Optional(
+    Type.Array(Type.String(), { description: "read/stat: many paths in one call." }),
+  ),
+  ops: Type.Optional(
+    Type.Array(Type.Object({}), {
+      description: "Batch: [{op, ...}], up to 32, run in order with the shared cwd.",
+    }),
+  ),
   content: Type.Optional(Type.String({ description: "write: complete new content." })),
-  old_string: Type.Optional(Type.String({ description: "edit: literal text to replace." })),
+  old_string: Type.Optional(Type.String({ description: "edit: exact text to replace." })),
   new_string: Type.Optional(Type.String({ description: "edit: replacement text." })),
   replace_all: Type.Optional(Type.Boolean({ description: "edit: replace every match." })),
-  pattern: Type.Optional(Type.String({ description: "glob: pattern. grep: literal text." })),
+  edits: Type.Optional(
+    Type.Array(
+      Type.Object({
+        old_string: Type.String(),
+        new_string: Type.String(),
+        replace_all: Type.Optional(Type.Boolean()),
+      }),
+      { description: "edit: several replacements on one path, all or none." },
+    ),
+  ),
+  pattern: Type.Optional(
+    Type.String({ description: "glob: path pattern. grep: regex; set literal:true for plain text." }),
+  ),
+  literal: Type.Optional(Type.Boolean({ description: "grep: plain text, not regex." })),
   include: Type.Optional(Type.String({ description: "grep: one glob to limit files." })),
-  ignore_case: Type.Optional(Type.Boolean()),
+  ignore_case: Type.Optional(Type.Boolean({ description: "grep: ignore case." })),
+  all: Type.Optional(
+    Type.Boolean({ description: "glob/grep: include node_modules, target, build, dist, vendor." }),
+  ),
   offset: Type.Optional(Type.Number()),
   limit: Type.Optional(Type.Number()),
   max_results: Type.Optional(Type.Number()),
@@ -60,10 +102,10 @@ const FS_PARAMETERS = Type.Object({
 });
 
 const RUN_DESCRIPTION =
-  "Run a local command fast through qx. Prefer `program` + `args` (direct exec, no shell); use `command` only for pipes/redirects. In-process built-ins: pwd, echo, ls, cat, head, tail, wc, mkdir, rm, cp, mv, touch, which, realpath, whoami, hostname, seq, sleep. Output is compacted and secrets are redacted. On failure fall back to the native `bash` tool.";
+  "Run a local command fast through qx. Prefer `program` + `args` (direct exec, no shell); use `command` only for pipes/redirects. In-process built-ins: pwd, echo, ls, cat, head, tail, wc, grep, sed, mkdir, rm, cp, mv, touch, which, basename, dirname, realpath, whoami, hostname, seq, sleep. Output is compacted and secrets are redacted. A command still running after `timeout_ms` keeps running as a background job: follow it with `job` and `wait_ms`, stop it with `kill`. On failure fall back to the native `bash` tool.";
 
 const FS_DESCRIPTION =
-  "Fast in-process filesystem operations: op=read (line-numbered), write, edit (literal replace), glob, grep (literal), list, stat. Always pass `cwd`; paths outside it are refused. write/edit need a prior qx read of the same version. On any error fall back to the native `read`/`write`/`edit` tools.";
+  "Fast in-process filesystem operations: op=read (line-numbered), write, edit (exact unique replace), glob, grep (regex; literal:true for plain text), list, stat. Batch with `ops`, read many with `paths`, apply several edits to one file with `edits`. Always pass `cwd`; writes outside it are refused, reads can go anywhere. Replacing an existing file with write needs a prior qx read; edit does not. On any error fall back to the native `read`/`write`/`edit` tools.";
 
 export default function (pi) {
   const register = (name, label, description, parameters, tool) => {

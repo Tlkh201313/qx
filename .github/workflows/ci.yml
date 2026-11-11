@@ -28,6 +28,9 @@ jobs:
         run: cargo clippy --release --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --release --locked
+      # Dev profile keeps overflow checks and debug asserts on, which release turns off.
+      - name: Tests (dev profile)
+        run: cargo test --locked
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -36,8 +39,10 @@ jobs:
           cargo build --release --locked
           node integrations/pi/bridge.test.mjs
           node integrations/pi/smoke.mjs target/release/qx.exe
-      - name: Bench table (Goal.md; timings are printed, never gated)
-        continue-on-error: true
+      # Spawned timings are printed only; an in-process median over 10 ms (target 2 ms; runners are noisy) fails the job.
+      - name: Bench table (Goal.md)
+        env:
+          QX_BENCH_MAX_INPROC_MS: "10"
         run: python scripts/bench_mcp.py "$env:GITHUB_WORKSPACE\target\release\qx.exe" "$env:GITHUB_WORKSPACE"
 
   msrv:

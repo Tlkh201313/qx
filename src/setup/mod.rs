@@ -53,6 +53,7 @@ pub enum Action {
     Remove,
 }
 
+#[derive(Debug)]
 pub enum Edit {
     Unchanged,
     Changed(String),
@@ -158,13 +159,58 @@ fn claude_hook(exe: &Path) -> Value {
     })
 }
 
-/// A group that holds only a `qx hook claude` entry, from this build or an older one.
-fn is_qx_hook(group: &Value) -> bool {
-    let Some([hook]) = group["hooks"].as_array().map(Vec::as_slice) else { return false };
+/// A `qx hook claude` command, from this build or an older one.
+fn is_qx_command(hook: &Value) -> bool {
     let qx = Path::new(hook["command"].as_str().unwrap_or_default())
         .file_stem()
         .is_some_and(|s| s.eq_ignore_ascii_case("qx"));
     qx && hook["args"] == json!(["hook", "claude"])
+}
+
+/// A group that holds only a `qx hook claude` entry.
+fn is_qx_hook(group: &Value) -> bool {
+    matches!(group["hooks"].as_array().map(Vec::as_slice), Some([hook]) if is_qx_command(hook))
+}
+
+/// A group that holds a `qx hook claude` entry next to hooks of the user's own.
+fn is_mixed_qx_group(group: &Value) -> bool {
+    !is_qx_hook(group) && group["hooks"].as_array().is_some_and(|hooks| hooks.iter().any(is_qx_command))
+}
+
+/// The group with its qx hooks pointed at `exe` (Install) or taken out (Remove).
+fn mixed_group_edit(group: &Value, exe: &Path, a: Action) -> Value {
+    let mut group = group.clone();
+    if let Some(hooks) = group["hooks"].as_array_mut() {
+        match a {
+            Action::Install => {
+                for hook in hooks.iter_mut().filter(|h| is_qx_command(h)) {
+                    hook["command"] = json!(exe.to_string_lossy());
+                }
+            }
+            Action::Remove => hooks.retain(|h| !is_qx_command(h)),
+        }
+    }
+    group
+}
+
+/// `current` with the qx hook installed or removed. A group that also holds the user's hooks
+/// is edited in place, never joined by a second qx group.
+fn claude_hook_text(current: &str, groups: &[Value], exe: &Path, a: Action) -> Result<String, String> {
+    let mut text = current.to_string();
+    for (i, group) in groups.iter().enumerate().filter(|(_, g)| is_mixed_qx_group(g)) {
+        let edited = mixed_group_edit(group, exe, a);
+        if edited != *group {
+            text = jsonc::replace_element(&text, PRE_TOOL_USE, i, &edited)?;
+        }
+    }
+    text = jsonc::remove_elements(&text, PRE_TOOL_USE, is_qx_hook)?;
+    match a {
+        Action::Install if groups.iter().any(is_mixed_qx_group) => Ok(text),
+        Action::Install => jsonc::push_element(&text, PRE_TOOL_USE, &claude_hook(exe)),
+        // Only a file qx changed is tidied: an empty list the user left there stays.
+        Action::Remove if text == current => Ok(text),
+        Action::Remove => jsonc::prune_empty(&text, PRE_TOOL_USE),
+    }
 }
 
 fn edit_claude_hook(file: &Path, exe: &Path, a: Action) -> Edit {
@@ -175,19 +221,18 @@ fn edit_claude_hook(file: &Path, exe: &Path, a: Action) -> Edit {
 ".to_string(),
         Err(e) => return Edit::Refuse(e),
     };
-    let want = claude_hook(exe);
-    let ours: Vec<Value> = match jsonc::elements(&current, PRE_TOOL_USE) {
-        Ok(groups) => groups.into_iter().filter(is_qx_hook).collect(),
+    let groups = match jsonc::elements(&current, PRE_TOOL_USE) {
+        Ok(groups) => groups,
         Err(e) => return Edit::Refuse(format!("{}: {e}", file.display())),
     };
-    if a == Action::Install && ours == [want.clone()] {
+    let ours: Vec<&Value> = groups.iter().filter(|g| is_qx_hook(g)).collect();
+    let current_hook = claude_hook(exe);
+    let settled = ours == [&current_hook]
+        && groups.iter().filter(|g| is_mixed_qx_group(g)).all(|g| mixed_group_edit(g, exe, a) == *g);
+    if a == Action::Install && settled {
         return Edit::Unchanged;
     }
-    let updated = jsonc::remove_elements(&current, PRE_TOOL_USE, is_qx_hook).and_then(|text| match a {
-        Action::Install => jsonc::push_element(&text, PRE_TOOL_USE, &want),
-        Action::Remove => Ok(text),
-    });
-    match updated {
+    match claude_hook_text(&current, &groups, exe, a) {
         Ok(text) if text == current => Edit::Unchanged,
         Ok(text) if parse_strict(&text).is_some() => Edit::Changed(text),
         Ok(_) => Edit::Refuse(format!("the edit would leave {} unparseable; edit it by hand", file.display())),
@@ -266,7 +311,14 @@ fn edit_json_file(
                 .and_then(|range| serde_json::from_str(&jsonc::to_strict_json(&current[range])).ok());
             let updated = match a {
                 Action::Install => jsonc::set_member(current, path, &entry(existing.as_ref())),
-                Action::Remove => jsonc::remove_member(current, path),
+                // Only a file qx changed is tidied: an empty section the user left there stays.
+                Action::Remove => jsonc::remove_member(current, path).and_then(|text| {
+                    if text == current {
+                        Ok(text)
+                    } else {
+                        jsonc::prune_empty(&text, &path[..path.len() - 1])
+                    }
+                }),
             };
             match updated {
                 Ok(text) if text == current => Edit::Unchanged,
@@ -358,19 +410,21 @@ fn opencode_entry(exe: &Path, existing: Option<&Value>) -> Value {
 }
 
 /// Write one planned change: back up, write a temp file, rename over the original.
-/// Empty text removes the file — no config format qx writes is valid and empty, and
+/// Empty text (or a bare `{}`) removes the file — no config format qx writes is valid and empty, and
 /// removing an extension means removing its files.
 pub fn apply(ch: &Change) -> std::io::Result<()> {
     let Edit::Changed(text) = &ch.edit else {
         return Ok(());
     };
+    // A symlinked config (dotfiles) is edited where it points: the link stays a link.
+    let target = write_target(&ch.file);
     if !text.is_empty() {
-        if let Some(parent) = ch.file.parent() {
+        if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
     }
     // Removing a file keeps the first backup too: the file may be one the user edited.
-    if ch.file.exists() {
+    if let Ok(existing) = std::fs::read(&ch.file) {
         let backup = ch.file.with_extension(format!(
             "{}qx-bak",
             ch.file
@@ -379,29 +433,66 @@ pub fn apply(ch: &Change) -> std::io::Result<()> {
                 .unwrap_or_default()
         ));
         // The first backup is the user's own file; a later run must not replace it with qx's edit.
-        if !backup.exists() {
+        if !backup.exists() && !leaves_nothing_of_the_users(ch.client, text, &existing) {
             std::fs::copy(&ch.file, &backup)?;
         }
     }
-    if text.is_empty() {
+    // A JSON config qx emptied to `{}` goes too: the client reads a missing file as `{}`.
+    if text.is_empty() || text.trim_start_matches('\u{feff}').trim() == "{}" {
         return match std::fs::remove_file(&ch.file) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if ch.client == Client::Pi {
+                    drop_empty_extension_dirs(&ch.file);
+                }
+                Ok(())
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         };
     }
-    let tmp = ch
-        .file
-        .with_extension(format!("qx-tmp-{}", std::process::id()));
+    let tmp = target.with_extension(format!("qx-tmp-{}", std::process::id()));
     let written = std::fs::File::create(&tmp).and_then(|mut f| {
         use std::io::Write;
         f.write_all(text.as_bytes())?;
         // On disk before the rename, so a crash leaves the old file or the whole new one.
         f.sync_all()
     });
-    written.and_then(|()| std::fs::rename(&tmp, &ch.file)).inspect_err(|_| {
+    written.and_then(|()| std::fs::rename(&tmp, &target)).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// `extensions/qx` and `extensions` go when the last file in them does; `remove_dir` only ever
+/// removes an empty folder.
+fn drop_empty_extension_dirs(file: &Path) {
+    let mut dir = file.parent();
+    while let Some(d) = dir.filter(|d| d.file_name().is_some_and(|n| n == "qx" || n == "extensions")) {
+        if std::fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
+}
+
+/// Where a write to `file` lands: the target of a symlink, else the file itself.
+fn write_target(file: &Path) -> PathBuf {
+    let is_link = std::fs::symlink_metadata(file).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        return file.to_path_buf();
+    }
+    std::fs::canonicalize(file)
+        .or_else(|_| std::fs::read_link(file).map(|l| file.parent().unwrap_or(Path::new("")).join(l)))
+        .unwrap_or_else(|_| file.to_path_buf())
+}
+
+/// A file qx made, and now empties, holds nothing worth a `.qx-bak`: the text qx wrote itself,
+/// or a config with no member left. (pi's extension files are compared with what qx generates.)
+fn leaves_nothing_of_the_users(client: Client, text: &str, existing: &[u8]) -> bool {
+    if client == Client::Pi && text.is_empty() {
+        return std::str::from_utf8(existing).is_ok_and(pi::is_generated);
+    }
+    let bare = text.trim_start_matches('\u{feff}').trim();
+    bare.is_empty() || bare == "{}"
 }
 
 /// Two spellings of one file: slashes and case do not matter on Windows.
@@ -426,8 +517,14 @@ pub fn status(c: Client, p: &Paths) -> Status {
             let hook = std::fs::read_to_string(claude_settings(p))
                 .ok()
                 .and_then(|text| jsonc::elements(&text, PRE_TOOL_USE).ok())
-                .and_then(|groups| groups.into_iter().find(is_qx_hook));
-            match hook.as_ref().and_then(|g| g["hooks"][0]["command"].as_str()) {
+                .and_then(|groups| {
+                    groups
+                        .iter()
+                        .flat_map(|g| g["hooks"].as_array().into_iter().flatten())
+                        .find(|h| is_qx_command(h))
+                        .cloned()
+                });
+            match hook.as_ref().and_then(|h| h["command"].as_str()) {
                 None => notes.push("no `qx hook claude` PreToolUse hook: Claude's own Bash/PowerShell bypass qx".into()),
                 Some(cmd) if !Path::new(cmd).is_file() => {
                     notes.push(format!("the PreToolUse hook points at a missing binary ({cmd}): run `qx setup claude`"));
@@ -609,14 +706,24 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     }
+    if configure(clients, &paths, &exe, action, dry) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Plan and apply `action` for each client; true when anything was refused or could not be written.
+fn configure(clients: Vec<Client>, paths: &Paths, exe: &Path, action: Action, dry: bool) -> bool {
     let mut refused = false;
     let mut dsh_seen = false;
     let mut dsh_refused = false;
     for c in clients {
-        let changes = match plan(c, &paths, &exe, action) {
+        let changes = match plan(c, paths, exe, action) {
             Ok(changes) => changes,
             Err(e) => {
-                println!("{}: skipped: {e}", c.key());
+                refused = true;
+                println!("{}: refused: {e}", c.key());
                 continue;
             }
         };
@@ -655,15 +762,16 @@ pub fn run(args: &[String]) -> i32 {
         // dsh used to need a versioned copy per build; now one canonical binary is enough,
         // and every stale copy is a different qx under a client.
         let removed = yaml::prune_dsh_binaries(&paths.dsh_home);
-        if removed > 0 {
-            println!("dsh: removed {removed} unreferenced qx cop(ies) from {}", paths.dsh_home.join("bin").display());
+        if !removed.is_empty() {
+            println!(
+                "dsh: removed {} unreferenced qx cop(ies) from {}: {}",
+                removed.len(),
+                paths.dsh_home.join("bin").display(),
+                removed.join(", ")
+            );
         }
     }
-    if refused {
-        1
-    } else {
-        0
-    }
+    refused
 }
 
 #[cfg(test)]
@@ -942,5 +1050,449 @@ ew\qx.exe");
         let changes = plan(Client::ClaudeCode, &p, Path::new(r"C:\q\qx.exe"), Action::Remove).unwrap();
         assert!(matches!(changes[0].edit, Edit::Unchanged), "a missing parent must not refuse the removal");
         let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    // ---- batch 7: setup data-loss and tidiness (SU2, SU5-SU8, end to end) ----
+
+    fn q() -> &'static Path {
+        Path::new(r"C:\q\qx.exe")
+    }
+
+    /// Install, install again (nothing may change), remove, remove again, all through the real plan and apply.
+    fn cycle(plan_for: &dyn Fn(Action) -> Vec<Change>) {
+        for action in [Action::Install, Action::Remove] {
+            for ch in plan_for(action) {
+                if let Edit::Refuse(r) = &ch.edit {
+                    panic!("{action:?} refused {}: {r}", ch.file.display());
+                }
+                apply(&ch).unwrap();
+            }
+            let again = plan_for(action);
+            let names: Vec<String> = again.iter().map(|c| c.file.display().to_string()).collect();
+            assert!(again.iter().all(|c| matches!(c.edit, Edit::Unchanged)), "{action:?} twice must change nothing: {names:?}");
+        }
+    }
+
+    fn put(file: &Path, text: &str) {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+    }
+
+    /// Every `.qx-bak` and `qx-tmp` file left under `dir`.
+    fn leftovers(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let path = e.path();
+                let name = e.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if name.contains(".qx-bak") || name.contains("qx-tmp") {
+                    out.push(path.display().to_string());
+                }
+            }
+        }
+        out
+    }
+
+    fn qx_hook_commands(settings: &str) -> Vec<String> {
+        jsonc::elements(settings, PRE_TOOL_USE)
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
+            .filter(|h| h["args"] == json!(["hook", "claude"]))
+            .map(|h| h["command"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn pi_changes(version: (u32, u32), p: &Paths, a: Action) -> Vec<Change> {
+        pi::edit_pi(Some(version), p, q(), a)
+            .into_iter()
+            .map(|(file, edit)| Change { client: Client::Pi, file, edit })
+            .collect()
+    }
+
+    #[test]
+    fn apply_writes_through_a_symlink_and_keeps_the_link() {
+        let p = paths("symlink");
+        let real = p.home.join("dotfiles").join("settings.json");
+        put(&real, "{}\n");
+        let link = p.home.join("settings.json");
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&real, &link);
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&real, &link);
+        if made.is_err() {
+            println!("skip: this account may not create symlinks");
+            return;
+        }
+        let ch = Change { client: Client::ClaudeCode, file: link.clone(), edit: Edit::Changed("{\"a\": 1}\n".into()) };
+        apply(&ch).unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link must stay a link");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "{\"a\": 1}\n", "the target holds the edit");
+        assert_eq!(std::fs::read_to_string(p.home.join("settings.json.qx-bak")).unwrap(), "{}\n");
+        let gone = Change { client: Client::ClaudeCode, file: link.clone(), edit: Edit::Changed(String::new()) };
+        apply(&gone).unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err(), "removing deletes the link");
+        assert!(real.exists(), "and never the file it pointed at");
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn a_client_whose_plan_fails_is_a_refusal_not_a_skip() {
+        let p = paths("planerr");
+        std::fs::create_dir_all(&p.codex_home).unwrap();
+        // UTF-16 with a BOM: the file cannot be read as text, so `plan` returns Err.
+        let bytes: Vec<u8> = vec![0xFF, 0xFE, b'a', 0, b'=', 0, b'1', 0];
+        std::fs::write(p.codex_home.join("config.toml"), &bytes).unwrap();
+        assert!(configure(vec![Client::Codex], &p, q(), Action::Install, true), "the exit code must say it was refused");
+        assert_eq!(std::fs::read(p.codex_home.join("config.toml")).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn blank_settings_files_are_empty_documents_not_refusals() {
+        for (i, blank) in ["", "  \r\n", "\u{feff}", "\u{feff}\n"].into_iter().enumerate() {
+            let p = paths(&format!("blank{i}"));
+            put(&claude_file(&p), blank);
+            put(&claude_settings(&p), blank);
+            let changes = plan(Client::ClaudeCode, &p, q(), Action::Install).unwrap();
+            assert_eq!(changes.len(), 2);
+            for ch in &changes {
+                let text = changed(&ch.edit).unwrap_or_else(|| panic!("{} {blank:?} must install: {:?}", ch.file.display(), ch.edit));
+                assert!(parse_strict(text).is_some(), "{text}");
+                apply(ch).unwrap();
+            }
+            let settings = std::fs::read_to_string(claude_settings(&p)).unwrap();
+            assert_eq!(qx_hook_commands(&settings), vec![q().to_string_lossy().to_string()]);
+            let servers = std::fs::read_to_string(claude_file(&p)).unwrap();
+            assert_eq!(parse_strict(&servers).unwrap()["mcpServers"]["qx"]["args"][0], "mcp");
+            // Removing from a blank file is a no-op, not an error.
+            put(&claude_file(&p), blank);
+            put(&claude_settings(&p), blank);
+            for ch in plan(Client::ClaudeCode, &p, q(), Action::Remove).unwrap() {
+                assert!(matches!(ch.edit, Edit::Unchanged), "{blank:?}: {:?}", ch.edit);
+            }
+            let _ = std::fs::remove_dir_all(&p.home);
+        }
+    }
+
+    #[test]
+    fn a_group_with_the_qx_hook_and_another_hook_gets_no_second_qx_hook() {
+        let p = paths("mixedhook");
+        let file = claude_settings(&p);
+        let exe_text = q().to_string_lossy().replace('\\', "\\\\");
+        let mixed = format!(
+            "{{\"hooks\":{{\"PreToolUse\":[{{\"matcher\":\"Bash\",\"hooks\":[{{\"type\":\"command\",\"command\":\"{exe_text}\",\"args\":[\"hook\",\"claude\"]}},{{\"type\":\"command\",\"command\":\"echo mine\"}}]}}]}}}}"
+        );
+        put(&file, &mixed);
+        assert!(matches!(edit_claude_hook(&file, q(), Action::Install), Edit::Unchanged), "the hook is already there");
+        let newer = Path::new(r"D:\new\qx.exe");
+        let text = changed(&edit_claude_hook(&file, newer, Action::Install)).expect("the stale command is updated").to_string();
+        assert_eq!(qx_hook_commands(&text), vec![r"D:\new\qx.exe".to_string()], "one qx hook, pointing at the new exe: {text}");
+        assert!(text.contains("echo mine"));
+        put(&file, &text);
+        assert!(matches!(edit_claude_hook(&file, newer, Action::Install), Edit::Unchanged));
+        let removed = changed(&edit_claude_hook(&file, newer, Action::Remove)).expect("a removal").to_string();
+        assert!(qx_hook_commands(&removed).is_empty(), "{removed}");
+        assert!(removed.contains("echo mine"), "the user's own hook stays: {removed}");
+        assert!(parse_strict(&removed).is_some());
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn claude_install_then_remove_gives_back_the_original_bytes() {
+        let p = paths("rt-claude");
+        let json = "{\n  \"numStartups\": 3,\n  \"mcpServers\": {\n    \"other\": {\"command\": \"x\"}\n  }\n}\n";
+        let settings = "{\n  \"model\": \"opus\"\n}\n";
+        put(&claude_file(&p), json);
+        put(&claude_settings(&p), settings);
+        cycle(&|a| plan(Client::ClaudeCode, &p, q(), a).unwrap());
+        assert_eq!(std::fs::read_to_string(claude_file(&p)).unwrap(), json);
+        assert_eq!(std::fs::read_to_string(claude_settings(&p)).unwrap(), settings);
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn files_qx_created_end_empty_and_leave_no_backup() {
+        let p = paths("rt-claude-new");
+        std::fs::create_dir_all(claude_settings(&p).parent().unwrap()).unwrap();
+        cycle(&|a| plan(Client::ClaudeCode, &p, q(), a).unwrap());
+        for file in [claude_file(&p), claude_settings(&p)] {
+            if let Ok(text) = std::fs::read_to_string(&file) {
+                assert_eq!(parse_strict(&text).unwrap(), json!({}), "{}: {text:?}", file.display());
+            }
+        }
+        assert_eq!(leftovers(&p.home), Vec::<String>::new(), "qx's own text is no one's backup");
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn crlf_json_stays_crlf_and_a_comment_stays_put() {
+        let p = paths("rt-crlf");
+        let settings = "{\r\n  \"model\": \"opus\" // keep\r\n}\r\n";
+        put(&claude_settings(&p), settings);
+        for ch in plan(Client::ClaudeCode, &p, q(), Action::Install).unwrap() {
+            apply(&ch).unwrap();
+        }
+        let installed = std::fs::read_to_string(claude_settings(&p)).unwrap();
+        assert!(!installed.replace("\r\n", "").contains('\n'), "a bare LF went into a CRLF file: {installed:?}");
+        assert!(installed.contains("\"model\": \"opus\", // keep\r\n"), "the comment stays on its line: {installed:?}");
+        assert!(parse_strict(&installed).is_some());
+        for ch in plan(Client::ClaudeCode, &p, q(), Action::Remove).unwrap() {
+            apply(&ch).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(claude_settings(&p)).unwrap(), settings);
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn a_new_json_member_gets_a_comma_on_the_line_before_and_its_own_closing_brace() {
+        let p = paths("fmt");
+        put(&claude_file(&p), "{\n  \"a\": 1\n}\n");
+        let text = changed(&plan(Client::ClaudeCode, &p, q(), Action::Install).unwrap()[0].edit).unwrap().to_string();
+        assert!(text.starts_with("{\n  \"a\": 1,\n  \"mcpServers\": {\n"), "{text}");
+        assert!(text.ends_with("\n  }\n}\n"), "{text}");
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn opencode_install_then_remove_gives_back_the_original_bytes() {
+        let p = paths("rt-opencode");
+        let file = p.home.join(".config").join("opencode").join("opencode.json");
+        let original = "{\n  \"theme\": \"dark\"\n}\n";
+        put(&file, original);
+        cycle(&|a| plan(Client::OpenCode, &p, q(), a).unwrap());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn codex_install_then_remove_gives_back_the_original_bytes() {
+        let p = paths("rt-codex");
+        let file = p.codex_home.join("config.toml");
+        let original = "model = \"o3\"\n\n[projects.\"c:/x\"]\ntrust_level = \"trusted\"\n";
+        put(&file, original);
+        cycle(&|a| plan(Client::Codex, &p, q(), a).unwrap());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn dsh_install_then_remove_gives_back_the_original_bytes() {
+        let p = paths("rt-dsh");
+        let file = p.dsh_home.join("cordis.patch.yml");
+        let original = "- insert:\n    - id: mine\n      name: '@x/y'\n      config:\n        serverName: mine\n";
+        put(&file, original);
+        cycle(&|a| plan(Client::Dsh, &p, q(), a).unwrap());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn hermes_install_then_remove_gives_back_the_original_bytes() {
+        for (tag, original) in [
+            ("a", "model:\n  default: x\n"),
+            ("b", "model:\n  default: x\nmcp_servers:\n  other:\n    command: x\n"),
+        ] {
+            let p = paths(&format!("rt-hermes-{tag}"));
+            let file = p.hermes_home.join("config.yaml");
+            put(&file, original);
+            cycle(&|a| plan(Client::Hermes, &p, q(), a).unwrap());
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), original, "{tag}");
+            let _ = std::fs::remove_dir_all(&p.home);
+        }
+    }
+
+    #[test]
+    fn pi_old_extension_installs_again_unchanged_and_leaves_nothing_behind() {
+        let p = paths("rt-pi-old");
+        cycle(&|a| pi_changes((0, 85), &p, a));
+        assert_eq!(leftovers(&p.home), Vec::<String>::new(), "qx made these files, so it keeps no copy of them");
+        assert!(!p.home.join(".pi").join("agent").join("extensions").exists(), "the empty folders qx made go too");
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn pi_new_mcp_json_gives_back_the_original_bytes() {
+        let p = paths("rt-pi-new");
+        let file = p.home.join(".pi").join("agent").join("mcp.json");
+        let original = "{\n  \"mcpServers\": {\n    \"other\": {\"command\": \"x\"}\n  }\n}\n";
+        put(&file, original);
+        cycle(&|a| pi_changes((1, 3), &p, a));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&p.home);
+        let fresh = paths("rt-pi-new2");
+        cycle(&|a| pi_changes((1, 3), &fresh, a));
+        assert_eq!(leftovers(&fresh.home), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&fresh.home);
+    }
+
+    // ---- end to end: real plan + apply in a temp home ----
+
+    fn all_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                all_files(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
+    fn apply_all(changes: Vec<Change>) -> usize {
+        let mut n = 0;
+        for ch in changes {
+            assert!(!matches!(ch.edit, Edit::Refuse(_)), "refused: {}", ch.file.display());
+            if matches!(ch.edit, Edit::Changed(_)) {
+                n += 1;
+                apply(&ch).unwrap();
+            }
+        }
+        n
+    }
+
+    /// Install, install again (nothing changes), remove: a seeded home gets its own bytes back,
+    /// an empty one keeps no trace of qx and no backup.
+    fn roundtrip(
+        tag: &str,
+        seeds: impl Fn(&Paths) -> Vec<(PathBuf, &'static str)>,
+        plan_for: impl Fn(&Paths, Action) -> Vec<Change>,
+    ) {
+        let p = paths(tag);
+        let seeds = seeds(&p);
+        for (file, text) in &seeds {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+        assert!(apply_all(plan_for(&p, Action::Install)) > 0, "{tag}: install changed nothing");
+        assert_eq!(apply_all(plan_for(&p, Action::Install)), 0, "{tag}: a second install must change nothing");
+        assert!(apply_all(plan_for(&p, Action::Remove)) > 0, "{tag}: remove changed nothing");
+        for (file, text) in &seeds {
+            assert_eq!(&std::fs::read_to_string(file).unwrap(), text, "{tag}: {} is not the original", file.display());
+        }
+        assert_eq!(apply_all(plan_for(&p, Action::Remove)), 0, "{tag}: a second remove must change nothing");
+        let mut files = Vec::new();
+        all_files(&p.home, &mut files);
+        // A home with no config gets none back: not even a `{}` or a backup.
+        assert!(!seeds.is_empty() || files.is_empty(), "{tag}: files left in an empty home: {files:?}");
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    const E2E_EXE: &str = r"C:\q\qx.exe";
+
+    fn real_plan(c: Client) -> impl Fn(&Paths, Action) -> Vec<Change> {
+        move |p, a| plan(c, p, Path::new(E2E_EXE), a).unwrap()
+    }
+
+    #[test]
+    fn e2e_claude_code_roundtrip() {
+        let c = |p: &Paths| claude_file(p);
+        let s = |p: &Paths| claude_settings(p);
+        roundtrip("e2e-claude-fresh", |_| vec![], real_plan(Client::ClaudeCode));
+        roundtrip(
+            "e2e-claude-full",
+            |p| {
+                vec![
+                    (c(p), "{\n  \"numStartups\": 3,\n  \"mcpServers\": {\n    \"other\": {\n      \"command\": \"x\"\n    }\n  }\n}\n"),
+                    (s(p), "{\n  \"model\": \"opus\",\n  \"hooks\": {\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"Edit\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"y\"\n          }\n        ]\n      }\n    ]\n  }\n}\n"),
+                ]
+            },
+            real_plan(Client::ClaudeCode),
+        );
+        roundtrip(
+            "e2e-claude-bare",
+            |p| vec![(c(p), "{\n  \"numStartups\": 3\n}\n"), (s(p), "{\n  \"model\": \"opus\"\n}\n")],
+            real_plan(Client::ClaudeCode),
+        );
+        roundtrip(
+            "e2e-claude-crlf",
+            |p| vec![(c(p), "{\r\n  \"numStartups\": 3\r\n}\r\n"), (s(p), "{\r\n  \"model\": \"opus\"\r\n}\r\n")],
+            real_plan(Client::ClaudeCode),
+        );
+    }
+
+    #[test]
+    fn e2e_opencode_roundtrip() {
+        let f = |p: &Paths| opencode_file(p);
+        roundtrip("e2e-opencode-fresh", |_| vec![], real_plan(Client::OpenCode));
+        roundtrip(
+            "e2e-opencode-bare",
+            |p| vec![(f(p), "{\n  \"theme\": \"dark\"\n}\n")],
+            real_plan(Client::OpenCode),
+        );
+        roundtrip(
+            "e2e-opencode-servers",
+            |p| vec![(f(p), "{\n  \"mcp\": {\n    \"servers\": {\n      \"other\": {\n        \"command\": [\"x\"]\n      }\n    }\n  }\n}\n")],
+            real_plan(Client::OpenCode),
+        );
+    }
+
+    #[test]
+    fn e2e_codex_roundtrip() {
+        let f = |p: &Paths| p.codex_home.join("config.toml");
+        roundtrip("e2e-codex-fresh", |_| vec![], real_plan(Client::Codex));
+        roundtrip(
+            "e2e-codex-table",
+            |p| vec![(f(p), "model = \"o3\"\n\n[mcp_servers.other]\ncommand = \"x\"\n")],
+            real_plan(Client::Codex),
+        );
+        roundtrip("e2e-codex-bare", |p| vec![(f(p), "model = \"o3\"\n")], real_plan(Client::Codex));
+        roundtrip(
+            "e2e-codex-bom-crlf",
+            |p| vec![(f(p), "\u{feff}model = \"o3\"\r\n")],
+            real_plan(Client::Codex),
+        );
+    }
+
+    #[test]
+    fn e2e_dsh_roundtrip() {
+        let f = |p: &Paths| p.dsh_home.join("cordis.patch.yml");
+        roundtrip("e2e-dsh-fresh", |_| vec![], real_plan(Client::Dsh));
+        roundtrip(
+            "e2e-dsh-other",
+            |p| vec![(f(p), "- insert:\n    - id: mcp-other\n      name: b\n")],
+            real_plan(Client::Dsh),
+        );
+    }
+
+    #[test]
+    fn e2e_hermes_roundtrip() {
+        let f = |p: &Paths| p.hermes_home.join("config.yaml");
+        roundtrip("e2e-hermes-fresh", |_| vec![], real_plan(Client::Hermes));
+        roundtrip(
+            "e2e-hermes-other",
+            |p| vec![(f(p), "model: x\nmcp_servers:\n  other:\n    command: o\n")],
+            real_plan(Client::Hermes),
+        );
+        roundtrip("e2e-hermes-bare", |p| vec![(f(p), "model: x\n")], real_plan(Client::Hermes));
+    }
+
+    #[test]
+    fn e2e_pi_roundtrip() {
+        let exe = Path::new(E2E_EXE);
+        let plan_for = |version: (u32, u32)| {
+            move |p: &Paths, a| {
+                pi::edit_pi(Some(version), p, exe, a)
+                    .into_iter()
+                    .map(|(file, edit)| Change { client: Client::Pi, file, edit })
+                    .collect()
+            }
+        };
+        // 0.85: three generated files, and the folders made for them go with them.
+        roundtrip("e2e-pi-old", |_| vec![], plan_for((0, 85)));
+        let p = paths("e2e-pi-old-dirs");
+        apply_all(plan_for((0, 85))(&p, Action::Install));
+        apply_all(plan_for((0, 85))(&p, Action::Remove));
+        assert!(!p.home.join(".pi").join("agent").join("extensions").exists());
+        let _ = std::fs::remove_dir_all(&p.home);
+        roundtrip("e2e-pi-new-fresh", |_| vec![], plan_for((1, 3)));
+        roundtrip(
+            "e2e-pi-new-other",
+            |p| vec![(p.home.join(".pi").join("agent").join("mcp.json"), "{\n  \"mcpServers\": {\n    \"other\": {\n      \"command\": \"x\"\n    }\n  }\n}\n")],
+            plan_for((1, 3)),
+        );
     }
 }

@@ -153,6 +153,8 @@ mod imp {
         port: Handle,
         pending: Box<Pending>,
         broken: bool,
+        /// Cleared once git cannot answer for this root (not a repository, no git): no more asking.
+        git_ok: bool,
     }
 
     // The handles are used under the registry mutex only.
@@ -287,17 +289,50 @@ mod imp {
                 return;
             }
             let comps: Vec<&str> = rel.split('/').collect();
+            let last = comps.len() - 1;
+            // An ignore rule changed, or a name is a short 8.3 alias (which names a file the list holds under
+            // its long name): the list cannot follow, so the next query rebuilds it.
+            if rel == ".git/info/exclude" || comps[last].eq_ignore_ascii_case(".gitignore") || is_short_name(comps[last]) {
+                trace(|| format!("change: rules or alias {rel}"));
+                self.broken = true;
+                return;
+            }
             // A path inside a generated or VCS directory is not in the list: one name check, no syscall.
+            // The last part may be a plain file that only has such a name (`vendor`, `dist`): that one is listed.
+            let mut skip_leaf = false;
             for (i, c) in comps.iter().enumerate() {
                 if crate::fsops::skip_dir_name(c) {
-                    if i + 1 == comps.len() && (action == ADDED || action == RENAMED_NEW) && !crate::fsops::vcs_dir_name(c) {
-                        Arc::make_mut(&mut self.snap).skipped.insert((*c).to_string());
+                    if i != last {
+                        return;
                     }
-                    return;
+                    skip_leaf = true;
                 }
             }
+            if skip_leaf {
+                if let Some((parent, _)) = rel.rsplit_once('/') {
+                    if self.under_ignored(parent) {
+                        return;
+                    }
+                }
+                let full = self.root.join(rel.replace('/', "\\"));
+                match action {
+                    REMOVED | RENAMED_OLD => Arc::make_mut(&mut self.snap).remove(rel),
+                    ADDED | RENAMED_NEW | MODIFIED => match std::fs::symlink_metadata(&full) {
+                        Ok(md) if md.file_type().is_file() => {
+                            let modified = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                            Arc::make_mut(&mut self.snap).upsert(rel, full, modified);
+                        }
+                        Ok(md) if md.file_type().is_dir() && action != MODIFIED && !crate::fsops::vcs_dir_name(comps[last]) => {
+                            Arc::make_mut(&mut self.snap).skipped.insert(comps[last].to_string());
+                        }
+                        _ => {}
+                    },
+                    _ => self.broken = true,
+                }
+                return;
+            }
             // A folder git ignores (the walk left it out, and recorded it in `skipped` by its path).
-            if self.snap.skipped.iter().any(|s| rel.strip_prefix(s.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))) {
+            if self.under_ignored(rel) {
                 return;
             }
             let full = self.root.join(rel.replace('/', "\\"));
@@ -327,8 +362,44 @@ mod imp {
             }
         }
 
+        /// Whether `rel` is, or lies below, a folder the walk left out and recorded by its path.
+        fn under_ignored(&self, rel: &str) -> bool {
+            self.snap.skipped.iter().any(|s| rel.strip_prefix(s.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/')))
+        }
+
+        /// Ask git whether the folder `rel` is ignored. At most `*budget` asks per call chain (a process each);
+        /// `None` when the budget is spent, so the caller falls back to a rebuild.
+        fn git_ignores(&mut self, rel: &str, budget: &mut u32) -> Option<bool> {
+            if !self.git_ok {
+                return Some(false);
+            }
+            if *budget == 0 {
+                return None;
+            }
+            *budget -= 1;
+            match crate::fsops::git_ignores_dir(&self.root, rel) {
+                Some(v) => Some(v),
+                None => {
+                    self.git_ok = false; // no git, no repository, or too slow: the walk leaves nothing out either
+                    Some(false)
+                }
+            }
+        }
+
         /// A directory appeared (created, renamed in, or copied whole): list what it holds.
         fn add_tree(&mut self, dir: &Path, rel: &str) {
+            let mut budget = 16u32;
+            match self.git_ignores(rel, &mut budget) {
+                Some(true) => {
+                    Arc::make_mut(&mut self.snap).skipped.insert(rel.to_string());
+                    return;
+                }
+                Some(false) => {}
+                None => {
+                    self.broken = true;
+                    return;
+                }
+            }
             let mut stack = vec![(dir.to_path_buf(), rel.to_string())];
             while let Some((d, r)) = stack.pop() {
                 let Ok(rd) = std::fs::read_dir(&d) else { continue };
@@ -351,7 +422,16 @@ mod imp {
                             self.broken = true;
                             return;
                         }
-                        stack.push((e.path(), child_rel));
+                        match self.git_ignores(&child_rel, &mut budget) {
+                            Some(true) => {
+                                Arc::make_mut(&mut self.snap).skipped.insert(child_rel);
+                            }
+                            Some(false) => stack.push((e.path(), child_rel)),
+                            None => {
+                                self.broken = true; // too many folders to ask about one by one
+                                return;
+                            }
+                        }
                     } else if ft.is_file() {
                         let modified = e.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
                         Arc::make_mut(&mut self.snap).upsert(&child_rel, e.path(), modified);
@@ -359,6 +439,13 @@ mod imp {
                 }
             }
         }
+    }
+
+    /// An 8.3 alias such as `LONGFI~1.TXT`: the kernel reports it when a file is reached by that name.
+    fn is_short_name(name: &str) -> bool {
+        let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+        let Some((head, num)) = stem.rsplit_once('~') else { return false };
+        (1..=6).contains(&head.len()) && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) && ext.len() <= 3
     }
 
     fn is_reparse(md: &std::fs::Metadata) -> bool {
@@ -390,6 +477,7 @@ mod imp {
                 buf: vec![0u32; BUFFER_WORDS],
             }),
             broken: false,
+            git_ok: true,
         };
         if !index.issue() {
             return None; // Drop closes the handles
@@ -464,6 +552,7 @@ mod imp {
             trace(|| "broken: rebuilding".to_string());
             let base = guard.root.clone();
             drop(guard);
+            crate::fsops::drop_ignored_cache(); // an ignore rule may be why: ask git again
             forget(&base);
             rebuild_in_background(base);
             return None;

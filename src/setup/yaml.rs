@@ -114,7 +114,11 @@ pub fn edit_dsh(text: Option<&str>, exe: &Path, a: Action) -> Edit {
                         }
                         break;
                     }
+                    let last = end == lines.len();
                     lines.drain(from..end);
+                    if last && from > 0 && lines[from - 1].trim().is_empty() {
+                        lines.remove(from - 1);
+                    }
                     verdict(finish(lines, had_newline, eol), text)
                 }
                 Action::Install => {
@@ -259,6 +263,7 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
 
     // The qx child of `mcp_servers`, at the indent its siblings use.
     let child_indent = (servers + 1..end)
+        .filter(|i| !is_noise(lines[*i].as_str()))
         .map(|i| indent_of(lines[i].as_str()))
         .filter(|i| *i > 0)
         .min()
@@ -288,6 +293,14 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
             match action {
                 Action::Remove => {
                     lines.drain(start..qend);
+                    // `mcp_servers:` left with nothing under it goes too, with the blank line before it.
+                    let left = end - (qend - start);
+                    if (servers + 1..left).all(|i| lines[i].trim().is_empty()) {
+                        lines.drain(servers..left);
+                        if servers > 0 && lines[servers - 1].trim().is_empty() {
+                            lines.remove(servers - 1);
+                        }
+                    }
                     verdict(finish(lines, had_newline, eol), text)
                 }
                 Action::Install => {
@@ -400,6 +413,7 @@ pub fn hermes_command(text: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     let (servers, end) = top_child(&lines, "mcp_servers")?;
     let child_indent = (servers + 1..end)
+        .filter(|i| !is_noise(lines[*i]))
         .map(|i| indent_of(lines[i]))
         .filter(|i| *i > 0)
         .min()
@@ -444,20 +458,20 @@ fn refusal_hermes(exe: &Path, why: &str) -> String {
 }
 
 /// Delete `dsh_home\bin\qx*.exe` files that no patch file under `dsh_home` references.
-pub fn prune_dsh_binaries(dsh_home: &Path) -> usize {
+pub fn prune_dsh_binaries(dsh_home: &Path) -> Vec<String> {
     let bin = dsh_home.join("bin");
     let Ok(entries) = std::fs::read_dir(&bin) else {
-        return 0;
+        return Vec::new();
     };
     let referenced = dsh_references(dsh_home);
-    let mut removed = 0;
+    let mut removed = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default();
-        if !path.is_file() || !name.starts_with("qx") || !name.ends_with(".exe") {
+        if !path.is_file() || !is_qx_build(&name) {
             continue;
         }
         // Match on the file name anywhere in the patch text: a config may spell the copy
@@ -468,10 +482,16 @@ pub fn prune_dsh_binaries(dsh_home: &Path) -> usize {
         }
         // A running server holds its image open; that copy is not ours to remove.
         if std::fs::remove_file(&path).is_ok() {
-            removed += 1;
+            removed.push(name);
         }
     }
     removed
+}
+
+/// `qx.exe`, or `qx` + a separator + anything + `.exe` (`qx-1a2b.exe`): not `qxl-viewer.exe`.
+fn is_qx_build(lower_name: &str) -> bool {
+    let Some(stem) = lower_name.strip_suffix(".exe") else { return false };
+    stem == "qx" || stem.strip_prefix("qx").is_some_and(|r| r.starts_with(|c: char| !c.is_ascii_alphanumeric()))
 }
 
 fn dsh_references(dsh_home: &Path) -> Vec<String> {
@@ -721,10 +741,50 @@ mod tests {
             "        command: 'C:/q/.dsh/bin/qx-bbb.exe'\n",
         )
         .unwrap();
-        assert_eq!(prune_dsh_binaries(&root), 2);
+        assert_eq!(prune_dsh_binaries(&root).len(), 2);
         assert!(bin.join("qx-bbb.exe").is_file());
         assert!(!bin.join("qx-aaa.exe").exists());
         assert!(!bin.join("qx.exe").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dsh_cleanup_spares_programs_that_only_start_with_qx() {
+        let root = std::env::temp_dir().join(format!("qx-dshbin2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for name in ["qx.exe", "qx-aaa.exe", "qx_1.exe", "qxl-viewer.exe", "QXtool.exe", "qx-keep.txt"] {
+            std::fs::write(bin.join(name), "x").unwrap();
+        }
+        std::fs::write(root.join("cordis.patch.yml"), "# nothing references a copy\n").unwrap();
+        let mut removed = prune_dsh_binaries(&root);
+        removed.sort();
+        assert_eq!(removed, ["qx-aaa.exe", "qx.exe", "qx_1.exe"]);
+        for spared in ["qxl-viewer.exe", "QXtool.exe", "qx-keep.txt"] {
+            assert!(bin.join(spared).is_file(), "{spared} is not a qx build and must stay");
+        }
+        for gone in ["qx.exe", "qx-aaa.exe", "qx_1.exe"] {
+            assert!(!bin.join(gone).exists(), "{gone} is an unreferenced qx copy");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hermes_indent_follows_the_servers_not_comments_or_blank_lines() {
+        let exe = Path::new(r"C:\q\qx.exe");
+        let qx_indent = |text: &str| -> Vec<usize> {
+            text.lines().filter(|l| l.trim() == "qx:").map(indent_of).collect()
+        };
+        // A comment less indented than the servers must not set the indent.
+        let src = "mcp_servers:\n  # servers\n    other:\n        command: o\n";
+        let out = changed(edit_hermes(Some(src), exe, Action::Install));
+        assert_eq!(qx_indent(&out), vec![4], "{out}");
+        // Nor a whitespace-only line: the existing 4-space `qx:` is rewritten in place, not doubled.
+        let src = "mcp_servers:\n  \n    qx:\n      command: old\n";
+        let out = changed(edit_hermes(Some(src), exe, Action::Install));
+        assert_eq!(qx_indent(&out), vec![4], "{out}");
+        assert_eq!(hermes_command(&out).as_deref(), Some(r"C:\q\qx.exe"));
+        assert_eq!(hermes_command(src).as_deref(), Some("old"));
     }
 }

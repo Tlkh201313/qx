@@ -111,7 +111,7 @@ pub fn run() -> i32 {
         _ => "safe",
     };
     println!("[guard] this shell: {guard_mode} (each client uses its own QX_GUARD) — deny catastrophic, warn risky, audit to %LOCALAPPDATA%\\qx\\audit.jsonl");
-    println!("[redact] on for captured/MCP output (QX_REDACT=off disables)");
+    println!("[redact] on for command output, captured and MCP (QX_REDACT=off disables); fs returns files as written");
 
     // 5. Python startup. Site-packages `.pth` hooks run on every launch.
     python_startup();

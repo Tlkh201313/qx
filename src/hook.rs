@@ -41,7 +41,7 @@ fn respond(event: &Value) -> Option<Value> {
         return None;
     }
     let command = input.get("command")?.as_str()?;
-    let budget = tool_budget_secs(input.get("timeout").and_then(Value::as_u64));
+    let budget = Budget::from_secs(tool_budget_secs(input.get("timeout").and_then(Value::as_u64)));
     let mut rewritten = match tool {
         "Bash" => rewrite_bash_within(command, Some(budget))?,
         "PowerShell" => rewrite_powershell(command, Some(budget))?,
@@ -82,6 +82,26 @@ fn tool_budget_secs(timeout_ms: Option<u64>) -> u64 {
         .or_else(|| std::env::var("BASH_DEFAULT_TIMEOUT_MS").ok().and_then(|v| v.trim().parse().ok()))
         .unwrap_or(120_000);
     (ms / 1000).saturating_sub(2).max(1)
+}
+
+/// What a captured stage may spend: `secs` on its own, or until `deadline` (unix seconds) when
+/// several stages of one line share the tool's time.
+#[derive(Clone, Copy)]
+struct Budget {
+    secs: u64,
+    deadline: u64,
+}
+
+impl Budget {
+    fn from_secs(secs: u64) -> Self {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        Budget { secs, deadline: now + secs }
+    }
+
+    /// The qx flag for one stage; `shared` when a later stage of the line draws on the same time.
+    fn flag(self, shared: bool) -> String {
+        if shared { format!("--deadline {} ", self.deadline) } else { format!("--timeout {} ", self.secs) }
+    }
 }
 
 /// Builtins and keywords run inside the shell for free (and `cd`/`export` must stay there);
@@ -170,11 +190,11 @@ fn rewrite_bash(cmd: &str) -> Option<String> {
 }
 
 /// `budget`: the `--timeout` given to a captured stage that has none of its own.
-fn rewrite_bash_within(cmd: &str, budget: Option<u64>) -> Option<String> {
+fn rewrite_bash_within(cmd: &str, budget: Option<Budget>) -> Option<String> {
     Some(apply(cmd, bash_edits(cmd, budget)?))
 }
 
-fn bash_edits(cmd: &str, budget: Option<u64>) -> Option<Vec<(Range<usize>, String)>> {
+fn bash_edits(cmd: &str, budget: Option<Budget>) -> Option<Vec<(Range<usize>, String)>> {
     let stages = bash_stages(cmd)?;
     let first = |s: &Stage| {
         // `time ( ... ) | wc` and `! { ...; }` still pipe the group as a whole.
@@ -188,7 +208,13 @@ fn bash_edits(cmd: &str, budget: Option<u64>) -> Option<Vec<(Range<usize>, Strin
         return None;
     }
     let compound = stages.iter().any(|s| first(s).is_some_and(|w| COMPOUND_WORDS.contains(&w)));
-    let edits: Vec<(Range<usize>, String)> = stages.iter().filter_map(|s| plan(cmd, s, compound, budget)).collect();
+    let run = |shared| stages.iter().filter_map(|s| plan(cmd, s, compound, budget, shared)).collect::<Vec<_>>();
+    let mut edits = run(false);
+    // The stages run one after another inside the tool's time: give them one end time, not one budget each.
+    if edits.len() > 1 && edits.iter().any(|e| e.2) {
+        edits = run(true);
+    }
+    let edits: Vec<_> = edits.into_iter().map(|(r, t, _)| (r, t)).collect();
     (!edits.is_empty()).then_some(edits)
 }
 
@@ -477,7 +503,8 @@ fn skip_heredocs(cmd: &str, mut i: usize, heredocs: &mut Vec<(String, bool)>) ->
 
 /// The edit that routes one stage through qx: `qx ` (or `qx --stream `) before its program,
 /// replacing a leading `timeout N` with qx's own `--timeout`.
-fn plan(cmd: &str, stage: &Stage, compound: bool, budget: Option<u64>) -> Option<(Range<usize>, String)> {
+/// The third value: the stage took the shared budget (so its flag changes if the line chains stages).
+fn plan(cmd: &str, stage: &Stage, compound: bool, budget: Option<Budget>, shared: bool) -> Option<(Range<usize>, String, bool)> {
     if stage.background {
         return None;
     }
@@ -528,10 +555,14 @@ fn plan(cmd: &str, stage: &Stage, compound: bool, budget: Option<u64>) -> Option
     }
     let mut text = String::from(if whole { "qx " } else { "qx --stream " });
     // Only a captured stage: a streamed one has already shown its output when Claude kills it.
-    if let Some(secs) = timeout.or(budget.filter(|_| whole)) {
+    let mut took_budget = false;
+    if let Some(secs) = timeout {
         text.push_str(&format!("--timeout {secs} "));
+    } else if let Some(b) = budget.filter(|_| whole) {
+        text.push_str(&b.flag(shared));
+        took_budget = true;
     }
-    Some((start..at, text))
+    Some((start..at, text, took_budget))
 }
 
 /// `timeout`'s duration in whole seconds: `30`, `30s`, `5m`, `1h`. Options and fractions are
@@ -680,11 +711,13 @@ const POWERSHELL_WORDS: &[&str] = &[
 
 /// `qx ` before each `;`/newline separated PowerShell statement that is one plain native command,
 /// or `None` when no statement qualifies.
-fn rewrite_powershell(cmd: &str, budget: Option<u64>) -> Option<String> {
+fn rewrite_powershell(cmd: &str, budget: Option<Budget>) -> Option<String> {
     let mut out = String::with_capacity(cmd.len() + 8);
     let mut last = 0;
     let mut changed = false;
     let stmts = powershell_statements(cmd)?;
+    // Statements run one after another inside the tool's time: with several, they share one end time.
+    let shared = stmts.iter().filter(|s| powershell_target(&cmd[(*s).clone()]).is_some_and(|p| known_program(p, true))).count() > 1;
     // An alias or a dot-sourced script can shadow a native program for the statements after it.
     let shadows = |s: &Range<usize>| {
         let first = cmd[s.clone()].split_whitespace().next().unwrap_or("").to_ascii_lowercase();
@@ -699,8 +732,8 @@ fn rewrite_powershell(cmd: &str, budget: Option<u64>) -> Option<String> {
             let at = stmt.start + (text.len() - text.trim_start().len());
             out.push_str(&cmd[last..at]);
             out.push_str("qx ");
-            if let Some(secs) = budget {
-                out.push_str(&format!("--timeout {secs} "));
+            if let Some(b) = budget {
+                out.push_str(&b.flag(shared));
             }
             last = at;
             changed = true;
@@ -1257,16 +1290,38 @@ mod tests {
         assert_eq!(tool_budget_secs(Some(30_000)), 28);
         assert_eq!(tool_budget_secs(Some(1_000)), 1);
         assert_eq!(tool_budget_secs(Some(0)), 1);
-        assert_eq!(rewrite_bash_within("cargo test", Some(28)).as_deref(), Some("qx --timeout 28 cargo test"));
-        assert_eq!(rewrite_bash_within("timeout 5 cargo test", Some(28)).as_deref(), Some("qx --timeout 5 cargo test"));
-        assert_eq!(
-            rewrite_bash_within("git status && cargo test", Some(28)).as_deref(),
-            Some("qx --timeout 28 git status && qx --timeout 28 cargo test")
-        );
-        assert_eq!(rewrite_powershell("cargo test", Some(28)).as_deref(), Some("qx --timeout 28 cargo test"));
+        let b = Some(Budget { secs: 28, deadline: 5000 });
+        assert_eq!(rewrite_bash_within("cargo test", b).as_deref(), Some("qx --timeout 28 cargo test"));
+        assert_eq!(rewrite_bash_within("timeout 5 cargo test", b).as_deref(), Some("qx --timeout 5 cargo test"));
+        assert_eq!(rewrite_powershell("cargo test", b).as_deref(), Some("qx --timeout 28 cargo test"));
         // A streamed stage has shown its output already: no limit added.
-        let piped = rewrite_bash_within("cargo test | grep ok", Some(28)).unwrap();
-        assert!(!piped.contains("--timeout"), "{piped}");
+        let piped = rewrite_bash_within("cargo test | grep ok", b).unwrap();
+        assert!(!piped.contains("--timeout") && !piped.contains("--deadline"), "{piped}");
+    }
+
+    #[test]
+    fn chained_captured_stages_share_one_end_time() {
+        // `--timeout 28` on each would give the second stage the whole budget again, after the first
+        // used part of it; Claude then kills the tree and the second stage's buffered output is lost.
+        let b = Some(Budget { secs: 28, deadline: 5000 });
+        assert_eq!(
+            rewrite_bash_within("git status && cargo test", b).as_deref(),
+            Some("qx --deadline 5000 git status && qx --deadline 5000 cargo test")
+        );
+        assert_eq!(
+            rewrite_bash_within("timeout 5 git status; cargo test", b).as_deref(),
+            Some("qx --timeout 5 git status; qx --deadline 5000 cargo test")
+        );
+        assert_eq!(
+            rewrite_powershell("git status; cargo test", b).as_deref(),
+            Some("qx --deadline 5000 git status; qx --deadline 5000 cargo test")
+        );
+        // One captured stage among other edits (`cd` stays in the shell): nothing to share.
+        assert_eq!(rewrite_bash_within("cd x && cargo test", b).as_deref(), Some("cd x && qx --timeout 28 cargo test"));
+        // The budget is built from the tool's timeout and the clock.
+        let made = Budget::from_secs(28);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert!((now + 28..=now + 30).contains(&made.deadline), "{}", made.deadline);
     }
 
     #[test]

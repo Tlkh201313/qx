@@ -6,7 +6,9 @@ Not-obvious things that bite. Each line: trap → what to do. Read before build/
 - Test exe in `target\` gets a Low Mandatory Level label (seen 2026-10-24, still true 2026-11-02) → every file create fails `os error 5`, ~92 false test failures. Copy it out and run from repo root: `cp target/release/deps/qx-<hash>.exe <scratch>/probe/qxt.exe && <scratch>/probe/qxt.exe --test-threads=4`. Don't create test files named `nul.*`/`con.*` (Windows device names).
 - `cargo test --release` does NOT relink `target\release\qx.exe` → e2e checks after it run a stale exe. `cargo build --release` first.
 - Free RAM ~1 GB: full `cargo test` in background gets killed. Use `-j 1`; run single tests from the built exe.
-- Last full run from a copied exe (2026-10-24): 363 passed, 0 failed, 1 ignored, ~16 s. More failures than that on a clean tree = the `target\` label above or a stuck warm-PowerShell test, not your change. CI sets `QX_REQUIRE_ORACLE=1` (GNU grep/sed parity tests must run, not skip).
+- Last full run from a copied exe (2026-11-11, dev profile): 535 passed, 0 failed, 2 ignored, ~22 s. Run it with cwd = repo root (the `builtin` tests read repo files). More failures than that on a clean tree = the `target\` label above or a stuck warm-PowerShell test, not your change. CI sets `QX_REQUIRE_ORACLE=1` (GNU grep/sed parity tests must run, not skip).
+- rustc overflows its stack on `guard.rs` (exit 0xc00000fd) → build with `RUST_MIN_STACK=268435456`.
+- Worktrees build the same test exe name (`qx-<hash>.exe`) → a shared `target` runs another tree's code. Give each tree its own `CARGO_TARGET_DIR` and check `--list` names the test you added.
 - PATH differs: Git Bash puts Git `usr\bin` before System32, MCP server sees plain Windows PATH (`sort`, `find` differ). Run PATH-sensitive tests under both.
 - Other agents edit this tree too, and a commit of theirs can sweep in your uncommitted edits. `git diff` before building on it; diff HEAD against your tested copy.
 

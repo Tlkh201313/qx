@@ -108,7 +108,11 @@ pub fn edit_pi(
                 },
                 Action::Remove => match super::jsonc::remove_member(&text, &["mcpServers", "qx"]) {
                     Ok(out) if out == text => Edit::Unchanged,
-                    Ok(out) => Edit::Changed(out),
+                    // `mcpServers` left empty goes too; a section the user left empty stays (text unchanged above).
+                    Ok(out) => match super::jsonc::prune_empty(&out, &["mcpServers"]) {
+                        Ok(out) => Edit::Changed(out),
+                        Err(e) => Edit::Refuse(e),
+                    },
                     Err(e) => Edit::Refuse(e),
                 },
             },
@@ -159,6 +163,16 @@ fn legacy_files(p: &Paths, exe: &Path) -> [(PathBuf, String); 3] {
         (dir.join("qx").join("bridge.js"), BRIDGE.to_string()),
         (dir.join("qx").join("package.json"), BRIDGE_PACKAGE.to_string()),
     ]
+}
+
+/// Whether `content` is exactly what qx writes for one of its pre-0.99 files, whatever exe path
+/// it names. Used to skip a `.qx-bak` of a file qx made and never saw edited.
+pub fn is_generated(content: &str) -> bool {
+    let parts: Vec<&str> = EXTENSION.split("__QX_EXE__").collect();
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    content == BRIDGE
+        || content == BRIDGE_PACKAGE
+        || (content.len() >= first.len() + last.len() && content.starts_with(first) && content.ends_with(last))
 }
 
 #[cfg(test)]
@@ -278,6 +292,21 @@ mod tests {
             Edit::Refuse(reason) => assert!(reason.contains("pi not found"), "{reason}"),
             _ => panic!("a missing pi must be refused"),
         }
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn is_generated_recognises_only_what_qx_writes() {
+        let exe = Path::new(r"C:\q\qx.exe");
+        let p = paths("gen");
+        for (_, text) in legacy_files(&p, exe) {
+            assert!(is_generated(&text));
+        }
+        assert!(is_generated(&EXTENSION.replace("__QX_EXE__", r"D:\other\qx.exe")), "any exe path is ours");
+        assert!(!is_generated(""));
+        assert!(!is_generated("// the user's own edit\n"));
+        assert!(!is_generated(&format!("{BRIDGE}// edited\n")));
+        assert!(!is_generated(&EXTENSION.replace("__QX_EXE__", "x").replace("registerTool", "register")));
         let _ = std::fs::remove_dir_all(&p.home);
     }
 }

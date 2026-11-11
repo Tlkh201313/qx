@@ -27,14 +27,67 @@ fn norm_header(line: &str) -> String {
     strip_comment(line).chars().filter(|c| !c.is_whitespace()).map(|c| if c == '\'' { '"' } else { c }).collect()
 }
 
+/// Which lines sit inside a multi-line string (`"""` or `\'\'\'`): their text is a value, not TOML.
+/// shortcut: a backslash-escaped `"""` inside a basic string closes it here; rare, upgrade with a real parser.
+fn multiline_mask(lines: &[&str]) -> Vec<bool> {
+    let mut open: Option<&'static str> = None;
+    lines
+        .iter()
+        .map(|line| {
+            let inside = open.is_some();
+            let mut rest = *line;
+            loop {
+                match open {
+                    Some(delim) => match rest.find(delim) {
+                        Some(i) => {
+                            rest = &rest[i + 3..];
+                            open = None;
+                        }
+                        None => break,
+                    },
+                    None => match multiline_open(rest) {
+                        Some((i, delim)) => {
+                            rest = &rest[i + 3..];
+                            open = Some(delim);
+                        }
+                        None => break,
+                    },
+                }
+            }
+            inside
+        })
+        .collect()
+}
+
+/// Where a multi-line string opens on this line, outside comments and one-line strings.
+fn multiline_open(line: &str) -> Option<(usize, &'static str)> {
+    let b = line.as_bytes();
+    let (mut basic, mut literal) = (false, false);
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'#' if !basic && !literal => return None,
+            b'\\' if basic => i += 1,
+            _ if !basic && !literal && b[i..].starts_with(b"\"\"\"") => return Some((i, "\"\"\"")),
+            _ if !basic && !literal && b[i..].starts_with(b"\'\'\'") => return Some((i, "\'\'\'")),
+            b'"' if !literal => basic = !basic,
+            b'\'' if !basic => literal = !literal,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Every run of lines belonging to a qx table, in file order.
 fn qx_tables(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mask = multiline_mask(lines);
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        if is_qx_header(&norm_header(lines[i])) {
+        if !mask[i] && is_qx_header(&norm_header(lines[i])) {
             let mut end = i + 1;
-            while end < lines.len() && !lines[end].trim().starts_with('[') {
+            while end < lines.len() && (mask[end] || !lines[end].trim().starts_with('[')) {
                 end += 1;
             }
             // Trailing blank and comment lines introduce the next table: they are not ours,
@@ -42,7 +95,7 @@ fn qx_tables(lines: &[&str]) -> Vec<(usize, usize)> {
             let next_is_qx = lines.get(end).is_some_and(|l| is_qx_header(&norm_header(l)));
             while !next_is_qx && end > i + 1 && {
                 let t = lines[end - 1].trim();
-                t.is_empty() || t.starts_with('#')
+                !mask[end - 1] && (t.is_empty() || t.starts_with('#'))
             } {
                 end -= 1;
             }
@@ -62,6 +115,18 @@ pub fn edit_codex(text: Option<&str>, exe: &Path, a: Action) -> Edit {
             Action::Install => Edit::Changed(render(exe, &Kept::default(), "\n")),
         };
     };
+    // A BOM is not part of the first line: set it aside and put it back on what is written.
+    let (bom, body) = match text.strip_prefix('\u{feff}') {
+        Some(body) => ("\u{feff}", body),
+        None => ("", text),
+    };
+    match edit_codex_body(body, exe, a) {
+        Edit::Changed(out) if !out.is_empty() => Edit::Changed(format!("{bom}{out}")),
+        other => other,
+    }
+}
+
+fn edit_codex_body(text: &str, exe: &Path, a: Action) -> Edit {
     if refuses(text, a) {
         return Edit::Refuse(refusal(exe));
     }
@@ -98,6 +163,13 @@ pub fn edit_codex(text: Option<&str>, exe: &Path, a: Action) -> Edit {
             while at + 1 < out.len() && out[at].trim().is_empty() && out[at + 1].trim().is_empty() {
                 out.remove(at);
             }
+            // Install put one blank line between the block and what is around it: give it back.
+            let blank = |i: usize| out.get(i).is_some_and(|l| l.trim().is_empty());
+            if at > 0 && blank(at - 1) && (at >= out.len() || blank(at)) {
+                out.remove(at - 1);
+            } else if at == 0 && blank(0) {
+                out.remove(0);
+            }
         }
         Action::Install => {
             let block: Vec<String> = render(exe, &kept, eol).lines().map(str::to_string).collect();
@@ -117,6 +189,7 @@ pub fn edit_codex(text: Option<&str>, exe: &Path, a: Action) -> Edit {
 
 /// The `command` of the qx entry, for `qx doctor`.
 pub fn codex_command(text: &str) -> Option<String> {
+    let text = text.trim_start_matches('\u{feff}');
     let lines: Vec<&str> = text.lines().collect();
     for (start, end) in qx_tables(&lines) {
         if is_env_header(&norm_header(lines[start])) {
@@ -151,6 +224,7 @@ fn open_brackets(value: &str) -> i32 {
 
 fn kept(lines: &[&str], tables: &[(usize, usize)]) -> Kept {
     let mut out = Kept::default();
+    let mask = multiline_mask(lines);
     for (start, end) in tables {
         let header = norm_header(lines[*start]);
         let body = &lines[start + 1..*end];
@@ -167,7 +241,12 @@ fn kept(lines: &[&str], tables: &[(usize, usize)]) -> Kept {
             }
         } else if matches!(header.as_str(), "[mcp_servers.qx]" | "[mcp_servers.\"qx\"]") {
             let mut open = 0;
-            for line in body {
+            for (k, line) in body.iter().enumerate() {
+                // Inside a multi-line string every line, blank or not, is part of the value.
+                if mask[start + 1 + k] {
+                    out.main.push(line.to_string());
+                    continue;
+                }
                 if open > 0 {
                     open += open_brackets(line);
                     continue;
@@ -267,7 +346,9 @@ fn strip_comment(line: &str) -> &str {
 fn refuses(text: &str, action: Action) -> bool {
     let mut in_mcp_servers = false;
     let mut in_qx_table = false;
-    for line in text.lines() {
+    let lines: Vec<&str> = text.lines().collect();
+    let mask = multiline_mask(&lines);
+    for (line, _) in lines.iter().zip(&mask).filter(|(_, inside)| !**inside) {
         let t = strip_comment(line).trim();
         if t.starts_with('[') {
             let header = norm_header(t);
@@ -275,17 +356,21 @@ fn refuses(text: &str, action: Action) -> bool {
             in_qx_table = is_qx_header(&header) && !is_env_header(&header);
             continue;
         }
-        let squashed: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+        // `'qx'` and `"qx"` are the same key.
+        let squashed: String = t.chars().filter(|c| !c.is_whitespace()).map(|c| if c == '\'' { '"' } else { c }).collect();
         // An env written inline (`env = { .. }`) or dotted (`env.K = ..`) in the qx table would be
         // regenerated away with the table.
         // Removing the whole table drops nothing the user did not ask to drop.
         if action == Action::Install && in_qx_table && (squashed.starts_with("env=") || squashed.starts_with("env.")) {
             return true;
         }
-        if squashed.starts_with("mcp_servers={") || squashed.starts_with("mcp_servers.qx") {
+        // Another server whose name merely starts with `qx` is not ours.
+        if squashed.starts_with("mcp_servers={")
+            || ["mcp_servers.qx.", "mcp_servers.qx=", "mcp_servers.\"qx\""].iter().any(|p| squashed.starts_with(p))
+        {
             return true;
         }
-        if in_mcp_servers && (squashed.starts_with("qx={") || squashed.starts_with("qx.")) {
+        if in_mcp_servers && ["qx={", "qx.", "\"qx\"=", "\"qx\"."].iter().any(|p| squashed.starts_with(p)) {
             return true;
         }
     }
@@ -522,5 +607,49 @@ model = \"y\"
         assert!(!out.contains("mcp_servers.qx"), "{out}");
         assert!(out.contains("[profiles.fast]\nmodel = \"y\""), "{out}");
         assert!(matches!(edit_codex(Some(&out), Path::new(EXE), Action::Remove), Edit::Unchanged));
+    }
+
+    #[test]
+    fn a_bom_before_the_qx_header_does_not_add_a_second_table() {
+        let src = "\u{feff}[mcp_servers.qx]\ncommand = 'old'\nargs = [\"mcp\"]\n";
+        assert_eq!(codex_command(src).as_deref(), Some("old"));
+        let out = changed(edit_codex(Some(src), Path::new(EXE), Action::Install));
+        assert!(out.starts_with('\u{feff}'), "the BOM stays: {out:?}");
+        assert_eq!(count(&out, "[mcp_servers.qx]\n"), 1, "{out}");
+        assert!(out.contains(r"command = 'C:\q\qx.exe'"), "{out}");
+        let removed = changed(edit_codex(Some(&out), Path::new(EXE), Action::Remove));
+        assert!(!removed.contains("mcp_servers.qx"), "{removed}");
+    }
+
+    #[test]
+    fn a_qx_header_inside_a_multiline_string_is_text_not_a_table() {
+        let exe = Path::new(EXE);
+        let src = "[notes]\ntext = \"\"\"\n[mcp_servers.qx]\ncommand = 'inside'\n\"\"\"\nlit = '''\n[mcp_servers.qx.env]\n'''\nafter = 1\n";
+        assert_eq!(codex_command(src), None);
+        assert!(matches!(edit_codex(Some(src), exe, Action::Remove), Edit::Unchanged));
+        let out = changed(edit_codex(Some(src), exe, Action::Install));
+        assert!(out.starts_with(src), "the strings keep their bytes: {out}");
+        assert_eq!(count(&out, "\n[mcp_servers.qx]\ncommand = 'C:"), 1, "{out}");
+
+        // A string value inside the real qx table (header-like line, blank line) survives a rewrite.
+        let src = "[mcp_servers.qx]\ncommand = 'old'\nnote = \"\"\"\n[mcp_servers.other]\n\n\"\"\"\nenabled = false\n";
+        let out = changed(edit_codex(Some(src), exe, Action::Install));
+        assert!(out.contains("note = \"\"\"\n[mcp_servers.other]\n\n\"\"\"\n"), "{out}");
+        assert!(out.contains("enabled = false"), "{out}");
+        assert_eq!(count(&out, "[mcp_servers.qx]\n"), 1, "{out}");
+    }
+
+    #[test]
+    fn another_server_whose_name_starts_with_qx_is_not_refused() {
+        let exe = Path::new(EXE);
+        let src = "mcp_servers.qxother.command = 'o'\n";
+        let out = changed(edit_codex(Some(src), exe, Action::Install));
+        assert!(out.starts_with(src), "{out}");
+        assert_eq!(count(&out, "[mcp_servers.qx]\n"), 1, "{out}");
+        assert!(matches!(edit_codex(Some(src), exe, Action::Remove), Edit::Unchanged));
+        // The qx entry itself written as dotted keys or an inline table is still refused.
+        for hidden in ["mcp_servers.qx.command = 'o'\n", "mcp_servers.\"qx\" = { command = 'o' }\n", "mcp_servers.qx = {}\n"] {
+            assert!(matches!(edit_codex(Some(hidden), exe, Action::Install), Edit::Refuse(_)), "{hidden}");
+        }
     }
 }
