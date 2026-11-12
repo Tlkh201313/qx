@@ -35,13 +35,16 @@ const DEFAULT_READ_LINES: usize = 2_000;
 const MAX_READ_LINES: usize = 2_000;
 const DEFAULT_READ_LINE_CHARS: usize = 2_000;
 const MAX_READ_LINE_CHARS: usize = 8_000;
-const DEFAULT_READ_BYTES: usize = 50 * 1024;
+const DEFAULT_READ_BYTES: usize = CLIENT_REPLY_BYTES - 1_000;
+/// Claude Code refuses a tool reply of about 50k characters outright; no reply goes past this.
+pub(crate) const CLIENT_REPLY_BYTES: usize = 49_000;
 const DEFAULT_GLOB_RESULTS: usize = 100;
 const MAX_GLOB_RESULTS: usize = 1_000;
 const DEFAULT_GREP_MATCHES: usize = 250;
 const MAX_GREP_MATCHES: usize = 1_000;
 const DEFAULT_GREP_LINE_CHARS: usize = 2_000;
 const MAX_LIST_ENTRIES: usize = 500;
+const MAX_GREP_CONTEXT: usize = 5;
 
 pub struct Reply {
     pub text: String,
@@ -113,9 +116,29 @@ pub(crate) fn note_cwd(dir: &Path) {
     prime(dir);
 }
 
+/// OneDrive-style files that exist only in the cloud: reading one downloads it.
+fn cloud_placeholder(md: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // OFFLINE, RECALL_ON_OPEN, RECALL_ON_DATA_ACCESS
+        md.file_attributes() & (0x1000 | 0x40000 | 0x400000) != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = md;
+        false
+    }
+}
+
 /// Pull a workspace into the OS file cache in the background the first time it is named, so the first
 /// glob or grep over it is not a cold disk walk. Bounded in entries and bytes; never blocks a call.
+#[cfg_attr(test, allow(dead_code))] // only the warm-up thread calls it, and tests do not start that
 pub(crate) fn prime(dir: &Path) {
+    // A drive root or the home folder is not a workspace: reading it would walk the whole disk.
+    if dir.parent().is_none() || crate::resolve::home_dir().is_some_and(|h| h == dir) {
+        return;
+    }
     static SEEN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     {
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -147,7 +170,7 @@ pub(crate) fn prime(dir: &Path) {
                     }
                 } else if ft.is_file() {
                     if let Ok(md) = e.metadata() {
-                        if md.len() <= MAX_FILE {
+                        if md.len() <= MAX_FILE && !cloud_placeholder(&md) {
                             bytes += md.len();
                             let _ = fs::read(e.path());
                         }
@@ -158,14 +181,35 @@ pub(crate) fn prime(dir: &Path) {
     });
 }
 
+/// `%TEMP%\claude`: where Claude Code keeps a session's scratchpad. It is outside every project, yet
+/// writing there is the sanctioned place for temporary files, so mutations are allowed in it too.
+fn scratch_root() -> &'static Path {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        // Canonicalise the temp dir (it exists), not `claude` (it may not yet): otherwise a missing
+        // folder leaves a short `RUNNER~1` form that never matches the canonical path of a write.
+        let t = std::env::temp_dir();
+        fs::canonicalize(&t).unwrap_or(t).join("claude")
+    })
+}
+
+/// The `op` named, or the only one the arguments can mean. Models drop `op` from `{paths}`,
+/// `{path, edits}` and the like; the call would otherwise fail and be sent again. `pattern` is
+/// glob or grep, so it stays an error.
+fn op_of(args: &Value) -> String {
+    match args.get("op").and_then(Value::as_str).filter(|o| !o.is_empty()) {
+        Some(o) => o.to_string(),
+        None if args.get("edits").is_some() || args.get("old_string").is_some() => "edit".into(),
+        None if args.get("content").is_some() => "write".into(),
+        None if args.get("paths").is_some() || args.get("path").is_some() || args.get("file_path").is_some() => "read".into(),
+        None => String::new(),
+    }
+}
+
 pub fn call(args: &Value) -> Reply {
     let started = Instant::now();
     let defaulted = matches!(args.get("cwd"), None | Some(Value::Null));
-    let op = args
-        .get("op")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let op = op_of(args);
     let mut reply = match batch_items(args, &op) {
         Some(Ok(items)) => run_batch(&items),
         Some(Err(e)) => e.reply("batch"),
@@ -174,6 +218,22 @@ pub fn call(args: &Value) -> Reply {
             Err(e) => e.reply(&op),
         },
     };
+    if reply.text.len() > CLIENT_REPLY_BYTES {
+        let total = reply.text.len();
+        let mut cut = CLIENT_REPLY_BYTES;
+        while !reply.text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        reply.text.truncate(cut);
+        reply.text.push_str(&format!("\n[qx] reply cut at {cut} of {total} bytes; narrow the pattern or path, or ask for less per call"));
+        if let Value::Object(map) = &mut reply.structured {
+            map.insert("truncated".to_string(), json!(true));
+        }
+    }
+    let unknown = unknown_keys(args);
+    if !unknown.is_empty() {
+        reply.text.push_str(&format!("\n[qx] ignored (not fs options): {}", unknown.join(", ")));
+    }
     if defaulted && !reply.is_error {
         let used = last_cwd().or_else(|| std::env::current_dir().ok());
         if let Some(d) = used {
@@ -189,9 +249,31 @@ pub fn call(args: &Value) -> Reply {
     reply
 }
 
+/// Every key the `fs` tool reads (its input schema in `mcp.rs`). Anything else is a typo or a
+/// guess, and a silently ignored `ignorecase` returns the wrong answer without a sign of it.
+const KNOWN_KEYS: &[&str] = &[
+    "op", "cwd", "path", "file_path", "content", "old_string", "new_string", "replace_all", "ops", "paths", "edits",
+    "pattern", "include", "offset", "limit", "max_results", "max_matches", "max_line_chars", "ignore_case", "literal",
+    "all", "context", "-C", "-A", "-B",
+];
+
+/// The keys of the call (and of each `ops` item) that no operation reads, in first-seen order.
+fn unknown_keys(args: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let items = args.get("ops").and_then(Value::as_array).into_iter().flatten();
+    for obj in std::iter::once(args).chain(items).filter_map(Value::as_object) {
+        for k in obj.keys() {
+            if !KNOWN_KEYS.contains(&k.as_str()) && !out.contains(k) {
+                out.push(k.clone());
+            }
+        }
+    }
+    out
+}
+
 const MAX_BATCH: usize = 32;
 /// Past this much combined text a batch stops running further operations: the model asks again for the rest.
-const MAX_BATCH_BYTES: usize = 256 * 1024;
+const MAX_BATCH_BYTES: usize = CLIENT_REPLY_BYTES - 9_000;
 
 /// `ops: [{op, ...}]` runs several operations in one round trip; `paths: [..]` is the same for
 /// many `read`s or `stat`s. Each item inherits the call's other arguments (cwd above all).
@@ -243,8 +325,9 @@ fn run_batch(items: &[Value]) -> Reply {
     let mut text = String::new();
     let mut results = Vec::with_capacity(n);
     let (mut failed, mut stopped) = (0usize, false);
+    let mut capped: Vec<usize> = Vec::new();
     for (i, item) in items.iter().enumerate() {
-        let op = item.get("op").and_then(Value::as_str).unwrap_or("").to_string();
+        let op = op_of(item);
         let what = path_arg(item)
             .or_else(|| opt_str(item, "pattern"))
             .unwrap_or("")
@@ -260,6 +343,7 @@ fn run_batch(items: &[Value]) -> Reply {
         if text.len() > MAX_BATCH_BYTES {
             text.push_str("skipped: batch output cap reached; ask for the rest in another call\n\n");
             results.push(json!({ "op": op, "path": what, "ok": false, "skipped": true }));
+            capped.push(i + 1);
             failed += 1;
             continue;
         }
@@ -275,6 +359,11 @@ fn run_batch(items: &[Value]) -> Reply {
         text.push_str(r.text.trim_end());
         text.push_str("\n\n");
     }
+    // The reply may be cut at the client cap, taking the per-op skip lines with it: say it first.
+    if let (Some(a), Some(b)) = (capped.first(), capped.last()) {
+        let ops = if a == b { format!("op {a}") } else { format!("ops {a}-{b}") };
+        text.insert_str(0, &format!("[qx] {ops} of {n} not run (batch output cap); ask for them in another call\n\n"));
+    }
     Reply {
         text: text.trim_end().to_string(),
         structured: json!({ "op": "batch", "count": n, "failed": failed, "results": results }),
@@ -283,6 +372,13 @@ fn run_batch(items: &[Value]) -> Reply {
 }
 
 fn dispatch(op: &str, args: &Value) -> Result<Reply, FsError> {
+    // The last cwd of "some" session is a fine place to read from, never to create or change files in.
+    if matches!(op, "write" | "edit")
+        && matches!(args.get("cwd"), None | Some(Value::Null))
+        && path_arg(args).is_some_and(|p| !Path::new(p.trim()).is_absolute() && !p.trim().starts_with('~'))
+    {
+        return Err(FsError::arg("write and edit with a relative path need `cwd` (or an absolute path)"));
+    }
     let root = Root::new(args)?;
     match op {
         "read" => read(&root, args),
@@ -450,7 +546,7 @@ impl Root {
     }
 
     fn ensure_inside(&self, path: &Path) -> Result<(), FsError> {
-        if path == self.cwd || path.starts_with(&self.cwd) {
+        if path == self.cwd || path.starts_with(&self.cwd) || path.starts_with(scratch_root()) {
             Ok(())
         } else {
             Err(FsError::new(
@@ -464,8 +560,18 @@ impl Root {
         }
     }
 
+    /// A path on another machine would be probed over the network (tens of seconds when it is down) just to be
+    /// refused; refuse it first. A workspace on a share still owns its own paths.
+    fn refuse_foreign_share(&self, candidate: &Path) -> Result<(), FsError> {
+        match unc_share(candidate) {
+            Some(share) if unc_share(&self.cwd).as_ref() != Some(&share) => self.ensure_inside(candidate),
+            _ => Ok(()),
+        }
+    }
+
     fn resolve_existing(&self, raw: &str) -> Result<PathBuf, FsError> {
         let candidate = self.candidate(raw);
+        self.refuse_foreign_share(&candidate)?;
         let canonical = fs::canonicalize(&candidate).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => FsError::new(
                 "FS_NOT_FOUND",
@@ -506,12 +612,7 @@ impl Root {
             return Err(FsError::arg(format!("\"{raw}\" ends with a separator: it names a directory, not a file")).fb("write"));
         }
         let candidate = self.candidate(raw);
-        // A path on another machine would be probed over the network (tens of seconds when it is down) just to be refused.
-        if let Some(share) = unc_share(&candidate) {
-            if unc_share(&self.cwd) != Some(share) {
-                self.ensure_inside(&candidate).map_err(|e| e.fb("write"))?;
-            }
-        }
+        self.refuse_foreign_share(&candidate).map_err(|e| e.fb("write"))?;
         let name = candidate
             .file_name()
             .ok_or_else(|| FsError::arg("path must name a file"))?;
@@ -598,6 +699,18 @@ impl Root {
                 }
             }
         }
+        // The places `run` refuses to write (system folders, the startup folder, .ssh): the same rule,
+        // so `fs` is not the way around it. The guard compares lowercase `\` paths.
+        let mut s = path.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            s = rest.to_string();
+        }
+        if let Some(what) = crate::guard::write_protected(s.trim_end_matches('\\')) {
+            return Err(FsError::new(
+                "FS_PROTECTED",
+                format!("refusing to modify {what}: {}", path.display()),
+            ));
+        }
         Ok(())
     }
 }
@@ -681,24 +794,19 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     h
 }
 
-type ObsKey = (PathBuf, PathBuf);
-
-fn observations() -> &'static Mutex<HashMap<ObsKey, Version>> {
-    static MAP: OnceLock<Mutex<HashMap<ObsKey, Version>>> = OnceLock::new();
+/// Keyed by the file alone: the same file reached through another `cwd` is the same file.
+fn observations() -> &'static Mutex<HashMap<PathBuf, Version>> {
+    static MAP: OnceLock<Mutex<HashMap<PathBuf, Version>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Keyed by the file alone: the same file reached through another `cwd` is the same file.
-fn remember(_cwd: &Path, path: &Path, version: Version) {
-    observations()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert((PathBuf::new(), path.to_path_buf()), version);
+fn remember(path: &Path, version: Version) {
+    observations().lock().unwrap_or_else(|e| e.into_inner()).insert(path.to_path_buf(), version);
 }
 
-fn check_observed(_cwd: &Path, path: &Path, current: Version, display: &str) -> Result<(), FsError> {
+fn check_observed(path: &Path, current: Version, display: &str) -> Result<(), FsError> {
     let map = observations().lock().unwrap_or_else(|e| e.into_inner());
-    match map.get(&(PathBuf::new(), path.to_path_buf())) {
+    match map.get(path) {
         None => Err(FsError::new(
             "FS_NOT_OBSERVED",
             format!(
@@ -838,8 +946,36 @@ fn version_after(path: &Path, bytes: &[u8]) -> Result<Version, FsError> {
     Ok(Version::of(bytes, md.modified().ok()))
 }
 
+/// A killed write leaves its `.qx-tmp-*` beside the target. The first write into a folder (per process)
+/// removes those older than an hour.
+fn sweep_stale_temps(parent: &Path) {
+    static SWEPT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    {
+        let mut swept = SWEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if swept.iter().any(|p| p == parent) {
+            return;
+        }
+        if swept.len() >= 64 {
+            swept.clear();
+        }
+        swept.push(parent.to_path_buf());
+    }
+    let Ok(rd) = fs::read_dir(parent) else { return };
+    let hour = std::time::Duration::from_secs(3600);
+    for e in rd.flatten() {
+        if !e.file_name().to_string_lossy().starts_with(".qx-tmp-") {
+            continue;
+        }
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age >= hour);
+        if old {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+}
+
 fn write_temp(parent: &Path, bytes: &[u8]) -> Result<Temp, FsError> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    sweep_stale_temps(parent);
     for _ in 0..100 {
         let path = parent.join(format!(
             ".qx-tmp-{}-{}",
@@ -941,6 +1077,10 @@ fn atomic_replace(path: &Path, bytes: &[u8], expected: Version) -> Result<(), Fs
             ),
         ));
     }
+    // Read-only fails with the same error 5 a brief lock gives; say so instead of retrying for 600 ms.
+    if md.permissions().readonly() {
+        return Err(FsError::new("FS_IO", format!("cannot modify \"{}\": the file is read-only", path.display())));
+    }
     // An editor, indexer or virus scanner may hold the file for a moment without delete sharing.
     let mut attempt = 0;
     loop {
@@ -1034,7 +1174,7 @@ fn read(root: &Root, args: &Value) -> Result<Reply, FsError> {
         max_line_chars,
         DEFAULT_READ_BYTES,
     )?;
-    remember(&root.cwd, &path, version);
+    remember(&path, version);
     Ok(Reply {
         text: out.text,
         structured: json!({
@@ -1096,16 +1236,46 @@ fn read_large(root: &Root, path: &Path, raw: &str, offset: usize, limit: usize, 
         end_line = n;
     }
     let display = root.display(path);
-    let footer = if more {
-        format!("(Showing lines {offset}-{end_line} of a {size}-byte file. Use offset={} to continue.)", end_line + 1)
+    let text = if lean() {
+        lean_read(&body, offset, end_line, (!more).then_some(n), more)
     } else {
-        format!("(End of file - total {n} lines)")
+        let footer = if more {
+            format!("(Showing lines {offset}-{end_line} of a {size}-byte file. Use offset={} to continue.)", end_line + 1)
+        } else {
+            format!("(End of file - total {n} lines)")
+        };
+        format!("<path>{display}</path>\n<type>file</type>\n<content>\n{body}\n\n{footer}\n</content>")
     };
     Ok(Reply {
-        text: format!("<path>{display}</path>\n<type>file</type>\n<content>\n{body}\n\n{footer}\n</content>"),
+        text,
         structured: json!({ "op": "read", "path": display, "lines": shown, "end_line": end_line, "truncated": more, "bytes": size }),
         is_error: false,
     })
+}
+
+/// Claude Code and Codex get a read without the tag frame (the call already names the path, and a
+/// batch header repeats it): the numbered lines, plus one bracketed line only when the window is
+/// not the whole file from line 1. Other clients keep the OpenCode-shaped frame.
+fn lean() -> bool {
+    matches!(crate::client::current(), crate::client::Client::ClaudeCode | crate::client::Client::Codex)
+}
+
+fn lean_read(body: &str, offset: usize, end: usize, total: Option<usize>, more: bool) -> String {
+    let note = if more {
+        let of = total.map(|t| format!(" of {t}")).unwrap_or_default();
+        format!("[lines {offset}-{end}{of}; offset={} for more]", end + 1)
+    } else if total == Some(0) {
+        "(empty file)".to_string()
+    } else if offset > 1 {
+        format!("[end, {} lines]", total.unwrap_or(end))
+    } else {
+        return body.to_string();
+    };
+    if body.is_empty() {
+        note
+    } else {
+        format!("{body}\n{note}")
+    }
 }
 
 struct ReadWindow {
@@ -1126,8 +1296,9 @@ fn render_read(
 ) -> Result<ReadWindow, FsError> {
     let total = count_lines(text.as_bytes());
     if offset > total && !(total == 0 && offset == 1) {
+        let note = format!("(offset {offset} is past the end: the file has {total} lines)");
         return Ok(ReadWindow {
-            text: format!("<path>{display}</path>\n<type>file</type>\n<content>\n(offset {offset} is past the end: the file has {total} lines)\n</content>"),
+            text: if lean() { note } else { format!("<path>{display}</path>\n<type>file</type>\n<content>\n{note}\n</content>") },
             lines: 0,
             total,
             end_line: total,
@@ -1173,26 +1344,31 @@ fn render_read(
         end_line = n;
     }
 
-    let footer = if cut_by_bytes {
-        format!(
-            "(Output capped. Showing lines {offset}-{end_line}. Use offset={} to continue.)",
-            end_line + 1
-        )
-    } else if end_line < total {
-        format!(
-            "(Showing lines {offset}-{end_line} of {total}. Use offset={} to continue.)",
-            end_line + 1
-        )
+    let text = if lean() {
+        lean_read(&body, offset, end_line, Some(total), cut_by_bytes || end_line < total)
     } else {
-        format!("(End of file - total {total} lines)")
-    };
-    let body = if body.is_empty() {
-        footer
-    } else {
-        format!("{body}\n\n{footer}")
+        let footer = if cut_by_bytes {
+            format!(
+                "(Output capped. Showing lines {offset}-{end_line}. Use offset={} to continue.)",
+                end_line + 1
+            )
+        } else if end_line < total {
+            format!(
+                "(Showing lines {offset}-{end_line} of {total}. Use offset={} to continue.)",
+                end_line + 1
+            )
+        } else {
+            format!("(End of file - total {total} lines)")
+        };
+        let body = if body.is_empty() {
+            footer
+        } else {
+            format!("{body}\n\n{footer}")
+        };
+        format!("<path>{display}</path>\n<type>file</type>\n<content>\n{body}\n</content>")
     };
     Ok(ReadWindow {
-        text: format!("<path>{display}</path>\n<type>file</type>\n<content>\n{body}\n</content>"),
+        text,
         lines: shown,
         total,
         end_line,
@@ -1245,9 +1421,19 @@ fn push_clipped(out: &mut String, line: &str, max: usize) {
     }
 }
 
-fn clip_line(line: &str, max: usize) -> String {
+/// A grep hit shown within `max` characters: a long line is cut around the first match, not at its head,
+/// so the text that matched is in what the model sees.
+fn clip_match(line: &str, max: usize, matcher: &Matcher) -> String {
     let mut out = String::with_capacity(line.len().min(max + 64));
-    push_clipped(&mut out, line, max);
+    let before = matcher.find(line).map_or(0, |m| line[..m.start()].chars().count());
+    let start = before.saturating_sub(max / 2);
+    if start == 0 {
+        push_clipped(&mut out, line, max);
+        return out;
+    }
+    let from = line.char_indices().nth(start).map_or(line.len(), |(i, _)| i);
+    out.push_str("...");
+    push_clipped(&mut out, &line[from..], max);
     out
 }
 
@@ -1280,7 +1466,7 @@ fn write(root: &Root, args: &Value) -> Result<Reply, FsError> {
     let mut before = Vec::new();
     if existed {
         let (bytes, current) = read_file(&path, "write")?;
-        check_observed(&root.cwd, &path, current, &display).map_err(|e| e.fb("write"))?;
+        check_observed(&path, current, &display).map_err(|e| e.fb("write"))?;
         // `read` showed lossy, LF-only text: writing it back must not re-encode or flatten the file.
         match carry_over_encoding(&bytes, content) {
             Ok(text) => written = text,
@@ -1292,14 +1478,17 @@ fn write(root: &Root, args: &Value) -> Result<Reply, FsError> {
                 .fb("write"));
             }
         }
-        atomic_replace(&path, written.as_bytes(), current).map_err(|e| e.fb("write"))?;
+        // The same bytes need no replacing: a rewrite would only wake file watchers and move the clock.
+        if written.as_bytes() != bytes {
+            atomic_replace(&path, written.as_bytes(), current).map_err(|e| e.fb("write"))?;
+        }
         before = bytes;
     } else {
         create_noreplace(&path, content.as_bytes()).map_err(|e| e.fb("write"))?;
     }
     let content = written.as_ref();
     let version = version_after(&path, content.as_bytes()).map_err(|e| e.fb("write"))?;
-    remember(&root.cwd, &path, version);
+    remember(&path, version);
     // Only the reply is left to do, and the line count is not part of the change: not under the lock.
     drop(guard);
     let delta = line_delta(&before, content.as_bytes());
@@ -1308,8 +1497,9 @@ fn write(root: &Root, args: &Value) -> Result<Reply, FsError> {
     } else {
         "Created file"
     };
+    let said = format!("{verb} {}", lines_note(!existed, delta));
     Ok(Reply {
-        text: format!("<path>{display}</path>\n<type>file</type>\n<content>\n{verb} {}\n</content>", lines_note(!existed, delta)),
+        text: if lean() { said } else { format!("<path>{display}</path>\n<type>file</type>\n<content>\n{said}\n</content>") },
         structured: json!({
             "op": "write",
             "path": display,
@@ -1332,9 +1522,6 @@ fn lines_note(created: bool, (added, removed): (usize, usize)) -> String {
         _ => format!("(+{added} -{removed} lines)"),
     }
 }
-
-/// Past this many added plus removed lines, `line_delta` stops looking for the smallest diff.
-const DIFF_CAP: usize = 512;
 
 /// Length of the common prefix of `a` and `b`; 64 bytes a step while they match (a vectorised compare).
 fn common_prefix(a: &[u8], b: &[u8]) -> usize {
@@ -1383,55 +1570,16 @@ fn shared_tail(a: &[u8], b: &[u8]) -> usize {
     a[sa..].iter().position(|&c| c == b'\n').map_or(0, |i| n - i - 1)
 }
 
-/// Lines `(added, removed)` going from `old` to `new`. A line includes its terminator, so a change of
-/// line ending or of the final newline counts. The smallest diff: the lines outside a longest common
-/// subsequence. Done on bytes, with no table of lines: the shared head and tail are trimmed, the lines
-/// of what is left are counted, and Myers' greedy search finds only the edit distance D from which the
-/// two counts follow (its points are byte offsets of line starts).
+/// Lines `(added, removed)` going from `old` to `new`: the lines left in each once the whole lines they
+/// share at the start and at the end are cut. A line includes its terminator, so a change of line ending
+/// or of the final newline counts. Exact when the change is one stretch, as an edit or a rewrite of one
+/// place is; for changes scattered through the file the lines between them count as replaced, so the
+/// numbers are an upper bound.
 fn line_delta(old: &[u8], new: &[u8]) -> (usize, usize) {
     let head = shared_head(old, new);
     let (old, new) = (&old[head..], &new[head..]);
     let tail = shared_tail(old, new);
-    let (old, new) = (&old[..old.len() - tail], &new[..new.len() - tail]);
-    let (n, m) = (count_lines(old), count_lines(new));
-    if n == 0 || m == 0 {
-        return (m, n);
-    }
-    const NONE: usize = usize::MAX;
-    let end = |t: &[u8], at: usize| t[at..].iter().position(|&c| c == b'\n').map_or(t.len(), |i| at + i + 1);
-    let max = (n + m).min(DIFF_CAP);
-    let mid = max + 1;
-    // The furthest point reached on each diagonal (old lines taken minus new lines taken), as byte offsets.
-    let mut far = vec![(NONE, 0usize); 2 * max + 3];
-    for d in 0..=max {
-        for k in (0..=d).map(|j| 2 * j as isize - d as isize) {
-            let at = (mid as isize + k) as usize;
-            let (left, above) = (far[at - 1], far[at + 1]);
-            let start = if d == 0 {
-                (0, 0)
-            } else {
-                // From diagonal k-1 by dropping an old line, or from k+1 by adding a new one: the further one.
-                let del = (left.0 < old.len()).then(|| (end(old, left.0), left.1));
-                let ins = (above.0 != NONE && above.1 < new.len()).then(|| (above.0, end(new, above.1)));
-                match (del, ins) {
-                    (Some(a), Some(b)) => if b.0 >= a.0 { b } else { a },
-                    (a, b) => a.or(b).unwrap_or((NONE, 0)),
-                }
-            };
-            if start.0 == NONE {
-                far[at] = start;
-                continue;
-            }
-            let run = shared_head(&old[start.0..], &new[start.1..]);
-            let reached = (start.0 + run, start.1 + run);
-            if reached == (old.len(), new.len()) {
-                return ((d + m - n) / 2, (d + n - m) / 2);
-            }
-            far[at] = reached;
-        }
-    }
-    // shortcut: beyond DIFF_CAP edits the whole middle counts as replaced (an upper bound), raise the cap if exact counts of big rewrites matter
-    (m, n)
+    (count_lines(&new[..new.len() - tail]), count_lines(&old[..old.len() - tail]))
 }
 
 /// One `{old_string, new_string, replace_all?}` replacement, applied to `text` in memory.
@@ -1531,6 +1679,10 @@ fn edit(root: &Root, args: &Value) -> Result<Reply, FsError> {
         )
         .fb("edit"));
     };
+    // `steps` is the lines each edit of a batch changed, added up: exact for edits in different places,
+    // too high when a later edit rewrites lines an earlier one touched. The whole-file figure below is
+    // the other way round, so the smaller of the two is the closer bound.
+    let mut steps = (0usize, 0usize);
     let (updated, replacements) = match batch {
         Some(list) => {
             let mut cur = String::new();
@@ -1538,7 +1690,10 @@ fn edit(root: &Root, args: &Value) -> Result<Reply, FsError> {
             for (i, e) in list.iter().enumerate() {
                 let label = format!("edits[{i}]: ");
                 // The first edit reads the file's own text; no copy of it is made.
-                let (next, n) = apply_edit(if i == 0 { text } else { cur.as_str() }, raw, e, &label)?;
+                let before = if i == 0 { text } else { cur.as_str() };
+                let (next, n) = apply_edit(before, raw, e, &label)?;
+                let d = line_delta(before.as_bytes(), next.as_bytes());
+                steps = (steps.0 + d.0, steps.1 + d.1);
                 cur = next;
                 total += n;
             }
@@ -1547,12 +1702,17 @@ fn edit(root: &Root, args: &Value) -> Result<Reply, FsError> {
         None => apply_edit(text, raw, args, "")?,
     };
     let replace_all = batch.is_none() && bool_arg(args, "replace_all", false);
-    atomic_replace(&path, updated.as_bytes(), current).map_err(|e| e.fb("edit"))?;
+    if updated.as_bytes() != bytes {
+        atomic_replace(&path, updated.as_bytes(), current).map_err(|e| e.fb("edit"))?;
+    }
     let version = version_after(&path, updated.as_bytes()).map_err(|e| e.fb("edit"))?;
-    remember(&root.cwd, &path, version);
+    remember(&path, version);
     // Only the reply is left to do, and the line count is not part of the change: not under the lock.
     drop(guard);
-    let delta = line_delta(&bytes, updated.as_bytes());
+    let mut delta = line_delta(&bytes, updated.as_bytes());
+    if batch.is_some() {
+        delta = (delta.0.min(steps.0), delta.1.min(steps.1));
+    }
     let display = root.display(&path);
     let suffix = match (batch, replace_all) {
         (Some(b), _) => format!(" {} edits applied.", b.len()),
@@ -1632,6 +1792,19 @@ fn carry_over_encoding<'a>(before: &[u8], content: &'a str) -> Result<std::borro
 
 fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
     let pattern = req_str(args, "pattern")?;
+    let reply = glob_once(root, args, pattern)?;
+    // `app/[id]/*.tsx` and `pages/[id].tsx` name a folder or file called `[id]`, which as a pattern is a
+    // one-letter class. When that finds nothing, every bracket is tried as a plain character.
+    if reply.structured["count"] == 0 && pattern.contains('[') {
+        let retry = glob_once(root, args, &pattern.replace('[', "[[]"))?;
+        if retry.structured["count"] != 0 {
+            return Ok(retry);
+        }
+    }
+    Ok(reply)
+}
+
+fn glob_once(root: &Root, args: &Value, pattern: &str) -> Result<Reply, FsError> {
     if pattern.starts_with('!') {
         return Err(FsError::new(
             "FS_UNSUPPORTED",
@@ -1642,9 +1815,9 @@ fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
         )
         .fb("glob"));
     }
-    let patterns = expand_braces(&pattern.replace('\\', "/"));
     let raw_path = path_arg(args).unwrap_or(".");
     let root_path = root.resolve_read(raw_path).map_err(|e| e.fb("glob"))?;
+    let patterns = expand_braces(&relative_pattern(pattern, &root_path));
     let max_results = usize_arg(
         args,
         "max_results",
@@ -1654,7 +1827,9 @@ fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
     )?;
     let ignore_case = bool_arg(args, "ignore_case", false);
     // Asking for a generated directory by name (`node_modules/**`) is asking to look inside it.
-    let all = bool_arg(args, "all", false) || patterns.iter().any(|p| names_skipped_dir(p)) || names_skipped_dir(raw_path);
+    let all = bool_arg(args, "all", false)
+        || patterns.iter().any(|p| names_skipped_dir(p) || names_ignored_dir(&root_path, p))
+        || names_skipped_dir(raw_path);
     let mut skipped: Vec<String> = Vec::new();
 
     let mut hits = Newest::new();
@@ -1733,6 +1908,7 @@ fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
     }
     if count == 0 {
         out.push_str("No files found.\n");
+        out.push_str(&outside_note(&patterns, &root_path));
     } else if count > shown {
         out.push_str(&format!(
             "[qx] showing {shown} of {}{} paths; narrow the pattern or use the native {} tool.\n",
@@ -1792,21 +1968,9 @@ fn matches_any(patterns: &[String], rel: &str, base: &str, ignore_case: bool) ->
 
 // --------------------------------------------------------------------- grep
 
-/// How one `grep` call matches a line: a regex (what the dsh grep tool takes) or plain text.
-enum Matcher {
-    Re(regex::Regex),
-    Lit { needle: String, ci: bool },
-}
-
-impl Matcher {
-    fn is_match(&self, line: &str) -> bool {
-        match self {
-            Matcher::Re(re) => re.is_match(line),
-            Matcher::Lit { needle, ci: false } => line.contains(needle.as_str()),
-            Matcher::Lit { needle, ci: true } => contains_ascii_ci(line, needle),
-        }
-    }
-}
+/// How one `grep` call matches a line. Plain text is the escaped pattern, so one engine and one
+/// case-folding rule serve both.
+type Matcher = regex::Regex;
 
 fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     let needle = req_str(args, "pattern")?;
@@ -1835,11 +1999,11 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
             .fb("grep"));
         }
     }
-    let include_patterns = include.map(|s| expand_braces(&s.replace('\\', "/")));
+    let include_patterns = include.map(|s| expand_braces(&relative_pattern(s, &root_path)));
     let ignore_case = bool_arg(args, "ignore_case", false);
     let all = bool_arg(args, "all", false)
         || names_skipped_dir(raw_path)
-        || include_patterns.as_ref().is_some_and(|ps| ps.iter().any(|p| names_skipped_dir(p)));
+        || include_patterns.as_ref().is_some_and(|ps| ps.iter().any(|p| names_skipped_dir(p) || names_ignored_dir(&root_path, p)));
     let max_matches = usize_arg(
         args,
         "max_matches",
@@ -1854,31 +2018,29 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
         20,
         MAX_READ_LINE_CHARS,
     )?;
+    // `context`, `-A`, `-B` and `-C` are grep and Claude Code's own names: models send them unprompted,
+    // so they are honoured though the schema does not advertise them.
+    let ctx = |k: &str| {
+        let n = args.get(k).and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())));
+        n.map_or(0, |v| (v as usize).min(MAX_GREP_CONTEXT))
+    };
+    let c = ctx("context").max(ctx("-C"));
+    let (before, after) = (c.max(ctx("-B")), c.max(ctx("-A")));
 
     // Regex by default, like the dsh grep tool. A pattern that is not a valid regex (`foo(`, a lone `[`)
     // is searched as plain text instead of failing, and the reply says so.
+    let build = |p: &str| regex::RegexBuilder::new(p).case_insensitive(ignore_case).size_limit(32 * 1024 * 1024).build();
+    let literal = bool_arg(args, "literal", false);
     let mut literal_fallback = false;
-    let matcher = if bool_arg(args, "literal", false) {
-        Matcher::Lit {
-            needle: if ignore_case { needle.to_ascii_lowercase() } else { needle.to_string() },
-            ci: ignore_case,
-        }
+    let built = if literal {
+        build(&regex::escape(needle))
     } else {
-        match regex::RegexBuilder::new(needle)
-            .case_insensitive(ignore_case)
-            .size_limit(32 * 1024 * 1024)
-            .build()
-        {
-            Ok(re) => Matcher::Re(re),
-            Err(_) => {
-                literal_fallback = true;
-                Matcher::Lit {
-                    needle: if ignore_case { needle.to_ascii_lowercase() } else { needle.to_string() },
-                    ci: ignore_case,
-                }
-            }
-        }
+        build(needle).or_else(|_| {
+            literal_fallback = true;
+            build(&regex::escape(needle))
+        })
     };
+    let matcher = built.map_err(|e| FsError::arg(format!("pattern too large to search: {e}")).fb("grep"))?;
 
     // With the file's mtime when the index supplied the list: that is what makes its cached text usable.
     let mut files: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
@@ -1898,9 +2060,12 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     }
     // No sort here: matching files are sorted by path below, which fixes the output order.
     if let Some(patterns) = &include_patterns {
+        // Below a folder, `include` is relative to it. A single file has nothing below it: its path from
+        // the workspace is what `include` is then matched against.
+        let rel_to = if md.is_file() { root.cwd.as_path() } else { root_path.as_path() };
         files.retain(|(p, _)| {
             let rel = p
-                .strip_prefix(&root_path)
+                .strip_prefix(rel_to)
                 .unwrap_or(p)
                 .to_string_lossy()
                 .replace('\\', "/");
@@ -1915,12 +2080,12 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     let trace = std::env::var_os("QX_FS_TRACE").is_some();
     let t_scan = Instant::now();
     let panicked = AtomicBool::new(false);
-    let fast = fast_regex(&matcher, needle, bool_arg(args, "literal", false), ignore_case);
+    let fast = fast_regex(needle, literal || literal_fallback, ignore_case);
     let fast = fast.as_ref();
     let matcher = &matcher;
     // Threads cost ~60 us each to start: only as many as the work is worth. A file whose text is
     // cached takes ~10 us; one that must be opened and read, ~150 us.
-    let cold = files.iter().filter(|(p, m)| m.map_or(true, |m| content_get(p, m).is_none())).count();
+    let cold = files.iter().filter(|(p, m)| m.is_none_or(|m| content_get(p, m).is_none())).count();
     let work_us = cold * 150 + (files.len() - cold) * 10;
     let threads = fs_threads().min(files.len().max(1)).min(work_us / 400 + 1);
     let mut scans: Vec<ScanFile> = if threads <= 1 {
@@ -1947,8 +2112,9 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
                 .collect();
             let mut out = Vec::with_capacity(files.len());
             for h in handles {
-                if let Ok(v) = h.join() {
-                    out.extend(v);
+                match h.join() {
+                    Ok(v) => out.extend(v),
+                    Err(_) => panicked.store(true, Ordering::Relaxed),
                 }
             }
             out
@@ -1982,19 +2148,48 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
         }
         out.push('\n');
         out.push_str(&root.display(&sf.path));
-        for m in &sf.matches {
+        let lines = if before + after > 0 { context_lines(&sf.path, &sf.matches, before, after, max_line_chars) } else { HashMap::new() };
+        let mut next = 1usize; // the first line of this file not yet printed
+        for (i, m) in sf.matches.iter().enumerate() {
             if shown >= max_matches {
                 break 'files;
+            }
+            let from = m.line.saturating_sub(before).max(next);
+            if !lines.is_empty() && from > next && next > 1 {
+                out.push_str("\n--");
+            }
+            for n in from..m.line {
+                if let Some(l) = lines.get(&n) {
+                    out.push('\n');
+                    push_usize(&mut out, n);
+                    out.push_str("- ");
+                    push_clipped(&mut out, l, max_line_chars);
+                }
             }
             out.push('\n');
             push_usize(&mut out, m.line);
             out.push_str(": ");
             out.push_str(&m.text);
             shown += 1;
+            next = m.line + 1;
+            let stop = sf.matches.get(i + 1).map_or(usize::MAX, |n| n.line);
+            let last = (m.line + after).min(stop.saturating_sub(1));
+            let mut printed_to = next;
+            for n in next..=last {
+                // Past the end of the file there is no line: the window simply has none.
+                let Some(l) = lines.get(&n) else { break };
+                out.push('\n');
+                push_usize(&mut out, n);
+                out.push_str("- ");
+                push_clipped(&mut out, l, max_line_chars);
+                printed_to = n + 1;
+            }
+            next = printed_to;
         }
     }
     if total == 0 {
         out.push_str("No matches found.\n");
+        out.push_str(&outside_note(include_patterns.as_deref().unwrap_or_default(), &root_path));
     } else if total > shown {
         out.push_str(&format!(
             "\n[qx] showing {shown} of {total} matches; narrow the pattern, path or include.\n"
@@ -2005,10 +2200,13 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     if literal_fallback {
         out.push_str("[qx] the pattern is not a valid regex; it was searched as plain text.\n");
     }
-    if skipped_binary > 0 || skipped_large > 0 || read_errors > 0 {
-        out.push_str(&format!(
-            "[qx] skipped {skipped_binary} binary, {skipped_large} large, {read_errors} unreadable file(s).\n"
-        ));
+    let left_out: Vec<String> = [(skipped_binary, "binary"), (skipped_large, "large"), (read_errors, "unreadable")]
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect();
+    if !left_out.is_empty() {
+        out.push_str(&format!("[qx] skipped {} file(s).\n", left_out.join(", ")));
     }
     if !skipped_dirs.is_empty() {
         out.push_str(&skip_note(&skipped_dirs));
@@ -2185,6 +2383,10 @@ fn scan_text(text: &str, matcher: &Matcher, fast: Option<&regex::Regex>, max_lin
     match fast {
         Some(re) => scan_buffer(text, 1, re, matcher, max_line_chars, max_store, sf),
         None => {
+            if text.is_empty() {
+                return;
+            }
+            let text = text.strip_suffix('\n').unwrap_or(text);
             for (idx, line) in text.split('\n').enumerate() {
                 let line = line.strip_suffix('\r').unwrap_or(line);
                 if !matcher.is_match(line) {
@@ -2192,7 +2394,7 @@ fn scan_text(text: &str, matcher: &Matcher, fast: Option<&regex::Regex>, max_lin
                 }
                 sf.total += 1;
                 if sf.matches.len() < max_store {
-                    sf.matches.push(Match { line: idx + 1, text: clip_line(line, max_line_chars) });
+                    sf.matches.push(Match { line: idx + 1, text: clip_match(line, max_line_chars, matcher) });
                 }
             }
         }
@@ -2209,6 +2411,10 @@ fn scan_buffer(text: &str, first_line: usize, re: &regex::Regex, matcher: &Match
     while cursor <= text.len() {
         let Some(m) = re.find_at(text, cursor) else { break };
         let s = m.start();
+        // After the last line break there is no line: `^$` or `x*` would report an empty one.
+        if s == text.len() && (s == 0 || bytes[s - 1] == b'\n') {
+            break;
+        }
         let ls = bytes[..s].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
         let le = bytes[s..].iter().position(|&b| b == b'\n').map_or(text.len(), |i| s + i);
         let line = text[ls..le].strip_suffix('\r').unwrap_or(&text[ls..le]);
@@ -2220,7 +2426,7 @@ fn scan_buffer(text: &str, first_line: usize, re: &regex::Regex, matcher: &Match
         counted_to = ls;
         sf.total += 1;
         if sf.matches.len() < max_store {
-            sf.matches.push(Match { line: line_no, text: clip_line(line, max_line_chars) });
+            sf.matches.push(Match { line: line_no, text: clip_match(line, max_line_chars, matcher) });
         }
     }
 }
@@ -2228,34 +2434,48 @@ fn scan_buffer(text: &str, first_line: usize, re: &regex::Regex, matcher: &Match
 /// The multi-line search expression for `scan_buffer`, when it is certain to find every line the
 /// per-line matcher would accept: a pattern with no anchors or flags that mean something different
 /// on a whole text than on one line.
-fn fast_regex(matcher: &Matcher, pattern: &str, literal: bool, ignore_case: bool) -> Option<regex::Regex> {
-    let source = match matcher {
-        Matcher::Lit { needle, ci } if literal || !pattern.is_empty() => {
-            let _ = ci;
-            if needle.is_empty() {
+fn fast_regex(pattern: &str, text: bool, ignore_case: bool) -> Option<regex::Regex> {
+    let ci = if ignore_case { "(?i)" } else { "" };
+    let source = if text {
+        if pattern.is_empty() {
+            return None;
+        }
+        format!("{ci}{}", regex::escape(pattern))
+    } else {
+        let p = pattern;
+        if p.is_empty() || p.contains("\\A") || p.contains("\\z") || p.contains("\\Z") || p.contains("\\n") || p.contains("\\r") {
+            return None;
+        }
+        // Only plain groups and `(?i)`: any other flag could change what `^`, `$` or `.` mean.
+        let mut rest = p;
+        while let Some(i) = rest.find("(?") {
+            let after = &rest[i + 2..];
+            if !(after.starts_with(':') || after.starts_with("i)") || after.starts_with("P<") || after.starts_with('<')) {
                 return None;
             }
-            format!("{}{}", if *ci { "(?i)" } else { "" }, regex::escape(needle))
+            rest = after;
         }
-        Matcher::Re(_) => {
-            let p = pattern;
-            if p.is_empty() || p.contains("\\A") || p.contains("\\z") || p.contains("\\Z") || p.contains("\\n") || p.contains("\\r") {
-                return None;
-            }
-            // Only plain groups and `(?i)`: any other flag could change what `^`, `$` or `.` mean.
-            let mut rest = p;
-            while let Some(i) = rest.find("(?") {
-                let after = &rest[i + 2..];
-                if !(after.starts_with(':') || after.starts_with("i)") || after.starts_with("P<") || after.starts_with('<')) {
-                    return None;
-                }
-                rest = after;
-            }
-            format!("(?mR){}{p}", if ignore_case { "(?i)" } else { "" })
-        }
-        _ => return None,
+        format!("(?mR){ci}{p}")
     };
     regex::RegexBuilder::new(&source).size_limit(32 * 1024 * 1024).build().ok()
+}
+
+/// Reads past the rest of the current line. False on a read error.
+fn skip_line(r: &mut impl std::io::BufRead) -> bool {
+    loop {
+        let (done, used) = match r.fill_buf() {
+            Ok([]) => return true,
+            Ok(b) => match b.iter().position(|&c| c == b'\n') {
+                Some(i) => (true, i + 1),
+                None => (false, b.len()),
+            },
+            Err(_) => return false,
+        };
+        r.consume(used);
+        if done {
+            return true;
+        }
+    }
 }
 
 /// A file too big to load whole is searched line by line.
@@ -2265,6 +2485,7 @@ fn scan_stream(path: &Path, matcher: &Matcher, fast: Option<&regex::Regex>, max_
         sf.error = true;
         return;
     };
+    const LONG_LINE: usize = 16 << 20;
     let mut r = BufReader::with_capacity(1 << 20, f);
     match r.fill_buf() {
         Ok(head) if head.iter().take(8192).any(|&b| b == 0) => {
@@ -2280,6 +2501,7 @@ fn scan_stream(path: &Path, matcher: &Matcher, fast: Option<&regex::Regex>, max_
     if let Some(re) = fast {
         // 4 MB at a time, cut at the last line break: the whole-buffer search at memory speed.
         const CHUNK: usize = 4 << 20;
+        let mut skipping = false;
         let mut carry: Vec<u8> = Vec::new();
         let mut first_line = 1usize;
         let mut block = vec![0u8; CHUNK];
@@ -2291,13 +2513,33 @@ fn scan_stream(path: &Path, matcher: &Matcher, fast: Option<&regex::Regex>, max_
                     return;
                 }
             };
-            carry.extend_from_slice(&block[..n]);
+            let mut fresh = &block[..n];
+            if skipping {
+                // The rest of a line already searched as a prefix: dropped up to its line break.
+                match fresh.iter().position(|&b| b == b'\n') {
+                    Some(i) => {
+                        skipping = false;
+                        fresh = &fresh[i + 1..];
+                    }
+                    None if n == 0 => return,
+                    None => continue,
+                }
+            }
+            carry.extend_from_slice(fresh);
             let cut = if n == 0 { carry.len() } else { carry.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1) };
             if cut > 0 {
                 let text = String::from_utf8_lossy(&carry[..cut]);
                 scan_buffer(&text, first_line, re, matcher, max_line_chars, max_store, sf);
                 first_line += carry[..cut].iter().filter(|&&b| b == b'\n').count();
                 carry.drain(..cut);
+            } else if carry.len() > LONG_LINE {
+                // One line this long (a minified bundle, a data blob) would be held whole: only its first
+                // LONG_LINE bytes are searched, as one line, and the rest is skipped.
+                let text = String::from_utf8_lossy(&carry);
+                scan_buffer(&text, first_line, re, matcher, max_line_chars, max_store, sf);
+                first_line += 1;
+                carry.clear();
+                skipping = true;
             }
             if n == 0 {
                 return;
@@ -2308,9 +2550,15 @@ fn scan_stream(path: &Path, matcher: &Matcher, fast: Option<&regex::Regex>, max_
     let mut idx = 0usize;
     loop {
         buf.clear();
-        match r.read_until(b'\n', &mut buf) {
+        // At most LONG_LINE bytes of a line are held; the rest of a longer one is read past and dropped.
+        match (&mut r).take(LONG_LINE as u64).read_until(b'\n', &mut buf) {
             Ok(0) => break,
-            Ok(_) => {}
+            Ok(n) => {
+                if n == LONG_LINE && buf.last() != Some(&b'\n') && !skip_line(&mut r) {
+                    sf.error = true;
+                    break;
+                }
+            }
             Err(_) => {
                 sf.error = true;
                 break;
@@ -2324,22 +2572,67 @@ fn scan_stream(path: &Path, matcher: &Matcher, fast: Option<&regex::Regex>, max_
         }
         sf.total += 1;
         if sf.matches.len() < max_store {
-            sf.matches.push(Match { line: idx, text: clip_line(line, max_line_chars) });
+            sf.matches.push(Match { line: idx, text: clip_match(line, max_line_chars, matcher) });
         }
     }
 }
 
-fn contains_ascii_ci(hay: &str, needle_lower: &str) -> bool {
-    if needle_lower.is_empty() {
-        return true;
+/// The lines around a file's matches, by line number: only those, never the whole file. A file over
+/// `MAX_GREP_FILE_BYTES` is streamed (as `scan_stream` read it) and the read stops at the last wanted line.
+fn context_lines(path: &Path, matches: &[Match], before: usize, after: usize, max_chars: usize) -> HashMap<usize, String> {
+    use std::io::{BufReader, Cursor, Read};
+    let ranges: Vec<(usize, usize)> = matches.iter().map(|m| (m.line.saturating_sub(before).max(1), m.line + after)).collect();
+    let Ok(mut f) = fs::File::open(path) else { return HashMap::new() };
+    if f.metadata().is_ok_and(|m| m.len() > MAX_GREP_FILE_BYTES) {
+        return collect_lines(BufReader::with_capacity(1 << 20, f), &ranges, max_chars);
     }
-    let h = hay.as_bytes();
-    let n = needle_lower.as_bytes();
-    if n.len() > h.len() {
-        return false;
+    let mut bytes = Vec::new();
+    if f.read_to_end(&mut bytes).is_err() {
+        return HashMap::new();
     }
-    h.windows(n.len())
-        .any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b))
+    let text = decode_text(&bytes);
+    collect_lines(Cursor::new(text.as_bytes()), &ranges, max_chars)
+}
+
+/// Lines `(first, last)`, 1-based and both included, read from `r` and kept by number; reading stops after
+/// the last wanted line. `ranges` ascend in both ends. A kept line is cut to one char past `max_chars`
+/// (`push_clipped` then says it was cut), so a huge line is never held whole.
+fn collect_lines(mut r: impl std::io::BufRead, ranges: &[(usize, usize)], max_chars: usize) -> HashMap<usize, String> {
+    let mut out = HashMap::new();
+    let Some(last) = ranges.iter().map(|r| r.1).max() else { return out };
+    let keep = (max_chars + 1) * 4;
+    let (mut ri, mut buf) = (0usize, Vec::new());
+    for n in 1..=last {
+        buf.clear();
+        let mut any = false;
+        loop {
+            let (done, used) = match r.fill_buf() {
+                Ok([]) | Err(_) => break,
+                Ok(b) => {
+                    any = true;
+                    let (upto, done) = b.iter().position(|&c| c == b'\n').map_or((b.len(), false), |i| (i + 1, true));
+                    buf.extend_from_slice(&b[..upto.min(keep.saturating_sub(buf.len()))]);
+                    (done, upto)
+                }
+            };
+            r.consume(used);
+            if done {
+                break;
+            }
+        }
+        if !any {
+            break;
+        }
+        while ri < ranges.len() && ranges[ri].1 < n {
+            ri += 1;
+        }
+        if ri < ranges.len() && ranges[ri].0 <= n {
+            let line = String::from_utf8_lossy(&buf);
+            let line = line.trim_end_matches(['\n', '\r']);
+            out.insert(n, line.chars().take(max_chars + 1).collect());
+        }
+    }
+    out
 }
 
 /// What a search left out on purpose, so "no matches" is never mistaken for "searched everywhere".
@@ -2683,6 +2976,7 @@ where
         root,
         all,
         limit,
+        ignored: if all { IgnoredDirs::default() } else { git_ignored_dirs(root) },
         skipped: Mutex::new(std::collections::BTreeSet::new()),
         state: Mutex::new(WalkState {
             pending: starts.len(),
@@ -2722,6 +3016,8 @@ struct Walk<'a> {
     all: bool,
     /// Deepest directory level whose files are visited (the root is level 0).
     limit: usize,
+    /// Folders below `root` that git ignores (`git_ignored_dirs`); left out like the generated ones.
+    ignored: IgnoredDirs,
     /// Generated directories left out, so a reply can say what it did not search.
     skipped: Mutex<std::collections::BTreeSet<String>>,
     state: Mutex<WalkState>,
@@ -2789,6 +3085,14 @@ impl Walk<'_> {
                         self.skipped.lock().unwrap_or_else(|e| e.into_inner()).insert(name);
                     }
                     continue;
+                }
+                if !self.ignored.is_empty() {
+                    let path = entry.path();
+                    let rel = path.strip_prefix(self.root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                    if self.ignored.contains(&rel) {
+                        self.skipped.lock().unwrap_or_else(|e| e.into_inner()).insert(rel);
+                        continue;
+                    }
                 }
                 if depth >= self.limit {
                     continue;
@@ -2863,6 +3167,153 @@ fn skip_dir(name: &str, all: bool) -> bool {
     )
 }
 
+type IgnoredDirs = std::sync::Arc<std::collections::HashSet<String>>;
+
+static IGNORED_CACHE: Mutex<Vec<(PathBuf, Instant, IgnoredDirs)>> = Mutex::new(Vec::new());
+
+/// Forget what git said about ignored folders: an ignore rule changed, so the next walk asks again.
+pub(crate) fn drop_ignored_cache() {
+    if let Ok(mut cache) = IGNORED_CACHE.lock() {
+        cache.clear();
+    }
+}
+
+/// Whether git ignores the existing folder `rel` below `root`. `None` when git is missing, `root` is no
+/// repository, or git takes over three seconds: the caller then has no answer to rely on.
+pub(crate) fn git_ignores_dir(root: &Path, rel: &str) -> Option<bool> {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new("git");
+    cmd.args(["-c", "core.fsmonitor=false", "-C"])
+        .arg(root)
+        .args(["check-ignore", "-q", "--"])
+        .arg(rel)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = cmd.spawn().ok()?;
+    let end = Instant::now() + std::time::Duration::from_secs(3);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if Instant::now() < end => std::thread::sleep(std::time::Duration::from_millis(2)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    match status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// Folders below `root` that git ignores (`scratch`, `.worktrees`, `a/out`: `/`-separated, relative to
+/// `root`), so a search does not read old copies and build output that `skip_dir` has no name for.
+/// Git is asked once per root per half minute. Empty when git is missing, `root` is no repository,
+/// `root` is itself ignored (it was asked for by name), or git takes over three seconds.
+pub(crate) fn git_ignored_dirs(root: &Path) -> IgnoredDirs {
+    const FRESH: std::time::Duration = std::time::Duration::from_secs(30);
+    if let Ok(cache) = IGNORED_CACHE.lock() {
+        if let Some((_, _, hit)) = cache.iter().find(|(p, at, _)| p == root && at.elapsed() < FRESH) {
+            return hit.clone();
+        }
+    }
+    let found: IgnoredDirs = std::sync::Arc::new(ask_git_for_ignored_dirs(root));
+    if let Ok(mut cache) = IGNORED_CACHE.lock() {
+        cache.retain(|(p, at, _)| p != root && at.elapsed() < FRESH);
+        if cache.len() >= 8 {
+            cache.remove(0);
+        }
+        cache.push((root.to_path_buf(), Instant::now(), found.clone()));
+    }
+    found
+}
+
+fn ask_git_for_ignored_dirs(root: &Path) -> std::collections::HashSet<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let none = std::collections::HashSet::new();
+    let mut cmd = Command::new("git");
+    // `core.fsmonitor` is a command the searched repo names in its own config: not one to run for a search.
+    cmd.args(["-c", "core.fsmonitor=false", "-C"])
+        .arg(root)
+        .args(["ls-files", "-z", "-o", "-i", "--exclude-standard", "--directory"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let Ok(mut child) = cmd.spawn() else {
+        return none;
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        return none;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        let _ = tx.send(bytes);
+    });
+    let Ok(bytes) = rx.recv_timeout(std::time::Duration::from_secs(3)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return none;
+    };
+    if !child.wait().is_ok_and(|s| s.success()) {
+        return none;
+    }
+    let mut dirs = std::collections::HashSet::new();
+    for entry in bytes.split(|b| *b == 0) {
+        let entry = String::from_utf8_lossy(entry);
+        // Only a folder git ignores whole is listed with a trailing slash; `./` is `root` itself.
+        match entry.strip_suffix('/') {
+            Some(".") => return none,
+            Some(dir) if !dir.is_empty() => {
+                dirs.insert(dir.to_string());
+            }
+            _ => {}
+        }
+    }
+    dirs
+}
+
+/// Whether the folder part of a pattern lies in or under a folder git ignores: it is asked for by name.
+fn names_ignored_dir(root: &Path, pattern: &str) -> bool {
+    let dir = literal_dir(pattern);
+    if dir.is_empty() {
+        return false;
+    }
+    let ignored = git_ignored_dirs(root);
+    if ignored.is_empty() {
+        return false;
+    }
+    let mut prefix = String::new();
+    for seg in dir.split('/') {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(seg);
+        if ignored.contains(&prefix) {
+            return true;
+        }
+    }
+    false
+}
+
 fn fs_threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {
@@ -2880,6 +3331,31 @@ fn fs_threads() -> usize {
 }
 
 // --------------------------------------------------------------------- glob
+
+/// A glob is matched against paths relative to the searched folder: `./src/**` and `<folder>/src/**`
+/// mean `src/**`, and would otherwise match nothing.
+fn relative_pattern(pattern: &str, base: &Path) -> String {
+    let mut p = pattern.replace('\\', "/");
+    while let Some(rest) = p.strip_prefix("./") {
+        p = rest.to_string();
+    }
+    let b = base.to_string_lossy().replace('\\', "/");
+    let b = b.strip_prefix("//?/").unwrap_or(&b).trim_end_matches('/');
+    if p.len() > b.len() && p.is_char_boundary(b.len()) && p[..b.len()].eq_ignore_ascii_case(b) && p.as_bytes()[b.len()] == b'/' {
+        return p[b.len() + 1..].to_string();
+    }
+    p
+}
+
+/// A pattern that is still absolute after `relative_pattern` points outside the searched folder and can never match.
+fn outside_note(patterns: &[String], root: &Path) -> String {
+    let absolute = |p: &str| p.starts_with('/') || matches!(p.as_bytes(), [d, b':', b'/', ..] if d.is_ascii_alphabetic());
+    if patterns.iter().any(|p| absolute(p)) {
+        format!("[qx] an absolute pattern lies outside the searched folder {}; give that folder as `path` and keep the pattern relative.\n", root.display())
+    } else {
+        String::new()
+    }
+}
 
 fn expand_braces(pattern: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -3132,7 +3608,46 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_cut_at_the_output_cap_names_the_ops_it_did_not_run_first() {
+        let dir = tmp("batch-cap");
+        fs::write(dir.join("big.txt"), ("x".repeat(60) + "\n").repeat(800)).unwrap();
+        let mut ops = vec![json!({"op":"read","path":"big.txt"})];
+        for i in 0..12 {
+            fs::write(dir.join(format!("e{i}.txt")), "a\n").unwrap();
+            ops.push(json!({"op":"edit","path":format!("e{i}.txt"),"old_string":"a","new_string":"b"}));
+        }
+        let r = call(&json!({"cwd": dir.to_string_lossy(), "ops": ops}));
+        assert!(r.text.starts_with("[qx] ops 2-13 of 13 not run (batch output cap)"), "{}", &r.text[..200]);
+        assert_eq!(fs::read_to_string(dir.join("e0.txt")).unwrap(), "a\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editing_a_read_only_file_says_so_at_once() {
+        let dir = tmp("readonly");
+        let f = dir.join("ro.txt");
+        fs::write(&f, "a\n").unwrap();
+        let mut p = fs::metadata(&f).unwrap().permissions();
+        p.set_readonly(true);
+        fs::set_permissions(&f, p.clone()).unwrap();
+        let t = std::time::Instant::now();
+        let r = invoke(&dir, "edit", json!({"path":"ro.txt","old_string":"a","new_string":"b"}));
+        assert!(r.is_error && r.text.contains("read-only"), "{}", r.text);
+        // ~10 ms alone, over 300 ms under full-suite load; the old retry loop took 600+ ms.
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "{:?}", t.elapsed());
+        #[allow(clippy::permissions_set_readonly_false)]
+        p.set_readonly(false);
+        fs::set_permissions(&f, p).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn read_numbers_lines_and_observes_the_file() {
+        // Checked in the framed shape: pin a client that gets the frame (the process-wide client is
+        // changed by other tests while this one runs).
+        crate::client::scoped(crate::client::Client::Generic, read_numbers_lines_body);
+    }
+    fn read_numbers_lines_body() {
         let dir = tmp("read");
         fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
         let r = invoke(&dir, "read", json!({"path":"a.txt"}));
@@ -3146,6 +3661,113 @@ mod tests {
         assert!(!r.is_error, "{}", r.text);
         assert!(r.text.contains("Updated file (+1 -3 lines)"), "{}", r.text);
         assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "changed\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_and_codex_read_replies_drop_the_frame_but_keep_every_signal() {
+        use crate::client::{scoped, Client};
+        let dir = tmp("lean-read");
+        fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        fs::write(dir.join("empty.txt"), "").unwrap();
+        for c in [Client::ClaudeCode, Client::Codex] {
+            let t = |args: Value| scoped(c, || invoke(&dir, "read", args)).text;
+            // Whole file from line 1: the lines and nothing else.
+            assert_eq!(t(json!({"path": "a.txt"})), "1: one\n2: two\n3: three");
+            // A window says where it is and how to go on; the end of a later window says it is the end.
+            assert_eq!(t(json!({"path": "a.txt", "limit": 1})), "1: one\n[lines 1-1 of 3; offset=2 for more]");
+            assert_eq!(t(json!({"path": "a.txt", "offset": 2})), "2: two\n3: three\n[end, 3 lines]");
+            assert_eq!(t(json!({"path": "a.txt", "offset": 9})), "(offset 9 is past the end: the file has 3 lines)");
+            assert_eq!(t(json!({"path": "empty.txt"})), "(empty file)");
+            assert_eq!(
+                scoped(c, || invoke(&dir, "write", json!({"path": "w.txt", "content": "x\n"}))).text,
+                "Created file (+1 -0 lines)"
+            );
+            fs::remove_file(dir.join("w.txt")).unwrap();
+            // A batch keeps one header per item and no tags inside it.
+            let b = scoped(c, || invoke(&dir, "read", json!({"paths": ["a.txt", "empty.txt"]}))).text;
+            assert_eq!(b, "== 1/2 read a.txt ==\n1: one\n2: two\n3: three\n\n== 2/2 read empty.txt ==\n(empty file)");
+        }
+        // Everyone else keeps the tag frame.
+        let r = scoped(Client::OpenCode, || invoke(&dir, "read", json!({"path": "a.txt"})));
+        assert!(r.text.starts_with("<path>a.txt</path>\n<type>file</type>\n<content>\n1: one"), "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writes_may_go_to_the_claude_scratch_dir_and_nowhere_else_outside_cwd() {
+        let dir = tmp("scratch-cwd");
+        let scratch = std::env::temp_dir().join("claude").join(format!("qx-scratch-{}", std::process::id()));
+        fs::create_dir_all(&scratch).unwrap();
+        let target = scratch.join("n.txt");
+        let r = invoke(&dir, "write", json!({"path": target.to_string_lossy(), "content": "hi"}));
+        assert!(!r.is_error, "{}", r.text);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "hi");
+        let other = std::env::temp_dir().join(format!("qx-not-scratch-{}.txt", std::process::id()));
+        let r = invoke(&dir, "write", json!({"path": other.to_string_lossy(), "content": "no"}));
+        assert!(r.is_error && r.structured["code"] == "FS_OUTSIDE_WORKSPACE", "{}", r.text);
+        let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_honours_context_arguments_and_caps_them() {
+        let dir = tmp("grep-ctx");
+        let body: String = (1..=20).map(|i| if i == 5 || i == 7 || i == 18 { format!("hit {i}\n") } else { format!("l{i}\n") }).collect();
+        fs::write(dir.join("a.txt"), body).unwrap();
+        let g = |extra: Value| {
+            let mut a = json!({"pattern": "hit"});
+            a.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            invoke(&dir, "grep", a).text
+        };
+        // Overlapping context merges; a gap gets `--`; matches keep `:`, context takes `-`.
+        let t = g(json!({"-C": 1}));
+        assert!(t.contains("4- l4\n5: hit 5\n6- l6\n7: hit 7\n8- l8\n--\n17- l17\n18: hit 18\n19- l19"), "{t}");
+        // After only, and `context` spelled out; never more than the cap.
+        let t = g(json!({"-A": 1}));
+        assert!(t.contains("5: hit 5\n6- l6\n7: hit 7\n8- l8\n--\n18: hit 18\n19- l19") && !t.contains("4- l4"), "{t}");
+        assert_eq!(g(json!({"context": 99})), g(json!({"context": MAX_GREP_CONTEXT})));
+        assert!(g(json!({"context": 99})).contains("12- l12\n13- l13"));
+        // No context asked: exactly the old shape.
+        assert!(!g(json!({})).contains("- l"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_reply_goes_past_the_cap_claude_code_rejects() {
+        let dir = tmp("reply-cap");
+        let line = format!("needle {}\n", "x".repeat(1_500));
+        fs::write(dir.join("a.txt"), line.repeat(200)).unwrap();
+        let r = invoke(&dir, "grep", json!({"pattern": "needle"}));
+        assert!(r.text.len() <= CLIENT_REPLY_BYTES + 200, "{} bytes", r.text.len());
+        assert!(r.text.contains("[qx] reply cut at"), "{}", &r.text[r.text.len().saturating_sub(200)..]);
+        assert_eq!(r.structured["truncated"], true);
+        // A read stops at its own window, under the cap, with the way to go on.
+        fs::write(dir.join("b.txt"), line.repeat(200)).unwrap();
+        let r = scoped_lean(|| invoke(&dir, "read", json!({"path": "b.txt"})));
+        assert!(r.text.len() <= CLIENT_REPLY_BYTES && r.text.contains("offset="), "{} bytes", r.text.len());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn scoped_lean<T>(f: impl FnOnce() -> T) -> T {
+        crate::client::scoped(crate::client::Client::ClaudeCode, f)
+    }
+
+    #[test]
+    fn a_missing_op_is_inferred_only_when_the_arguments_mean_one_thing() {
+        let dir = tmp("op-infer");
+        fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        let cwd = dir.to_string_lossy();
+        let r = call(&json!({"cwd": cwd, "paths": ["a.txt"]}));
+        assert!(!r.is_error && r.text.contains("1: one"), "{}", r.text);
+        let r = call(&json!({"cwd": cwd, "path": "a.txt", "edits": [{"old_string": "two", "new_string": "2"}]}));
+        assert!(!r.is_error, "{}", r.text);
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n2\n");
+        let r = call(&json!({"cwd": cwd, "ops": [{"path": "a.txt"}, {"path": "b.txt", "content": "x"}]}));
+        assert!(r.text.contains("1: one") && fs::read_to_string(dir.join("b.txt")).unwrap() == "x", "{}", r.text);
+        // A pattern is glob or grep: still an error.
+        let r = call(&json!({"cwd": cwd, "pattern": "*.txt"}));
+        assert!(r.is_error && r.text.contains("op must be one of"), "{}", r.text);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3343,7 +3965,7 @@ mod tests {
     }
 
     #[test]
-    fn write_refuses_a_directory_name_and_a_foreign_share_at_once() {
+    fn a_directory_name_and_a_foreign_share_are_refused_at_once() {
         let dir = tmp("write-dirname");
         for raw in ["newdir/", "newdir\\", "a/b/"] {
             let r = invoke(&dir, "write", json!({"path":raw,"content":"x"}));
@@ -3355,6 +3977,11 @@ mod tests {
             // 192.0.2.0/24 is reserved for documentation: probing it would wait for a timeout.
             let t = Instant::now();
             let r = invoke(&dir, "write", json!({"path":"\\\\192.0.2.1\\share\\x.txt","content":"x"}));
+            assert!(r.is_error && r.structured["code"] == "FS_OUTSIDE_WORKSPACE", "{}", r.text);
+            assert!(t.elapsed().as_secs() < 2, "{:?}", t.elapsed());
+            // `edit` resolves the path another way and must not probe the share either.
+            let t = Instant::now();
+            let r = invoke(&dir, "edit", json!({"path":"\\\\192.0.2.1\\share\\x.txt","old_string":"a","new_string":"b"}));
             assert!(r.is_error && r.structured["code"] == "FS_OUTSIDE_WORKSPACE", "{}", r.text);
             assert!(t.elapsed().as_secs() < 2, "{:?}", t.elapsed());
             // A workspace on a share owns the paths under it, however they are spelled.
@@ -3396,6 +4023,138 @@ mod tests {
         }
         let r = invoke(&dir, "grep", json!({"pattern":"hello"}));
         assert!(r.text.contains("Found 1 match"), "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_ignore_case_folds_non_ascii_letters_like_a_regex_does() {
+        let dir = tmp("grep-ci-unicode");
+        fs::write(dir.join("a.txt"), "caf\u{e9}\nCAF\u{c9}\nplain\n").unwrap();
+        for args in [
+            json!({"pattern":"caf\u{e9}","ignore_case":true,"literal":true}),
+            json!({"pattern":"caf\u{e9}","ignore_case":true}),
+        ] {
+            let r = invoke(&dir, "grep", args.clone());
+            assert!(r.text.contains("Found 2 matches"), "{args}: {}", r.text);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_and_edit_refuse_a_relative_path_without_cwd() {
+        for op in ["write", "edit"] {
+            let r = call(&json!({"op": op, "path": "qx-no-cwd-probe.txt", "content": "x", "old_string": "a", "new_string": "b"}));
+            assert!(r.is_error && r.text.contains("cwd"), "{op}: {}", r.text);
+            assert!(!Path::new("qx-no-cwd-probe.txt").exists());
+        }
+    }
+
+    #[test]
+    fn grep_reports_no_phantom_empty_line_at_the_end_of_a_file() {
+        let dir = tmp("grep-phantom");
+        fs::write(dir.join("two.txt"), "a\nb\n").unwrap();
+        fs::write(dir.join("gap.txt"), "a\n\nb\n").unwrap();
+        // Fast path (anchors only) and the per-line path (`\r` keeps it off the fast path).
+        for pat in ["^$", "^$|\\r"] {
+            let r = invoke(&dir, "grep", json!({"pattern": pat}));
+            assert!(r.text.contains("Found 1 match in 1 file") && r.text.contains("2: "), "{pat}: {}", r.text);
+            assert!(!r.text.contains("two.txt"), "{pat}: {}", r.text);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_removes_temp_files_a_killed_write_left_behind() {
+        let dir = tmp("stale-temp");
+        let (old, fresh) = (dir.join(".qx-tmp-1-0"), dir.join(".qx-tmp-1-1"));
+        fs::write(&old, "x").unwrap();
+        fs::write(&fresh, "x").unwrap();
+        let f = OpenOptions::new().write(true).open(&old).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600)).unwrap();
+        drop(f);
+        let r = invoke(&dir, "write", json!({"path": "a.txt", "content": "hi"}));
+        assert!(!r.is_error, "{}", r.text);
+        assert!(!old.exists(), "a temp older than an hour is removed");
+        assert!(fresh.exists(), "a recent one may belong to a write in flight");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_shows_the_part_of_a_long_line_that_matched() {
+        let dir = tmp("grep-window");
+        let line = format!("{}NEEDLE{}\n", "x".repeat(3000), "y".repeat(3000));
+        fs::write(dir.join("min.js"), line).unwrap();
+        for ci in [false, true] {
+            let r = invoke(&dir, "grep", json!({"pattern": "needle", "ignore_case": true, "literal": ci}));
+            assert!(r.text.contains("NEEDLE") && r.text.contains("truncated"), "{}", r.text);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn streamed_grep_does_not_hold_a_huge_single_line() {
+        let dir = tmp("grep-longline");
+        let path = dir.join("blob.txt");
+        // One 20 MB line (more than the 16 MB held), then two normal lines.
+        let mut text = format!("NEEDLE first{}\n", "z".repeat(20 << 20));
+        text.push_str("plain\nNEEDLE last\n");
+        fs::write(&path, text).unwrap();
+        let matcher = regex::Regex::new("NEEDLE").unwrap();
+        let fast = fast_regex("NEEDLE", true, false).unwrap();
+        let mut sf = ScanFile { path: path.clone(), matches: Vec::new(), total: 0, binary: false, large: false, error: false };
+        scan_stream(&path, &matcher, Some(&fast), 200, 10, &mut sf);
+        let lines: Vec<usize> = sf.matches.iter().map(|m| m.line).collect();
+        assert_eq!(lines, [1, 3], "{:?}", sf.matches.iter().map(|m| (m.line, m.text.len())).collect::<Vec<_>>());
+        assert!(sf.matches[0].text.len() < 400);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_line_by_line_path_does_not_hold_a_huge_single_line_either() {
+        let dir = tmp("grep-longline-slow");
+        let path = dir.join("blob.txt");
+        let mut text = format!("NEEDLE first{}\n", "z".repeat(20 << 20));
+        text.push_str("plain\nNEEDLE last\n");
+        fs::write(&path, text).unwrap();
+        let matcher = regex::Regex::new("NEEDLE").unwrap();
+        let mut sf = ScanFile { path: path.clone(), matches: Vec::new(), total: 0, binary: false, large: false, error: false };
+        scan_stream(&path, &matcher, None, 200, 10, &mut sf);
+        let lines: Vec<usize> = sf.matches.iter().map(|m| m.line).collect();
+        assert_eq!(lines, [1, 3], "{:?}", sf.matches.iter().map(|m| (m.line, m.text.len())).collect::<Vec<_>>());
+        assert!(!sf.error && sf.matches[0].text.len() < 400);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_absolute_pattern_outside_the_folder_says_why_it_found_nothing() {
+        let dir = tmp("glob-outside");
+        let other = tmp("glob-outside-other");
+        fs::write(other.join("x.rs"), "fn x() {}\n").unwrap();
+        let abs = format!("{}/*.rs", other.display().to_string().replace('\\', "/"));
+        let r = invoke(&dir, "glob", json!({"pattern": abs}));
+        assert!(r.text.contains("No files found") && r.text.contains("absolute pattern"), "{}", r.text);
+        let r = invoke(&dir, "grep", json!({"pattern": "fn", "include": abs}));
+        assert!(r.text.contains("No matches found") && r.text.contains("absolute pattern"), "{}", r.text);
+        let r = invoke(&dir, "glob", json!({"pattern": "*.nothing"}));
+        assert!(r.text.contains("No files found") && !r.text.contains("absolute"), "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn glob_and_include_accept_a_dot_slash_or_absolute_prefix() {
+        let dir = tmp("glob-prefix");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src").join("a.rs"), "fn main() {}\n").unwrap();
+        let r = invoke(&dir, "glob", json!({"pattern": "./src/*.rs"}));
+        assert!(r.text.contains("a.rs"), "{}", r.text);
+        let r = invoke(&dir, "grep", json!({"pattern": "main", "include": "./src/*.rs"}));
+        assert!(r.text.contains("Found 1 match"), "{}", r.text);
+        let base = Path::new("C:/proj");
+        assert_eq!(relative_pattern("C:\\proj\\src\\**\\*.rs", base), "src/**/*.rs");
+        assert_eq!(relative_pattern("c:/proj/src/*.rs", base), "src/*.rs");
+        assert_eq!(relative_pattern("C:/projx/src/*.rs", base), "C:/projx/src/*.rs");
+        assert_eq!(relative_pattern("././a/*.rs", base), "a/*.rs");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3483,6 +4242,75 @@ mod tests {
         assert!(r.text.contains("node_modules/x.rs"), "{}", r.text);
         let r = invoke(&dir, "glob", json!({"pattern":"**/*.rs", "all": true}));
         assert!(r.text.contains("node_modules/x.rs"), "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn git_init(dir: &Path) -> bool {
+        std::process::Command::new("git").arg("init").arg("-q").arg(dir).output().is_ok_and(|o| o.status.success())
+    }
+
+    #[test]
+    fn search_skips_folders_git_ignores_and_says_so() {
+        let dir = tmp("git-ignored");
+        if !git_init(&dir) {
+            let _ = fs::remove_dir_all(&dir);
+            return; // no git on this machine: nothing to check
+        }
+        fs::create_dir_all(dir.join("out/deep")).unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join(".gitignore"), "out/\n").unwrap();
+        fs::write(dir.join("out/deep/x.rs"), "needle\n").unwrap();
+        fs::write(dir.join("src/a.rs"), "needle\n").unwrap();
+        assert!(git_ignored_dirs(&dir).contains("out"), "{:?}", git_ignored_dirs(&dir));
+
+        let r = invoke(&dir, "grep", json!({"pattern":"needle"}));
+        assert!(r.text.contains("src/a.rs") && !r.text.contains("out/deep/x.rs"), "{}", r.text);
+        assert!(r.text.contains("not searched:") && r.text.contains("out"), "{}", r.text);
+        let r = invoke(&dir, "glob", json!({"pattern":"**/*.rs"}));
+        assert!(r.text.contains("src/a.rs") && !r.text.contains("out/deep/x.rs"), "{}", r.text);
+        // Asking for everything, or naming the folder, still looks inside it.
+        let r = invoke(&dir, "grep", json!({"pattern":"needle","all":true}));
+        assert!(r.text.contains("out/deep/x.rs"), "{}", r.text);
+        let r = invoke(&dir, "grep", json!({"pattern":"needle","include":"out/**/*.rs"}));
+        assert!(r.text.contains("out/deep/x.rs"), "{}", r.text);
+        let r = invoke(&dir, "glob", json!({"pattern":"out/**/*.rs"}));
+        assert!(r.text.contains("out/deep/x.rs"), "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_option_no_operation_reads_is_named_not_silently_dropped() {
+        let dir = tmp("unknown-keys");
+        fs::write(dir.join("a.txt"), "Needle\n").unwrap();
+        let r = invoke(&dir, "grep", json!({"pattern":"needle","ignorecase":true,"-A":1}));
+        assert!(r.text.contains("[qx] ignored (not fs options): ignorecase"), "{}", r.text);
+        assert!(!r.text.contains("-A"), "a real option was reported: {}", r.text);
+        let r = invoke(&dir, "grep", json!({"pattern":"needle","ignore_case":true}));
+        assert!(!r.text.contains("ignored (not fs options)"), "{}", r.text);
+        let r = invoke(&dir, "stat", json!({"ops":[{"op":"stat","path":"a.txt","fast":1}]}));
+        assert!(r.text.contains("ignored (not fs options): fast"), "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_skip_note_counts_only_what_was_skipped() {
+        let dir = tmp("skip-note");
+        fs::write(dir.join("a.txt"), "needle\n").unwrap();
+        fs::write(dir.join("b.bin"), b"needle\0\0\0").unwrap();
+        let r = invoke(&dir, "grep", json!({"pattern":"needle"}));
+        assert!(r.text.contains("[qx] skipped 1 binary file(s)."), "{}", r.text);
+        assert!(!r.text.contains("0 large") && !r.text.contains("0 unreadable"), "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_outside_a_git_repo_skips_nothing_extra() {
+        let dir = tmp("no-git");
+        fs::create_dir_all(dir.join("out")).unwrap();
+        fs::write(dir.join(".gitignore"), "out/\n").unwrap();
+        fs::write(dir.join("out/x.rs"), "needle\n").unwrap();
+        let r = invoke(&dir, "grep", json!({"pattern":"needle"}));
+        assert!(r.text.contains("out/x.rs"), "{}", r.text);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3713,6 +4541,28 @@ mod tests {
     }
     #[cfg(windows)]
     #[test]
+    fn a_folder_inside_an_indexed_root_reuses_that_index() {
+        let dir = tmp("index-sub");
+        fs::create_dir_all(dir.join("src/deep")).unwrap();
+        fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        fs::write(dir.join("src/deep/a.rs"), "fn a() {}\n").unwrap();
+        fs::write(dir.join("node_modules/pkg/x.rs"), "fn x() {}\n").unwrap();
+        crate::index::ensure(&dir);
+        let canon = fs::canonicalize(&dir).unwrap();
+        // Naming a sub-folder builds nothing new: its queries are answered from the root's index.
+        crate::index::ensure(&canon.join("src"));
+        let (_, prefix) = crate::index::snapshot(&canon.join("src")).expect("served by the root index");
+        assert_eq!(prefix, "src");
+        // A folder the root walk skipped is not in that index: it gets its own.
+        crate::index::ensure(&canon.join("node_modules"));
+        let (snap, prefix) = crate::index::snapshot(&canon.join("node_modules")).expect("own index");
+        assert_eq!(prefix, "");
+        assert!(snap.files.iter().any(|e| e.rel.ends_with("x.rs")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn the_workspace_index_follows_every_change_at_once() {
         let dir = tmp("index");
         fs::create_dir_all(dir.join("src/deep")).unwrap();
@@ -3810,13 +4660,148 @@ mod tests {
                     want.extend(p);
                 }
                 want.sort();
-                let (snap, _) = crate::index::snapshot(&canon).expect("index stays valid");
+                // None is a correct answer (the walk serves): parallel tests can evict this root
+                // (MAX_ROOTS) or a watcher overflow can mark it broken. Rebuild and compare that.
+                let (snap, _) = crate::index::snapshot(&canon)
+                    .or_else(|| {
+                        crate::index::ensure(&canon);
+                        crate::index::snapshot(&canon)
+                    })
+                    .expect("index answers after a rebuild");
                 let got: Vec<String> = snap.files.iter().map(|e| e.rel.clone()).collect();
                 assert_eq!(got, want, "after step {step}");
             }
         }
         let _ = fs::remove_dir_all(&dir);
     }
+    #[cfg(windows)]
+    #[test]
+    fn a_file_named_like_a_generated_folder_is_indexed_and_its_deletion_follows() {
+        let dir = tmp("index-vendor-file");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/a.rs"), "").unwrap();
+        crate::index::ensure(&dir);
+        let canon = fs::canonicalize(&dir).unwrap();
+        let rels = || -> Vec<String> {
+            let (snap, _) = crate::index::snapshot(&canon).expect("index stays valid");
+            snap.files.iter().map(|e| e.rel.clone()).collect()
+        };
+        fs::write(dir.join("vendor"), "x").unwrap();
+        fs::write(dir.join("src/dist"), "x").unwrap();
+        assert_eq!(rels(), ["src/a.rs", "src/dist", "vendor"]);
+        fs::remove_file(dir.join("vendor")).unwrap();
+        assert_eq!(rels(), ["src/a.rs", "src/dist"]);
+        // A folder of that name is still left out, with what it holds.
+        fs::create_dir_all(dir.join("vendor")).unwrap();
+        fs::write(dir.join("vendor/x.rs"), "").unwrap();
+        assert_eq!(rels(), ["src/a.rs", "src/dist"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deleting_by_a_short_8_3_name_does_not_leave_the_file_in_the_index() {
+        let dir = tmp("index-short");
+        fs::write(dir.join("a.rs"), "").unwrap();
+        fs::write(dir.join("longfilename.txt"), "").unwrap();
+        let short = dir.join("LONGFI~1.TXT");
+        if !short.exists() {
+            let _ = fs::remove_dir_all(&dir);
+            return; // 8.3 names are off on this volume: nothing to check
+        }
+        crate::index::ensure(&dir);
+        let canon = fs::canonicalize(&dir).unwrap();
+        assert!(crate::index::snapshot(&canon).is_some(), "an index was built");
+        fs::remove_file(&short).unwrap();
+        // The kernel reports the short name, which names no entry: the index is dropped, not left wrong.
+        let r = invoke(&dir, "glob", json!({"pattern": "**/*.txt"}));
+        assert!(!r.text.contains("longfilename"), "{}", r.text);
+        crate::index::ensure(&dir);
+        let (snap, _) = crate::index::snapshot(&canon).expect("rebuilt");
+        let rels: Vec<&str> = snap.files.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(rels, ["a.rs"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_index_leaves_out_what_git_ignores_also_a_folder_made_or_ignored_after_it_started() {
+        let dir = tmp("index-gitignore");
+        if !git_init(&dir) {
+            let _ = fs::remove_dir_all(&dir);
+            return; // no git on this machine: nothing to check
+        }
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join(".gitignore"), "gen/\n").unwrap();
+        fs::write(dir.join("src/a.rs"), "needle\n").unwrap();
+        crate::index::ensure(&dir);
+        let canon = fs::canonicalize(&dir).unwrap();
+        assert!(crate::index::snapshot(&canon).is_some(), "an index was built");
+        let grep = || invoke(&dir, "grep", json!({"pattern": "needle"})).text;
+        // A folder git ignores, made after the index started.
+        fs::create_dir_all(dir.join("gen/deep")).unwrap();
+        fs::write(dir.join("gen/deep/x.rs"), "needle\n").unwrap();
+        let r = grep();
+        assert!(r.contains("src/a.rs") && !r.contains("gen/deep/x.rs"), "{r}");
+        // A folder that is searched until the ignore file is edited.
+        fs::create_dir_all(dir.join("late")).unwrap();
+        fs::write(dir.join("late/y.rs"), "needle\n").unwrap();
+        assert!(grep().contains("late/y.rs"));
+        fs::write(dir.join(".gitignore"), "gen/\nlate/\n").unwrap();
+        let r = grep();
+        assert!(r.contains("src/a.rs") && !r.contains("late/y.rs"), "{r}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The indexed `glob` and `grep` answer what a walk of the disk finds, after the changes the index
+    /// has to read from names alone: a file called `vendor`, a short 8.3 name, a folder git ignores.
+    #[cfg(windows)]
+    #[test]
+    fn indexed_glob_and_grep_equal_a_walk_after_changes_to_names_and_ignore_rules() {
+        let dir = tmp("index-vs-walk");
+        if !git_init(&dir) {
+            let _ = fs::remove_dir_all(&dir);
+            return; // no git on this machine: nothing to check
+        }
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join(".gitignore"), "gen/\n").unwrap();
+        fs::write(dir.join("src/a.rs"), "needle\n").unwrap();
+        crate::index::ensure(&dir);
+        let canon = fs::canonicalize(&dir).unwrap();
+        assert!(crate::index::snapshot(&canon).is_some(), "an index was built");
+        let all = [
+            "src/a.rs", "vendor", "src/dist", "gen/x.rs", "late/y.rs", "longfilename.txt", "lib/z.rs",
+        ];
+        fs::write(dir.join("vendor"), "needle\n").unwrap();
+        fs::write(dir.join("src/dist"), "needle\n").unwrap();
+        fs::create_dir_all(dir.join("gen")).unwrap();
+        fs::write(dir.join("gen/x.rs"), "needle\n").unwrap();
+        fs::create_dir_all(dir.join("late")).unwrap();
+        fs::write(dir.join("late/y.rs"), "needle\n").unwrap();
+        fs::write(dir.join("longfilename.txt"), "needle\n").unwrap();
+        fs::create_dir_all(dir.join("lib")).unwrap();
+        fs::write(dir.join("lib/z.rs"), "needle\n").unwrap();
+        fs::write(dir.join(".gitignore"), "gen/\nlate/\n").unwrap();
+        fs::remove_file(dir.join("src/a.rs")).unwrap();
+        let short = dir.join("LONGFI~1.TXT");
+        fs::remove_file(if short.exists() { short } else { dir.join("longfilename.txt") }).unwrap();
+
+        let globbed = invoke(&dir, "glob", json!({"pattern": "**/*"})).text;
+        let mut got: Vec<&str> = globbed.lines().filter(|l| all.contains(l)).collect();
+        got.sort();
+        let (parts, _) = walk_live(&canon, false, Vec::<String>::new, |v, p, _| {
+            v.push(p.strip_prefix(&canon).unwrap().to_string_lossy().replace('\\', "/"));
+        });
+        let mut want: Vec<String> = parts.into_iter().flatten().filter(|r| !r.starts_with('.')).collect();
+        want.sort();
+        assert_eq!(got, want, "glob: {globbed}");
+        let grepped = invoke(&dir, "grep", json!({"pattern": "needle"})).text;
+        for f in all {
+            assert_eq!(grepped.contains(&format!("{f}:")) || grepped.contains(&format!("{f}\n")), want.iter().any(|w| w == f), "{f} in grep: {grepped}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore = "micro-benchmark: cargo test --release bench_fs -- --ignored --nocapture"]
     fn bench_fs() {
@@ -3891,20 +4876,25 @@ mod tests {
         assert_eq!(seen.into_inner().unwrap(), ["src/a.rs"]);
         let _ = fs::remove_dir_all(&dir);
     }
-    /// The smallest line diff by brute force: the lines outside a longest common subsequence.
-    fn lcs_delta(old: &[u8], new: &[u8]) -> (usize, usize) {
-        let lines = |t: &[u8]| std::str::from_utf8(t).unwrap().split_inclusive('\n').map(String::from).collect::<Vec<_>>();
-        let (o, n) = (lines(old), lines(new));
-        let mut t = vec![vec![0usize; n.len() + 1]; o.len() + 1];
-        for i in 0..o.len() {
-            for j in 0..n.len() {
-                t[i + 1][j + 1] = if o[i] == n[j] { t[i][j] + 1 } else { t[i][j + 1].max(t[i + 1][j]) };
-            }
-        }
-        (n.len() - t[o.len()][n.len()], o.len() - t[o.len()][n.len()])
-    }
     #[test]
-    fn line_delta_matches_a_brute_force_diff() {
+    fn two_far_apart_edits_report_the_lines_they_changed_not_everything_between() {
+        let dir = tmp("edit-far");
+        let body: String = (1..=1000).map(|i| format!("line {i}\n")).collect();
+        fs::write(dir.join("f.txt"), &body).unwrap();
+        let r = invoke(
+            &dir,
+            "edit",
+            json!({"path":"f.txt","edits":[
+                {"old_string":"line 1\n","new_string":"first\n"},
+                {"old_string":"line 1000\n","new_string":"last\n"}]}),
+        );
+        assert!(!r.is_error, "{}", r.text);
+        assert_eq!((r.structured["added"].as_u64(), r.structured["removed"].as_u64()), (Some(2), Some(2)), "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn line_delta_counts_the_lines_between_the_shared_ends() {
         // A line keeps its terminator: a final newline or a line ending alone makes a line differ.
         assert_eq!(line_delta(b"a\nb", b"a\nb\n"), (1, 1));
         assert_eq!(line_delta(b"a\nb\n", b"a\nb"), (1, 1));
@@ -3915,50 +4905,39 @@ mod tests {
         assert_eq!(line_delta(b"a\nb\n", b""), (0, 2));
         assert_eq!(line_delta(b"", b""), (0, 0));
         assert_eq!(line_delta(b"same\n", b"same\n"), (0, 0));
-        // Small strings over a tiny alphabet, half of them near-copies, from a fixed LCG.
-        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
-        let mut rnd = move |n: usize| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (seed >> 33) as usize % n
-        };
-        let alphabet = *b"ab\n\r";
-        for round in 0..2000 {
-            let old: Vec<u8> = (0..rnd(15)).map(|_| alphabet[rnd(4)]).collect();
-            let new: Vec<u8> = if round % 2 == 0 {
-                (0..rnd(15)).map(|_| alphabet[rnd(4)]).collect()
-            } else {
-                let mut v = old.clone();
-                for _ in 0..1 + rnd(3) {
-                    let at = rnd(v.len() + 1);
-                    match rnd(3) {
-                        0 if at < v.len() => {
-                            v.remove(at);
-                        }
-                        1 if at < v.len() => v[at] = alphabet[rnd(4)],
-                        _ => v.insert(at, alphabet[rnd(4)]),
-                    }
-                }
-                v
-            };
-            assert_eq!(line_delta(&old, &new), lcs_delta(&old, &new), "{old:?} -> {new:?}");
-        }
-        // Past the 64-byte steps of the head and tail compare, and a search that has to look (D = 200).
+        // Past the 64-byte steps of the head and tail compare.
         let (head, tail) = ("same line\n".repeat(50), "tail line\n".repeat(50));
         let (old, new) = (format!("{head}x\n{tail}"), format!("{head}y\nz\n{tail}"));
         assert_eq!(line_delta(old.as_bytes(), new.as_bytes()), (2, 1));
-        let lines = |f: &dyn Fn(usize) -> String, n: usize| (0..n).map(|i| f(i)).collect::<String>();
-        let old = lines(&|i| format!("l{i}\n"), 200);
-        let new = lines(&|i| if i % 2 == 1 { format!("m{i}\n") } else { format!("l{i}\n") }, 200);
-        assert_eq!(line_delta(old.as_bytes(), new.as_bytes()), lcs_delta(old.as_bytes(), new.as_bytes()));
-        assert_eq!(line_delta(old.as_bytes(), new.as_bytes()), (100, 100));
-        // Beyond DIFF_CAP the answer is an upper bound (everything between the shared ends), never less.
-        let old = lines(&|i| format!("l{i}\n"), 700);
-        let new = lines(&|i| if i % 2 == 1 { format!("m{i}\n") } else { format!("l{i}\n") }, 700);
-        let (a, r) = line_delta(old.as_bytes(), new.as_bytes());
-        assert!((350..=700).contains(&a) && (350..=700).contains(&r), "{a} {r}");
+        // Changes in two places: the lines between them count as replaced, so these are upper bounds (exact: 2 and 2).
+        assert_eq!(line_delta(b"a\nb\nc\nd\ne\n", b"a\nB\nc\nD\ne\n"), (3, 3));
+    }
+    #[test]
+    fn an_unchanged_write_or_edit_leaves_the_file_alone() {
+        let dir = tmp("unchanged");
+        let path = dir.join("a.txt");
+        assert!(!invoke(&dir, "write", json!({"path": "a.txt", "content": "one\ntwo\n"})).is_error);
+        let mtime = || fs::metadata(&path).unwrap().modified().unwrap();
+        let before = mtime();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let w = invoke(&dir, "write", json!({"path": "a.txt", "content": "one\ntwo\n"}));
+        assert!(!w.is_error && w.text.contains("(no changes)"), "{}", w.text);
+        let e = invoke(&dir, "edit", json!({"path": "a.txt", "edits": [
+            {"old_string": "one", "new_string": "1"},
+            {"old_string": "1", "new_string": "one"},
+        ]}));
+        assert!(!e.is_error && e.text.contains("(no changes)"), "{}", e.text);
+        assert_eq!(mtime(), before);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+        let _ = fs::remove_dir_all(&dir);
     }
     #[test]
     fn write_and_edit_replies_count_the_lines_they_changed() {
+        // The replies are checked in the framed shape, so pin a client that gets the frame: the
+        // process-wide client is changed by other tests while this one runs.
+        crate::client::scoped(crate::client::Client::Generic, write_and_edit_replies_body);
+    }
+    fn write_and_edit_replies_body() {
         let dir = tmp("delta");
         let write = |content: &str| invoke(&dir, "write", json!({"path": "f.txt", "content": content}));
         let reply = |what: &str| format!("<path>f.txt</path>\n<type>file</type>\n<content>\n{what}\n</content>");
@@ -4068,4 +5047,154 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let _ = fs::remove_dir_all(&dir);
-    }}
+    }
+
+    // ---- batch 4 / FS7 ----
+
+    #[test]
+    fn git_ignored_dirs_does_not_run_the_repos_fsmonitor_command() {
+        let dir = tmp("fsmonitor");
+        if !git_init(&dir) {
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+        let marker = dir.join("MARKER.txt");
+        let hook = format!("echo ran > \"{}\"", marker.to_string_lossy().replace('\\', "/"));
+        git(&["config", "core.fsmonitor", &hook]);
+        fs::write(dir.join("b.txt"), "x\n").unwrap();
+        let _ = git_ignored_dirs(&dir);
+        assert!(!marker.exists(), "the searched repo's core.fsmonitor command ran");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_of_one_file_matches_include_against_its_path() {
+        let dir = tmp("grep-file-include");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/one.rs"), "needle\n").unwrap();
+        for inc in ["**/*.rs", "src/*.rs", "*.rs", "src/one.rs"] {
+            let r = invoke(&dir, "grep", json!({"pattern":"needle","path":"src/one.rs","include":inc}));
+            assert!(r.text.contains("Found 1 match"), "include {inc}: {}", r.text);
+        }
+        let r = invoke(&dir, "grep", json!({"pattern":"needle","path":"src/one.rs","include":"**/*.txt"}));
+        assert!(r.text.contains("No matches"), "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_context_given_as_a_string_is_honoured() {
+        let dir = tmp("grep-ctx-string");
+        fs::write(dir.join("a.txt"), "one\nneedle\nthree\n").unwrap();
+        let num = invoke(&dir, "grep", json!({"pattern":"needle","context":1}));
+        let txt = invoke(&dir, "grep", json!({"pattern":"needle","context":"1"}));
+        assert!(num.text.contains("1- one") && num.text.contains("3- three"), "{}", num.text);
+        assert_eq!(num.text, txt.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_brackets_in_a_folder_name_are_literal_when_nothing_else_matches() {
+        let dir = tmp("glob-brackets");
+        fs::create_dir_all(dir.join("app/[id]")).unwrap();
+        fs::write(dir.join("app/[id]/page.tsx"), "").unwrap();
+        let r = invoke(&dir, "glob", json!({"pattern":"app/[id]/*.tsx"}));
+        assert!(r.text.contains("app/[id]/page.tsx"), "{}", r.text);
+        assert_eq!(r.structured["count"], 1, "{}", r.text);
+        // A real class still works and is not reinterpreted.
+        fs::create_dir_all(dir.join("app/i")).unwrap();
+        fs::write(dir.join("app/i/x.tsx"), "").unwrap();
+        let r = invoke(&dir, "glob", json!({"pattern":"app/[id]/*.tsx"}));
+        assert!(r.text.contains("app/i/x.tsx") && !r.text.contains("page.tsx"), "{}", r.text);
+        // A file called `[id].tsx`, with and without a folder part.
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::write(dir.join("pages/[id].tsx"), "").unwrap();
+        for pat in ["pages/[id].tsx", "**/[id].tsx", "[id].tsx"] {
+            let r = invoke(&dir.join(if pat == "[id].tsx" { "pages" } else { "." }), "glob", json!({"pattern": pat}));
+            assert_eq!(r.structured["count"], 1, "{pat}: {}", r.text);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct CountingReader<R> {
+        inner: R,
+        read: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+    impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.set(self.read.get() + n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn context_windows_come_from_a_stream_that_stops_at_the_last_wanted_line() {
+        let text: String = (1..=200_000).map(|i| format!("line {i} padding padding padding\n")).collect();
+        let total = text.len();
+        let read = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let r = std::io::BufReader::with_capacity(8192, CountingReader { inner: text.as_bytes(), read: read.clone() });
+        let got = collect_lines(r, &[(99, 103), (101, 105)], 2000);
+        let mut keys: Vec<_> = got.keys().copied().collect();
+        keys.sort();
+        assert_eq!(keys, (99..=105).collect::<Vec<_>>());
+        assert_eq!(got[&100], "line 100 padding padding padding");
+        assert!(read.get() < total / 100, "read {} of {total} bytes", read.get());
+    }
+
+    #[test]
+    fn grep_context_on_a_streamed_file_gives_the_same_lines() {
+        let dir = tmp("grep-ctx-stream");
+        let mut text = String::new();
+        for i in 1..=200_000 {
+            if i == 150_000 {
+                text.push_str("UNIQUE_NEEDLE_LINE\n");
+            } else {
+                text.push_str(&format!("filler line number {i} with some padding text\n"));
+            }
+        }
+        assert!(text.len() as u64 > MAX_GREP_FILE_BYTES);
+        fs::write(dir.join("big.log"), &text).unwrap();
+        let r = invoke(&dir, "grep", json!({"pattern":"UNIQUE_NEEDLE_LINE","path":"big.log","context":2}));
+        assert!(r.text.contains("149998- filler line number 149998 with some padding text\n"), "{}", r.text);
+        assert!(r.text.contains("149999- filler line number 149999"), "{}", r.text);
+        assert!(r.text.contains("150000: UNIQUE_NEEDLE_LINE"), "{}", r.text);
+        assert!(r.text.contains("150001- filler line number 150001"), "{}", r.text);
+        assert!(r.text.contains("150002- filler line number 150002"), "{}", r.text);
+        assert!(!r.text.contains("150003-") && !r.text.contains("149997-"), "{}", r.text);
+        // A match on the last line has no after-context and does not fail.
+        fs::write(dir.join("tail.log"), format!("{text}UNIQUE_NEEDLE_TAIL\n")).unwrap();
+        let r = invoke(&dir, "grep", json!({"pattern":"UNIQUE_NEEDLE_TAIL","path":"tail.log","context":2}));
+        assert!(r.text.contains("200001: UNIQUE_NEEDLE_TAIL") && r.text.contains("200000- filler"), "{}", r.text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_write_and_edit_refuse_the_places_the_guard_protects() {
+        let dir = tmp("fs-protected");
+        fs::create_dir_all(dir.join(".ssh")).unwrap();
+        fs::create_dir_all(dir.join("Start Menu/Programs/Startup")).unwrap();
+        fs::write(dir.join(".ssh/known"), "old\n").unwrap();
+        for rel in [".ssh/authorized_keys", "Start Menu/Programs/Startup/a.cmd", "Start Menu\\Programs\\Startup\\b.cmd", "sub/.ssh/id"] {
+            let r = invoke(&dir, "write", json!({"path":rel,"content":"x\n"}));
+            assert!(r.is_error && r.structured["code"] == "FS_PROTECTED", "{rel}: {}", r.text);
+            assert!(!dir.join(rel).exists(), "{rel} was created");
+        }
+        assert!(!dir.join("sub").exists(), "a refused write left a folder behind");
+        let r = invoke(&dir, "edit", json!({"path":".ssh/known","old_string":"old","new_string":"new"}));
+        assert!(r.is_error && r.structured["code"] == "FS_PROTECTED", "{}", r.text);
+        assert_eq!(fs::read_to_string(dir.join(".ssh/known")).unwrap(), "old\n");
+        // The protected-path rules themselves, without touching a real system folder.
+        let root = Root { cwd: dir.clone() };
+        let sys = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        let e = root.check_mutable(&Path::new(&sys).join("System32").join("x.dll")).unwrap_err();
+        assert_eq!(e.code, "FS_PROTECTED");
+        let e = root.check_mutable(&dir.join("owner/.git/hooks/pre-commit")).unwrap_err();
+        assert_eq!(e.code, "FS_PROTECTED");
+        // A normal path still writes.
+        let r = invoke(&dir, "write", json!({"path":"src/ok.txt","content":"fine\n"}));
+        assert!(!r.is_error, "{}", r.text);
+        assert_eq!(fs::read_to_string(dir.join("src/ok.txt")).unwrap(), "fine\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

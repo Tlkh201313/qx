@@ -335,6 +335,7 @@ fn is_python(program: &str, exe: &Path) -> bool {
     name == "py" || name.starts_with("python") || stem(exe).starts_with("python")
 }
 
+#[derive(Clone)]
 pub struct Outcome {
     pub code: i32,
     pub stdout: String,
@@ -426,7 +427,7 @@ pub fn build_command_env(
     if matches!(program.to_ascii_lowercase().as_str(), "bash" | "bash.exe" | "sh" | "sh.exe") {
         if let Some(b) = resolve::git_bash() {
             let mut c = Command::new(b);
-            c.args(args);
+            add_args(&mut c, args);
             prepare(&mut c);
             apply_python_fast(&mut c);
             apply_child_defaults(&mut c, false);
@@ -455,8 +456,12 @@ pub fn build_command_env(
         return Ok(c);
     }
     // `dir /b`, `del /q`: a cmd.exe internal, or a coreutils twin that reads `/b` as a path.
-    if cmd_internal(program)
-        && (args.iter().any(|a| a.starts_with('/')) || matches!(resolve::resolve(program, cwd), Target::Missing))
+    // `rmdir /s /q t3`: Git's rmdir reads both switches as paths. Only a one-letter `/x` counts, so `rmdir /c/tmp/x` stays POSIX.
+    let rmdir_switch = program.eq_ignore_ascii_case("rmdir")
+        && args.iter().any(|a| matches!(a.as_bytes(), [b'/', c] if c.is_ascii_alphabetic()));
+    if rmdir_switch
+        || (cmd_internal(program)
+            && (args.iter().any(|a| a.starts_with('/')) || matches!(resolve::resolve(program, cwd), Target::Missing)))
     {
         let mut line = program.to_string();
         for a in args {
@@ -468,10 +473,14 @@ pub fn build_command_env(
         apply_child_defaults(&mut c, false);
         return Ok(c);
     }
-    let mut target = resolve::resolve(program, cwd);
+    // `PATH=<dir> tool`: the child gets that PATH, so it is also where the program is looked up.
+    let mut target = match envs.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case("PATH")) {
+        Some((_, p)) => resolve::resolve_in(program, &std::env::split_paths(p).collect::<Vec<_>>(), cwd),
+        None => resolve::resolve(program, cwd),
+    };
     // `find src -name x` and `sort -n`: System32 ships unrelated tools under those names
     // with different switches, so a POSIX `-flag` picks Git's binary instead.
-    if posix_flags(program, args) {
+    if posix_flags(program, args, cwd) {
         if let Some(exe) = resolve::git_coreutil(program) {
             target = Target::Direct { exe, prefix: Vec::new() };
         }
@@ -479,10 +488,22 @@ pub fn build_command_env(
     command_for(program, target, args)
 }
 
-/// A name Windows also ships, where a `-flag` means the caller wanted the POSIX tool.
-fn posix_flags(program: &str, args: &[String]) -> bool {
-    matches!(program.to_ascii_lowercase().as_str(), "find" | "sort")
-        && args.iter().any(|a| a.len() > 1 && a.starts_with('-'))
+/// A name Windows also ships, where the arguments show the caller wanted the POSIX tool.
+fn posix_flags(program: &str, args: &[String], cwd: Option<&Path>) -> bool {
+    match program.to_ascii_lowercase().as_str() {
+        "find" | "sort" if args.iter().any(|a| a.len() > 1 && a.starts_with('-')) => true,
+        // find.exe takes a quoted string, never a directory: `find logs` is the POSIX walk.
+        // `find "err" log.txt` is find.exe even when a folder `err` exists: a later operand that is a file.
+        "find" => {
+            let at = |a: &String| cwd.map_or_else(|| PathBuf::from(a), |c| c.join(a));
+            args.first().is_some_and(|a| !a.starts_with('/') && at(a).is_dir()) && !args[1..].iter().any(|a| at(a).is_file())
+        }
+        // `timeout 30 git status` runs a command; Windows' `timeout 5`, `timeout /t 5` and `timeout 5 /nobreak` only wait.
+        "timeout" => {
+            args.len() >= 2 && !args[0].starts_with('/') && !args[1].eq_ignore_ascii_case("/nobreak")
+        }
+        _ => false,
+    }
 }
 
 fn npmish(program: &str) -> bool {
@@ -549,6 +570,13 @@ pub fn command_for(program: &str, target: Target, args: &[String]) -> Result<Com
             Ok(c)
         }
         Target::Shim(p) => {
+            // cmd.exe ends the command line at a newline and drops every later argument, exit 0.
+            if args.iter().any(|a| a.contains(['\n', '\r'])) {
+                return Err(format!(
+                    "{program}: a .cmd/.bat file cannot take an argument with a newline (cmd.exe cuts the line there); \
+                     put the text in a file and pass the path"
+                ));
+            }
             let mut line = cmd_quote(&p.to_string_lossy());
             for a in args {
                 line.push(' ');
@@ -708,7 +736,109 @@ fn msys_quote(a: &str) -> Option<String> {
 /// `cmd.exe` folds a line over ~8 KiB into "The command line is too long."
 const CMD_LINE_CAP: usize = 8_000;
 
+/// Git Bash eats the `\` of an unquoted Windows path: `rm -rf .\cache` deletes `.cache`,
+/// `cat C:\a\b` opens `C:ab`, `rm out\*` removes nothing. Turn the `\` of a path-shaped
+/// word (`X:\..`, `.\..`, `..\..`, `name\name`, `dir\*`) into `/` before the line reaches bash.
+/// Quoted text, `\\`, `\$`, `\"`, `\ ` and the like stay as typed, and so does a word that
+/// already has a `/` (a sed script, `a\.b/c`) unless it starts with a drive, `.\` or `..\`.
+/// A `\` before `* ? [ { . _ - ~` in any other word is an escape (`find -name foo\*`,
+/// `echo a\.b`) unless the text before it is a folder under `cwd` (`out\*`, `dir\.git`).
+/// Heredocs and `$'..'` are left alone: their text is data.
+pub fn slash_windows_paths<'a>(line: &'a str, cwd: Option<&Path>) -> std::borrow::Cow<'a, str> {
+    use std::borrow::Cow;
+    // A char that can follow a path's `\` (every other escape, `\$ \" \<space>`, is kept).
+    fn path_next(c: char) -> bool {
+        c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '*' | '?' | '[' | '{' | '~')
+    }
+    // (char, true when it is bare text of the word: the only place a `\` may be rewritten)
+    fn flush(word: &mut Vec<(char, bool)>, out: &mut String, cwd: Option<&Path>) {
+        let bare = |i: usize| word.get(i).is_some_and(|&(_, b)| b);
+        let is = |i: usize, ch: char| bare(i) && word[i].0 == ch;
+        let drive = bare(0)
+            && bare(1)
+            && bare(2)
+            && word[0].0.is_ascii_alphabetic()
+            && word[1].0 == ':'
+            && matches!(word[2].0, '\\' | '/');
+        let anchored = drive || (is(0, '.') && (is(1, '\\') || (is(1, '.') && is(2, '\\'))));
+        let convert = anchored || !word.iter().any(|&(c, b)| b && c == '/');
+        let is_dir = |p: &str| {
+            !p.is_empty() && cwd.map_or_else(|| Path::new(p).is_dir(), |d| d.join(p).is_dir())
+        };
+        let mut so_far = String::new(); // the word as written to `out`
+        for i in 0..word.len() {
+            let (c, b) = word[i];
+            let hit = convert
+                && b
+                && c == '\\'
+                && i > 0
+                && bare(i - 1)
+                && (word[i - 1].0.is_alphanumeric() || matches!(word[i - 1].0, '.' | '_' | '-' | ':' | '~'))
+                && (anchored || word.get(i + 1).is_some_and(|w| w.0.is_alphanumeric()) || is_dir(&so_far));
+            let ch = if hit { '/' } else { c };
+            out.push(ch);
+            so_far.push(ch);
+        }
+        word.clear();
+    }
+    if !line.contains('\\') || line.contains("<<") || line.contains("$'") {
+        return Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut word: Vec<(char, bool)> = Vec::new();
+    let mut it = line.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\'' => {
+                word.push((c, false));
+                for q in it.by_ref() {
+                    word.push((q, false));
+                    if q == '\'' {
+                        break;
+                    }
+                }
+            }
+            '"' => {
+                word.push((c, false));
+                while let Some(q) = it.next() {
+                    word.push((q, false));
+                    if q == '\\' {
+                        if let Some(e) = it.next() {
+                            word.push((e, false));
+                        }
+                    } else if q == '"' {
+                        break;
+                    }
+                }
+            }
+            '\\' => match it.next() {
+                Some(e) if path_next(e) => {
+                    word.push((c, true));
+                    word.push((e, true));
+                }
+                Some(e) => {
+                    word.push((c, false));
+                    word.push((e, false));
+                }
+                None => word.push((c, false)),
+            },
+            c if c.is_whitespace() || matches!(c, '|' | '&' | ';' | '(' | ')' | '<' | '>') => {
+                flush(&mut word, &mut out, cwd);
+                out.push(c);
+            }
+            _ => word.push((c, true)),
+        }
+    }
+    flush(&mut word, &mut out, cwd);
+    Cow::Owned(out)
+}
+
 pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
+    build_shell_in(command, shell, None)
+}
+
+/// `build_shell` for a command that will run in `cwd` (None: qx's own folder).
+pub fn build_shell_in(command: &str, shell: &str, cwd: Option<&Path>) -> Result<Command, String> {
     let shell = shell.trim().to_ascii_lowercase();
     let shell = shell.strip_suffix(".exe").unwrap_or(&shell);
     // Names models use for the shells qx has: anything unknown means "decide for me".
@@ -729,13 +859,16 @@ pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
                     .to_string()
             })?;
             let mut c = Command::new(b);
-            add_args(&mut c, &["-c", command]);
+            add_args(&mut c, &["-c", slash_windows_paths(command, cwd).as_ref()]);
             prepare(&mut c);
             apply_python_fast(&mut c);
             apply_child_defaults(&mut c, false);
             Ok(c)
         }
         "cmd" => {
+            if command.trim_end().contains('\n') {
+                return Err("cmd.exe runs only the first line of a multi-line command; use shell=powershell or one line".to_string());
+            }
             if command.len() > CMD_LINE_CAP {
                 return Err(format!(
                     "command line is {} characters; cmd.exe stops near {CMD_LINE_CAP}. \
@@ -804,7 +937,7 @@ fn pick_shell(s: &str) -> &'static str {
     if ps_style_flags(s) && !s.contains("&&") && !s.contains("||") {
         return "powershell";
     }
-    if posix_syntax(s) || missing_posix_tool(s) {
+    if posix_syntax(s) || missing_posix_tool(s) || posix_tool_backslash_glob(s) {
         return "bash";
     }
     // Lines cmd.exe would misread: it has no `;`, treats single quotes as ordinary characters
@@ -821,6 +954,8 @@ fn pick_shell(s: &str) -> &'static str {
         } else {
             "powershell"
         }
+    } else if s.trim_end().contains('\n') {
+        "powershell" // cmd.exe would run only the first line and exit 0
     } else {
         "cmd"
     }
@@ -860,6 +995,14 @@ fn missing_posix_tool(s: &str) -> bool {
     segments(s).into_iter().any(|seg| {
         let w = first_word(seg);
         BASH_ONLY.contains(&w) && resolve::find_on_path(w).is_none() && resolve::git_coreutil(w).is_some()
+    }) && resolve::git_bash().is_some()
+}
+/// `ls logs\*.tmp` or `rm -f C:\x\*.tmp` on cmd: Git's tool globs the word itself and reads
+/// `\*` as an escaped `*`, so nothing matches. Bash gets the line with `/` (`slash_windows_paths`).
+fn posix_tool_backslash_glob(s: &str) -> bool {
+    segments(s).into_iter().any(|seg| {
+        BASH_ONLY.contains(&first_word(seg))
+            && seg.split_whitespace().skip(1).any(|w| !w.starts_with('"') && w.contains('\\') && w.contains(['*', '?']))
     }) && resolve::git_bash().is_some()
 }
 /// Whether `c` appears outside single and double quotes.
@@ -959,6 +1102,10 @@ fn posix_syntax(s: &str) -> bool {
     if !s.contains('\\') && MARKERS.iter().any(|m| s.contains(m)) {
         return true;
     }
+    // `A=1 cmd1 && cmd2`: only bash knows an assignment prefix.
+    if chain_starts(s).iter().any(|seg| assignment_word(first_word(seg))) {
+        return true;
+    }
     let chained = s.contains('|') || s.contains('>') || s.contains(';');
     chained && segments(s).into_iter().any(|seg| BASH_ONLY.contains(&first_word(seg)))
 }
@@ -977,7 +1124,9 @@ fn powershell_call(program: &str, args: &[String]) -> Result<Command, String> {
 /// Bare words stay bare (`-Path`, `src`); anything else is single-quoted, the one form
 /// PowerShell never expands.
 fn ps_quote(s: &str) -> String {
+    // `@name` is splatting, so a leading `@` is quoted; one inside a word (`a@b`) is plain.
     let bare = !s.is_empty()
+        && !s.starts_with('@')
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_./\\:@".contains(c));
     if bare {
@@ -1110,10 +1259,12 @@ fn peek_tail(c: &Capture, max_bytes: usize) -> String {
     decode_output(all)
 }
 
+type ProgressSlot = std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Progress>>>>;
+
 thread_local! {
     /// Where `collect` publishes a running command's `Progress`: set by the MCP runner thread of a
     /// call that may become a background job.
-    static PROGRESS_SLOT: std::cell::RefCell<Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Progress>>>>>> = const { std::cell::RefCell::new(None) };
+    static PROGRESS_SLOT: std::cell::RefCell<Option<ProgressSlot>> = const { std::cell::RefCell::new(None) };
 }
 
 pub(crate) fn set_progress_slot(slot: Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Progress>>>>>) {
@@ -1665,6 +1816,7 @@ mod warm {
     }
 
     /// Idle refill: a parked PowerShell that died (or was never started) is replaced before a call needs it.
+    #[cfg_attr(test, allow(dead_code))] // only the warm-up thread calls it, and tests do not start that
     pub fn top_up() {
         if ENABLED.load(Ordering::Relaxed) {
             if let Ok(mut slot) = PARKED.lock() {
@@ -1726,7 +1878,7 @@ mod warm {
             return;
         }
         std::thread::spawn(|| {
-            while PARKED.lock().map_or(false, |s| s.len() < PARKED_TARGET) {
+            while PARKED.lock().is_ok_and(|s| s.len() < PARKED_TARGET) {
                 let mut c = powershell(BOOT.to_string());
                 let env = env_of(&c);
                 let Ok(child) = c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() else {
@@ -1772,7 +1924,7 @@ pub fn run_shell(
     timeout: Option<Duration>,
 ) -> Result<Outcome, String> {
     for attempt in 0..2 {
-        let mut cmd = build_shell(command, shell)?;
+        let mut cmd = build_shell_in(command, shell, cwd.as_deref())?;
         apply_envs(&mut cmd, envs);
         apply_cwd(&mut cmd, cwd);
         let out = run_captured(cmd, timeout).map_err(|e| format!("failed to start: {e}"))?;
@@ -1899,7 +2051,12 @@ pub fn peel_env(s: &str) -> (Vec<(String, String)>, &str) {
             _ => after.split_at(after.find(char::is_whitespace).unwrap_or(after.len())),
         };
         let bare = !after.starts_with(['"', '\'']);
-        let bad = |c: char| "$%`&|<>;()\n\r".contains(c) || (bare && "*?\"'".contains(c));
+        // `PATH=C:\a;C:\b tool`: `;` is the list separator when every piece is a path, not a second command.
+        let path_list = name.eq_ignore_ascii_case("PATH")
+            && val.split(';').all(|p| p == "." || (!p.is_empty() && p.contains(['\\', '/', ':'])));
+        let bad = |c: char| {
+            "$%`&|<>()\n\r".contains(c) || (c == ';' && !path_list) || (bare && "*?\"'".contains(c))
+        };
         if val.contains(bad) || !(tail.is_empty() || tail.starts_with(char::is_whitespace)) {
             break;
         }
@@ -1909,7 +2066,65 @@ pub fn peel_env(s: &str) -> (Vec<(String, String)>, &str) {
     if rest.is_empty() {
         return (Vec::new(), s);
     }
+    // `A=1 x && y`: POSIX gives A to x only, but a process env cannot be split over a chain. Bash
+    // reads the whole line (`posix_syntax` sends an assignment-led line there), unless PowerShell is the better shell.
+    if !envs.is_empty()
+        && chain_starts(rest).len() > 1
+        && pick_shell(rest) != "powershell"
+        && resolve::git_bash().is_some()
+    {
+        return (Vec::new(), s);
+    }
     (envs, rest)
+}
+
+/// The pieces of a line between `;`, `&&`, `||`, `&` and newlines outside quotes. A lone `|`, `2>&1`
+/// and `&>` do not split.
+fn chain_starts(s: &str) -> Vec<&str> {
+    let b = s.as_bytes();
+    let (mut out, mut start, mut quote, mut i) = (Vec::new(), 0, None, 0);
+    while i < b.len() {
+        let c = b[i];
+        let next = b.get(i + 1).copied();
+        let width = match (quote, c) {
+            (Some(q), _) if c == q => {
+                quote = None;
+                0
+            }
+            (Some(_), _) => 0,
+            (None, b'"' | b'\'') => {
+                quote = Some(c);
+                0
+            }
+            (None, b';' | b'\n') => 1,
+            (None, b'&') if next == Some(b'&') => 2,
+            (None, b'&')
+                if next != Some(b'>') && !matches!(i.checked_sub(1).map(|p| b[p]), Some(b'>' | b'<')) =>
+            {
+                1
+            }
+            (None, b'|') if next == Some(b'|') => 2,
+            _ => 0,
+        };
+        if width > 0 {
+            out.push(&s[start..i]);
+            i += width;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// `NAME=value` as the first word of a command: a POSIX assignment prefix.
+fn assignment_word(w: &str) -> bool {
+    w.split_once('=').is_some_and(|(n, _)| {
+        !n.is_empty()
+            && !n.starts_with(|c: char| c.is_ascii_digit())
+            && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 /// Tokenize a command line only when it needs no shell at all.
@@ -2027,9 +2242,37 @@ mod tests {
             ("powershell -NoProfile -Command \"1+1\"", "cmd"),
             ("node -e \"console.log(1+1)\"", "cmd"),
             ("python -c \"print(1+1)\"", "cmd"),
+            ("cargo build\ncargo test", "powershell"),
+            ("cargo build\n", "cmd"),
         ] {
             assert_eq!(pick_shell(line), want, "{line}");
         }
+        assert!(build_shell("echo a\necho b", "cmd").is_err());
+    }
+
+    #[test]
+    fn a_posix_tool_with_a_backslash_glob_goes_to_bash() {
+        if resolve::git_bash().is_none() {
+            return;
+        }
+        for (line, want) in [
+            (r"ls C:\work\logs\*.tmp", "bash"),
+            (r"rm -f logs\*.tmp", "bash"),
+            (r"dir /b C:\work\logs\*.tmp", "cmd"),
+            (r"del logs\*.tmp", "cmd"),
+        ] {
+            assert_eq!(pick_shell(line), want, "{line}");
+        }
+    }
+
+    #[test]
+    fn bash_as_a_program_gets_its_arguments_back_unchanged() {
+        if resolve::git_bash().is_none() {
+            return;
+        }
+        let args: Vec<String> = ["-c", "printf %s \"$1\"", "_", "a \"b\" c"].map(String::from).to_vec();
+        let o = run_captured(build_command("bash", &args).unwrap(), Some(Duration::from_secs(20))).unwrap();
+        assert_eq!(o.stdout, "a \"b\" c", "stderr: {}", o.stderr);
     }
 
     #[test]
@@ -2310,6 +2553,199 @@ mod tests {
     }
 
     #[test]
+    fn windows_paths_get_forward_slashes_before_bash() {
+        let d = scratch("slash-dirs");
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        std::fs::create_dir_all(d.join("logs")).unwrap();
+        let s = |l: &str| slash_windows_paths(l, Some(&d)).into_owned();
+        // The five shapes that lost their backslashes under Git Bash.
+        assert_eq!(s(r".\cache"), "./cache");
+        assert_eq!(s(r"rm -rf .\cache 2>/dev/null"), "rm -rf ./cache 2>/dev/null");
+        assert_eq!(s(r"rm -f C:\w\logs\*.tmp"), "rm -f C:/w/logs/*.tmp");
+        assert_eq!(s(r"rm -rf out\*"), "rm -rf out/*");
+        assert_eq!(s(r"rm -rf .\cache\*"), "rm -rf ./cache/*");
+        assert_eq!(s(r"cat C:\Users\U\Cargo.toml | head -3"), "cat C:/Users/U/Cargo.toml | head -3");
+        assert_eq!(s(r"cat sub\a.txt | head -1"), "cat sub/a.txt | head -1");
+        assert_eq!(s(r"head -1 sub\a.txt; echo done"), "head -1 sub/a.txt; echo done");
+        assert_eq!(s(r"grep -c o sub\a.txt || echo none"), "grep -c o sub/a.txt || echo none");
+        assert_eq!(s(r"wc -l C:\w\src\*.rs"), "wc -l C:/w/src/*.rs");
+        assert_eq!(s(r"ls C:\w\*.tmp"), "ls C:/w/*.tmp");
+        assert_eq!(s(r"grep -c name C:\w\Cargo.toml > out.txt"), "grep -c name C:/w/Cargo.toml > out.txt");
+        assert_eq!(s(r"ls ..\..\x"), "ls ../../x");
+        // A word that starts `.\`, `..\` or `X:\` is a path even when it also holds a `/`.
+        assert_eq!(s(r"rm -f .\cache/k.txt"), "rm -f ./cache/k.txt");
+        assert_eq!(s(r"ls ..\a/b\c"), "ls ../a/b/c");
+        // `\*` after a folder that exists is a path; after anything else it is an escape.
+        assert_eq!(s(r"ls logs\*.tmp"), "ls logs/*.tmp");
+        assert_eq!(s(r"ls out\.git"), "ls out/.git");
+        // Quoted text and real escapes are the user's and stay.
+        for same in [
+            r"printf '%s\n' a\\b",
+            r#"echo "C:\Users\x""#,
+            r"echo 'C:\Users\x'",
+            r"echo a\ b",
+            r"echo \$HOME",
+            r#"echo \"q\""#,
+            r"echo \n",
+            r"find . -name foo\* | head",
+            r"echo a\* | cat",
+            r"echo a\.b | cat",
+            r"ls f\[1\].txt",
+            r"grep -rn x --include=a\*",
+            "sed s/a\\.b/x/ f",
+            "cat <<EOF\nC:\\a\\b\nEOF",
+            r"echo $'a\nb'",
+            "ls",
+        ] {
+            assert_eq!(s(same), same, "{same}");
+        }
+        assert!(matches!(slash_windows_paths("ls -la", None), std::borrow::Cow::Borrowed(_)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_windows_path_in_a_bash_line_reaches_the_right_file() {
+        if resolve::git_bash().is_none() {
+            return; // no Git for Windows here
+        }
+        let d = std::env::temp_dir().join(format!("qx-slash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".cache")).unwrap();
+        std::fs::create_dir_all(d.join("cache")).unwrap();
+        std::fs::write(d.join(".cache").join("x.txt"), "x").unwrap();
+        std::fs::write(d.join("cache").join("y.txt"), "y").unwrap();
+        let mut c = build_shell(r"rm -rf .\cache 2>/dev/null; cat cache\y.txt | head -1", "bash").unwrap();
+        let out = c.current_dir(&d).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "", "cache is gone, so cat finds nothing");
+        assert!(d.join(".cache").join("x.txt").is_file(), ".cache must survive `rm .\\cache`");
+        assert!(!d.join("cache").exists(), "`rm -rf .\\cache` removes ./cache");
+        // A path that mixes both separators is still the path, not a sibling named `.cache`.
+        std::fs::create_dir_all(d.join("cache")).unwrap();
+        std::fs::write(d.join("cache").join("k.txt"), "k").unwrap();
+        std::fs::write(d.join(".cache").join("k.txt"), "k").unwrap();
+        let mut c = build_shell(r"rm -f .\cache/k.txt", "bash").unwrap();
+        c.current_dir(&d).output().unwrap();
+        assert!(!d.join("cache").join("k.txt").exists(), "`rm .\\cache/k.txt` removes cache/k.txt");
+        assert!(d.join(".cache").join("k.txt").is_file(), "and leaves .cache/k.txt");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("qx-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn find_with_a_string_and_a_file_stays_find_exe_even_if_a_folder_has_that_name() {
+        let d = scratch("find-route");
+        std::fs::create_dir_all(d.join("err")).unwrap();
+        std::fs::write(d.join("l.txt"), "x").unwrap();
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(!posix_flags("find", &a(&["err", "l.txt"]), Some(&d)), "find \"err\" l.txt searches the file");
+        assert!(posix_flags("find", &a(&["err"]), Some(&d)), "find err walks the folder");
+        assert!(posix_flags("find", &a(&["err", "err"]), Some(&d)), "two folders are a walk");
+        assert!(posix_flags("find", &a(&["err", "-name", "x"]), Some(&d)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_cmd_shim_refuses_a_newline_in_an_argument() {
+        let shim = Target::Shim(PathBuf::from("x.cmd"));
+        let args = ["line1\nline2".to_string(), "--dry-run".to_string()];
+        let err = command_for("x.cmd", shim, &args).expect_err("must refuse, cmd.exe would cut the line");
+        assert!(err.contains("newline"), "{err}");
+    }
+
+    #[test]
+    fn an_at_sign_argument_is_quoted_for_powershell() {
+        assert_eq!(ps_quote("@types"), "'@types'");
+        assert_eq!(ps_quote("@args"), "'@args'");
+        assert_eq!(ps_quote("a@b.com"), "a@b.com");
+    }
+
+    #[test]
+    fn timeout_n_cmd_runs_cmd_under_a_deadline() {
+        if resolve::git_coreutil("timeout").is_none() {
+            return; // no Git for Windows here
+        }
+        let args = ["30".to_string(), "git".to_string(), "--version".to_string()];
+        let out = build_command("timeout", &args).unwrap().output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("git version"), "{out:?}");
+        // Windows' own `timeout 1` / `timeout /t 1` still go to timeout.exe.
+        assert!(!posix_flags("timeout", &["1".to_string()], None));
+        assert!(!posix_flags("timeout", &["/t".to_string(), "1".to_string()], None));
+        assert!(!posix_flags("timeout", &["5".to_string(), "/nobreak".to_string()], None));
+    }
+
+    #[test]
+    fn rmdir_with_a_slash_flag_goes_to_cmd() {
+        let d = scratch("rmdir");
+        std::fs::create_dir_all(d.join("t3").join("deep")).unwrap();
+        std::fs::write(d.join("t3").join("deep").join("f.txt"), "x").unwrap();
+        let args = ["/s".to_string(), "/q".to_string(), "t3".to_string()];
+        let out = build_command_env("rmdir", &args, Some(&d), &[]).unwrap().current_dir(&d).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(!d.join("t3").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn find_with_only_a_directory_is_posix_find() {
+        let d = scratch("findd");
+        std::fs::create_dir_all(d.join("logs")).unwrap();
+        std::fs::write(d.join("logs").join("a.log"), "x").unwrap();
+        if resolve::git_coreutil("find").is_none() {
+            return;
+        }
+        let out = build_command_env("find", &["logs".to_string()], Some(&d), &[]).unwrap().current_dir(&d).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("a.log"), "{out:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_path_prefix_decides_which_program_runs() {
+        let a = scratch("rs1a");
+        let b = scratch("rs1b");
+        std::fs::write(a.join("qxrs1tool.cmd"), "@echo from-A\r\n").unwrap();
+        std::fs::write(b.join("qxrs1tool.cmd"), "@echo from-B\r\n").unwrap();
+        let run = |dir: &Path| {
+            let env = [("PATH".to_string(), dir.to_string_lossy().into_owned())];
+            let mut c = build_command_env("qxrs1tool", &[], None, &env).unwrap();
+            apply_envs(&mut c, &env);
+            String::from_utf8_lossy(&c.output().unwrap().stdout).trim().to_string()
+        };
+        assert_eq!(run(&a), "from-A");
+        assert_eq!(run(&b), "from-B", "not cached from the first call");
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn a_path_prefix_may_hold_semicolons() {
+        let (e, r) = peel_env(r"PATH=C:\a;C:\b tool x");
+        assert_eq!(e, vec![("PATH".to_string(), r"C:\a;C:\b".to_string())]);
+        assert_eq!(r, "tool x");
+        // Any other name keeps `;` for the shell: `A=1;tool` is two statements.
+        assert_eq!(peel_env("A=1;tool").0.len(), 0);
+    }
+
+    #[test]
+    fn an_env_prefix_reaches_only_the_first_command_of_a_chain() {
+        if resolve::git_bash().is_none() {
+            return;
+        }
+        let line = "QX_E6=one printenv QX_E6 && printenv QX_E6 || echo none";
+        let (e, r) = peel_env(line);
+        assert!(e.is_empty() && r == line, "a chained line stays whole for bash");
+        let out = build_shell(r, "auto").unwrap().output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"), "one\nnone\n");
+        // One command: still peeled, as before.
+        assert_eq!(peel_env("A=1 echo x").0.len(), 1);
+    }
+
+    #[test]
     fn write_atomic_replaces_the_file_whole() {
         let d = std::env::temp_dir().join(format!("qx-atomic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -2397,8 +2833,10 @@ mod tests {
             let (pid, rest) = err.split_once(';').unwrap();
             (pid[4..].parse::<u32>().unwrap(), (code, out, rest.to_string()))
         };
+        // One time limit for the whole test: 20 retries of a 60 s wait each could hang a run for 20 minutes.
+        let overall = Instant::now() + Duration::from_secs(120);
         let wait_parked = || {
-            let deadline = Instant::now() + Duration::from_secs(60);
+            let deadline = (Instant::now() + Duration::from_secs(20)).min(overall);
             while warm::parked_pid().is_none() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -2407,14 +2845,14 @@ mod tests {
         // A parked one that went stale (its environment no longer matches) is dropped and
         // refilled, so wait and try again.
         let parked = |script: &str| {
-            for _ in 0..20 {
+            while Instant::now() < overall {
                 let pid = wait_parked();
                 let (ran_on, out) = run(script);
                 if pid == Some(ran_on) {
                     return out;
                 }
             }
-            panic!("never ran on the parked PowerShell");
+            panic!("never ran on the parked PowerShell within 120 s");
         };
         let cases = [
             "echo a; Write-Error 'e1'; echo b",

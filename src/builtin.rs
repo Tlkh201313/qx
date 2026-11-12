@@ -46,7 +46,16 @@ pub fn try_exec(program: &str, args: &[String], cwd: Option<&Path>, envs: &[(Str
         }
         None => args,
     };
-    if PATHY.contains(&name.as_str()) && args.iter().any(|a| a.starts_with('/')) {
+    // grep checks its own operands: a pattern such as `/api/users` is not a path.
+    if name != "grep" && PATHY.contains(&name.as_str()) && args.iter().any(|a| a.starts_with('/')) {
+        return None;
+    }
+    // `Test-Path env:FOO`, `ls HKCU:\`: a PowerShell provider path, not a file under the cwd.
+    // grep and sed take patterns and scripts, where a colon is ordinary text.
+    if !matches!(name.as_str(), "grep" | "sed" | "echo" | "write-output" | "write-host")
+        && (PATHY.contains(&name.as_str()) || name == "test-path")
+        && args.iter().any(|a| !a.starts_with('-') && a.find(':').is_some_and(|i| i >= 2))
+    {
         return None;
     }
     let mut out = match name.as_str() {
@@ -336,6 +345,7 @@ struct LsEntry {
     is_dir: bool,
     len: u64,
     modified: Option<SystemTime>,
+    readonly: bool,
 }
 
 struct LsWalk {
@@ -409,6 +419,7 @@ fn cmd_ls(args: &[String], cwd: Option<&Path>, full: bool) -> Option<BuiltinOut>
                     md.is_dir(),
                     md.len(),
                     md.modified().ok(),
+                    md.permissions().readonly(),
                     opts.long,
                 ),
                 Err(e) => return Some(fail(format!("ls: {}: {e}", path.display()))),
@@ -440,37 +451,36 @@ fn cmd_ls(args: &[String], cwd: Option<&Path>, full: bool) -> Option<BuiltinOut>
         return Some(ok(out));
     }
 
+    // One bad operand does not hide the others: its error goes to stderr and the exit code is 1.
     let multiple = paths.len() > 1;
-    let mut first = true;
+    let mut err = String::new();
     for p in paths {
         let path = path_of(cwd, p);
-        if multiple {
-            if !first {
-                out.push('\n');
+        let listed = fs::metadata(&path).and_then(|md| {
+            let mut head = String::new();
+            // Only a directory gets a `name:` header; a file is shown as typed.
+            if multiple && md.is_dir() {
+                if !out.is_empty() {
+                    head.push('\n');
+                }
+                let _ = writeln!(head, "{p}:");
             }
-            let _ = writeln!(out, "{p}:");
-        }
-        first = false;
-        match list_one(&path, &opts) {
+            list_one(&path, p, &md, &opts).map(|body| head + &body)
+        });
+        match listed {
             Ok(s) => out.push_str(&s),
-            Err(e) => return Some(fail(format!("ls: {}: {e}", path.display()))),
+            Err(e) => {
+                let _ = writeln!(err, "ls: {}: {e}", path.display());
+            }
         }
     }
-    Some(ok(out))
+    Some(BuiltinOut { code: i32::from(!err.is_empty()), stdout: out, stderr: err, elapsed: Duration::ZERO })
 }
 
-fn list_one(path: &Path, opts: &LsOpts) -> std::io::Result<String> {
-    let md = fs::metadata(path)?;
+fn list_one(path: &Path, display: &str, md: &fs::Metadata, opts: &LsOpts) -> std::io::Result<String> {
     if !md.is_dir() {
         let mut out = String::new();
-        write_entry(
-            &mut out,
-            &path.file_name().unwrap_or_default().to_string_lossy(),
-            false,
-            md.len(),
-            md.modified().ok(),
-            opts.long,
-        );
+        write_entry(&mut out, display, false, md.len(), md.modified().ok(), md.permissions().readonly(), opts.long);
         return Ok(out);
     }
 
@@ -561,12 +571,14 @@ fn collect_entries(
         let md = if need_meta { e.metadata().ok() } else { None };
         let len = md.as_ref().map(|m| m.len()).unwrap_or(0);
         let modified = md.as_ref().and_then(|m| m.modified().ok());
+        let readonly = md.as_ref().is_some_and(|m| m.permissions().readonly());
         entries.push(LsEntry {
             lower: name.to_ascii_lowercase(),
             name,
             is_dir,
             len,
             modified,
+            readonly,
         });
     }
     Ok((entries, total, dirs, files, capped))
@@ -608,14 +620,14 @@ fn write_listing(
             if !take_line(walk) {
                 break;
             }
-            write_entry(out, &e.name, e.is_dir, e.len, e.modified, opts.long);
+            write_entry(out, &e.name, e.is_dir, e.len, e.modified, e.readonly, opts.long);
         }
     } else {
         for e in &entries[..LS_SAMPLE_HEAD] {
             if !take_line(walk) {
                 break;
             }
-            write_entry(out, &e.name, e.is_dir, e.len, e.modified, opts.long);
+            write_entry(out, &e.name, e.is_dir, e.len, e.modified, e.readonly, opts.long);
         }
         if !walk.capped {
             // Directories are navigation anchors: never drop one silently.
@@ -639,7 +651,7 @@ fn write_listing(
                 if !take_line(walk) {
                     break;
                 }
-                write_entry(out, &e.name, e.is_dir, e.len, e.modified, opts.long);
+                write_entry(out, &e.name, e.is_dir, e.len, e.modified, e.readonly, opts.long);
             }
         }
     }
@@ -700,6 +712,7 @@ fn write_entry(
     is_dir: bool,
     len: u64,
     modified: Option<SystemTime>,
+    readonly: bool,
     long: bool,
 ) {
     if !long {
@@ -712,12 +725,14 @@ fn write_entry(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    // On Windows a folder's read-only attribute is only a marker; it does not stop writes into it.
+    let w = if readonly && !is_dir { '-' } else { 'w' };
     let mode = if is_dir {
-        "drwxr-xr-x"
+        format!("dr{w}xr-xr-x")
     } else if matches!(ext.as_str(), "exe" | "cmd" | "bat" | "ps1" | "com") {
-        "-rwxr-xr-x"
+        format!("-r{w}xr-xr-x")
     } else {
-        "-rw-r--r--"
+        format!("-r{w}-r--r--")
     };
     let _ = write!(out, "{mode} {len:>10} ");
     write_time(out, modified.unwrap_or(UNIX_EPOCH));
@@ -739,7 +754,7 @@ pub(crate) fn format_time(t: SystemTime) -> String {
     let rem = secs.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
     format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
         rem / 3600,
         (rem % 3600) / 60
     )
@@ -895,13 +910,12 @@ fn cmd_head(args: &[String], cwd: Option<&Path>, tail: bool) -> Option<BuiltinOu
         };
     }
     let Window::Lines(count) = window else { return None };
-    let text = match read_head_tail(&path, count, tail) {
-        Ok(t) => t,
-        Err(e) => {
-            return Some(fail(format!("{tool}: {}: {e}", path.display())))
-        }
-    };
-    Some(ok(text))
+    match read_head_tail(&path, count, tail) {
+        Ok(Some(t)) => Some(ok(t)),
+        // Too big for the 32 MiB window: the real tool prints all of it.
+        Ok(None) => None,
+        Err(e) => Some(fail(format!("{tool}: {}: {e}", path.display()))),
+    }
 }
 
 /// `-c`: a byte window, text only. A window that is binary or not valid UTF-8 is left to the
@@ -928,16 +942,28 @@ fn read_bytes_window(path: &Path, n: usize, tail: bool) -> std::io::Result<Optio
     Ok(String::from_utf8(buf).ok())
 }
 
-/// Read only what `head`/`tail` needs. Large files are bounded to the first or
-/// last 32 MiB instead of falling back to a binary that may not exist on
-/// Windows.
-fn read_head_tail(path: &Path, count: usize, tail: bool) -> std::io::Result<String> {
+/// Read only what `head`/`tail` needs, from a 32 MiB window. `None` when the window is too small
+/// to hold the answer, so the real tool answers instead of a silently short result.
+fn read_head_tail(path: &Path, count: usize, tail: bool) -> std::io::Result<Option<String>> {
     if count == 0 && tail {
-        return Ok(String::new());
+        return Ok(Some(String::new()));
     }
     let mut f = File::open(path)?;
     if count == 0 {
-        return Ok(String::new());
+        return Ok(Some(String::new()));
+    }
+    // UTF-16 (PowerShell 5.1 `>`) has to be decoded whole: a line slice or a mid-file window has no BOM.
+    let mut bom = [0u8; 2];
+    let got = f.read(&mut bom)?;
+    f.seek(SeekFrom::Start(0))?;
+    if got == 2 && (bom == [0xFF, 0xFE] || bom == [0xFE, 0xFF]) {
+        let (text, cut) = read_text_capped(path)?;
+        if cut {
+            return Ok(None);
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let pick = if tail { &lines[lines.len().saturating_sub(count)..] } else { &lines[..lines.len().min(count)] };
+        return Ok(Some(pick.iter().map(|l| format!("{l}\n")).collect()));
     }
     let len = f.metadata()?.len();
     if !tail {
@@ -963,7 +989,10 @@ fn read_head_tail(path: &Path, count: usize, tail: bool) -> std::io::Result<Stri
             out.push_str(&line);
             out.push('\n');
         }
-        return Ok(out);
+        if seen < count && len > READ_CAP && reader.get_ref().limit() == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(out));
     }
 
     // Walk backwards in small chunks until enough line breaks are found. The
@@ -984,6 +1013,9 @@ fn read_head_tail(path: &Path, count: usize, tail: bool) -> std::io::Result<Stri
         if pos == 0 || newlines > count {
             break;
         }
+    }
+    if pos > 0 && newlines <= count {
+        return Ok(None);
     }
     let mut buf = Vec::with_capacity(total);
     for chunk in chunks.iter().rev() {
@@ -1011,7 +1043,7 @@ fn read_head_tail(path: &Path, count: usize, tail: bool) -> std::io::Result<Stri
         out.push_str(line);
         out.push('\n');
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 fn cmd_wc(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
@@ -1090,11 +1122,13 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         *slot = Some(v);
         Some(())
     }
+    // GNU grep takes options before or after the pattern and files; the words are what is left.
+    let mut words: Vec<&String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--" {
-            i += 1;
+            words.extend(&args[i + 1..]);
             break;
         }
         if let Some(rest) = a.strip_prefix("--") {
@@ -1183,7 +1217,7 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                 }
             }
         } else {
-            break;
+            words.push(&args[i]);
         }
         i += 1;
     }
@@ -1194,13 +1228,10 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         // GNU answers these with a "context is ignored" warning; qx words warnings badly.
         return None;
     }
+    let mut words = words.into_iter();
     let pattern = match pattern {
         Some(p) => p,
-        None => {
-            let p = args.get(i)?.clone();
-            i += 1;
-            p
-        }
+        None => words.next()?.clone(),
     };
     let pattern = pattern.as_str();
     // A newline separates patterns, with `-F` too.
@@ -1212,7 +1243,8 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         include.as_ref().is_none_or(|g| file.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&g[1..])))
     };
     let mut specs: Vec<(&str, PathBuf)> = Vec::new();
-    if i == args.len() {
+    let operands: Vec<&String> = words.collect();
+    if operands.is_empty() {
         if !recursive {
             // No path means stdin, which qx never gives a child.
             return None;
@@ -1220,12 +1252,17 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         // `grep -r x` searches `.` but names files without a `./` prefix.
         specs.push(("", path_of(cwd, ".")));
     } else {
-        for raw in &args[i..] {
-            if raw == "-" {
+        for raw in operands {
+            // `-` is stdin, and a leading `/` may be a POSIX-style path path_of cannot place.
+            if raw == "-" || raw.starts_with('/') {
                 return None;
             }
             specs.push((raw.as_str(), path_of(cwd, raw)));
         }
+    }
+    // Decline on any operand qx cannot answer before the first walk, not after it.
+    for (_, path) in &specs {
+        fs::metadata(path).ok().filter(|m| m.is_file() || (m.is_dir() && recursive))?;
     }
 
     // Expand to files in the spelling grep would print: `grep -r x src` says `src/a.rs`.
@@ -1292,17 +1329,31 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut hits = 0usize;
     let mut printed = false; // anything printed yet, across files: GNU separates groups of different files
     'files: for (disp, path) in &files {
+        if crate::exec::should_stop() {
+            return None;
+        }
         // Size first: a multi-gigabyte log must not be read just to be declined.
         if fs::metadata(path).ok()?.len() > READ_CAP {
             return None;
         }
         let bytes = fs::read(path).ok()?;
         // GNU prints "Binary file ... matches" for a NUL anywhere, or bytes that are not text in
-        // a UTF-8 locale; never guess at that.
-        if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
-            return None;
-        }
-        let text = crate::exec::decode(&bytes);
+        // a UTF-8 locale; qx declines whenever that message could be the answer, and otherwise
+        // the file is a plain miss (`.git` objects). An ASCII needle survives lossy decoding.
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(t) if !bytes.contains(&0) => t,
+            _ => {
+                if invert || !pattern.is_ascii() {
+                    return None;
+                }
+                let lossy = String::from_utf8_lossy(&bytes);
+                let hit = if insensitive { lossy.to_lowercase().contains(&needle) } else { lossy.contains(&needle) };
+                if hit {
+                    return None;
+                }
+                ""
+            }
+        };
         // `split_inclusive` keeps a trailing newline from inventing an empty last line, which
         // `-v` would otherwise report.
         let raw_lines: Vec<&str> = text.split_inclusive('\n').collect();
@@ -1421,6 +1472,9 @@ fn count_file(path: &Path) -> std::io::Result<(usize, usize, usize)> {
     let (mut lines, mut words, mut bytes) = (0usize, 0usize, 0usize);
     let mut in_word = false;
     loop {
+        if crate::exec::should_stop() {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stopped (cancelled or timed out)"));
+        }
         let n = f.read(&mut buf)?;
         if n == 0 {
             break;
@@ -1491,13 +1545,52 @@ fn cmd_sed(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut line_no = 0usize;
     // The last line printed had no newline (end of a file): GNU sed adds it once more output follows.
     let mut owed_newline = false;
+    let mut emit = |line: &str, out: &mut String| {
+        let has_nl = line.ends_with('\n');
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        // qx normalises a CRLF line ending, as head, cat and tail do here.
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if owed_newline {
+            out.push('\n');
+        }
+        out.push_str(line);
+        if has_nl {
+            out.push('\n');
+        }
+        // The last line of the input keeps whatever terminator it had.
+        owed_newline = !has_nl;
+    };
     for raw in &paths {
         let path = path_of(cwd, raw);
-        if !fs::metadata(&path).ok()?.is_file() {
+        let md = fs::metadata(&path).ok()?;
+        if !md.is_file() {
             return None;
         }
+        if md.len() > READ_CAP {
+            // Past the cap: stream the top of the file and stop at the range. A range that does not end
+            // inside the first READ_CAP bytes, or a binary file, is the real tool's.
+            let mut reader = BufReader::new(fs::File::open(&path).ok()?.take(READ_CAP));
+            let mut buf = Vec::new();
+            while line_no < to {
+                buf.clear();
+                if reader.read_until(b'\n', &mut buf).ok()? == 0 {
+                    break;
+                }
+                if buf.contains(&0) || (!buf.ends_with(b"\n") && reader.get_ref().limit() == 0) {
+                    return None;
+                }
+                line_no += 1;
+                if line_no >= from {
+                    emit(&crate::exec::decode(&buf), &mut out);
+                }
+            }
+            if line_no < to && reader.get_ref().limit() == 0 {
+                return None;
+            }
+            continue;
+        }
         let bytes = fs::read(&path).ok()?;
-        if bytes.len() as u64 > READ_CAP || bytes[..bytes.len().min(8192)].contains(&0) {
+        if bytes[..bytes.len().min(8192)].contains(&0) {
             return None;
         }
         let text = crate::exec::decode(&bytes);
@@ -1506,22 +1599,9 @@ fn cmd_sed(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             if line_no > to {
                 break;
             }
-            if line_no < from {
-                continue;
+            if line_no >= from {
+                emit(line, &mut out);
             }
-            let has_nl = line.ends_with('\n');
-            let line = line.strip_suffix('\n').unwrap_or(line);
-            // qx normalises a CRLF line ending, as head, cat and tail do here.
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            if owed_newline {
-                out.push('\n');
-            }
-            out.push_str(line);
-            if has_nl {
-                out.push('\n');
-            }
-            // The last line of the input keeps whatever terminator it had.
-            owed_newline = !has_nl;
         }
     }
     Some(ok(out))
@@ -1548,8 +1628,12 @@ fn cmd_mkdir(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut code = 0;
     for p in paths {
         let path = path_of(cwd, p);
+        // A `\` path only reaches here from a cmd line (bash eats it), and cmd's mkdir makes the parents.
         let res = if parents {
             fs::create_dir_all(&path)
+        } else if p.contains('\\') {
+            // ... but an existing folder is an error there, as in `mkdir` without `-p`.
+            if path.exists() { fs::create_dir(&path) } else { fs::create_dir_all(&path) }
         } else {
             fs::create_dir(&path)
         };
@@ -1715,6 +1799,10 @@ fn copy_rec(src: &Path, dst: &Path, depth: usize) -> std::io::Result<()> {
         Ok(())
     } else {
         fs::copy(src, dst)?;
+        // CopyFileExW keeps the source's old write time; GNU `cp` stamps now, and make/cargo rely on that.
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(dst) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
         Ok(())
     }
 }
@@ -1791,6 +1879,11 @@ fn cmd_cp(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         } else {
             dst.clone()
         };
+        if src.is_dir() && target.is_file() {
+            err.push_str(&format!("cp: cannot overwrite non-directory '{}' with directory '{}'\n", target.display(), src.display()));
+            code = 1;
+            continue;
+        }
         if into_self(&src, &target, false) {
             err.push_str(&format!(
                 "cp: {} -> {}: destination is the source or inside it\n",
@@ -1923,7 +2016,8 @@ fn cmd_touch(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         return None;
     }
     let readonly = |a: &String| fs::metadata(path_of(cwd, a)).is_ok_and(|m| m.permissions().readonly());
-    if args.iter().any(readonly) {
+    // A folder cannot be opened for append; the real touch updates its time.
+    if args.iter().any(readonly) || args.iter().any(|a| path_of(cwd, a).is_dir()) {
         return None;
     }
     let mut err = String::new();
@@ -2019,7 +2113,12 @@ fn cmd_realpath(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         } else {
             p.to_path_buf()
         };
-        match fs::canonicalize(&abs) {
+        // GNU prints the path of a file about to be created: only the last component may be missing.
+        let resolved = fs::canonicalize(&abs).or_else(|e| match (abs.parent(), abs.file_name()) {
+            (Some(dir), Some(name)) if e.kind() == std::io::ErrorKind::NotFound => fs::canonicalize(dir).map(|d| d.join(name)),
+            _ => Err(e),
+        });
+        match resolved {
             Ok(c) => {
                 let s = c.display().to_string();
                 let trimmed = s.strip_prefix(r"\\?\").unwrap_or(&s);
@@ -2050,7 +2149,7 @@ fn cmd_whoami(args: &[String]) -> Option<BuiltinOut> {
         Some(d) => format!("{d}\\{user}\n"),
         None => format!("{user}\n"),
     };
-    Some(ok(line))
+    Some(ok(line.to_lowercase()))
 }
 
 fn cmd_hostname(args: &[String]) -> Option<BuiltinOut> {
@@ -2080,7 +2179,8 @@ fn cmd_seq(args: &[String]) -> Option<BuiltinOut> {
     if step == 0.0 || !first.is_finite() || !last.is_finite() || !step.is_finite() {
         return None;
     }
-    let count = ((last - first) / step).floor() + 1.0;
+    // The epsilon keeps `seq 0.1 0.1 0.3` from losing 0.3 to floating-point division.
+    let count = ((last - first) / step + 1e-9).floor() + 1.0;
     if !count.is_finite() || !(0.0..=1_000_000.0).contains(&count) {
         return None;
     }
@@ -2100,6 +2200,39 @@ fn cmd_seq(args: &[String]) -> Option<BuiltinOut> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seq_keeps_its_last_value_and_realpath_accepts_a_new_file() {
+        let lines = |a: &[&str]| {
+            let a: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+            try_exec("seq", &a, None, &[]).unwrap().stdout.lines().count()
+        };
+        assert_eq!(lines(&["0.1", "0.1", "0.3"]), 3);
+        assert_eq!(lines(&["0", "0.1", "0.3"]), 4);
+        assert_eq!(lines(&["1", "3"]), 3);
+        let here = std::env::current_dir().unwrap();
+        let o = try_exec("realpath", &["not-yet-created.txt".into()], Some(&here), &[]).unwrap();
+        assert_eq!(o.code, 0, "{}", o.stderr);
+        assert!(o.stdout.trim_end().ends_with("not-yet-created.txt"));
+        let o = try_exec("realpath", &["no-such-dir\\x.txt".into()], Some(&here), &[]).unwrap();
+        assert_eq!(o.code, 1);
+    }
+
+    #[test]
+    fn cp_stamps_the_copy_with_the_current_time() {
+        let root = std::env::temp_dir().join(format!("qx-cpmtime-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let (a, b) = (root.join("a.txt"), root.join("b.txt"));
+        fs::write(&a, "x").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(86_400);
+        fs::OpenOptions::new().write(true).open(&a).unwrap().set_modified(old).unwrap();
+        let o = try_exec("cp", &["a.txt".into(), "b.txt".into()], Some(&root), &[]).unwrap();
+        assert_eq!(o.code, 0, "{}", o.stderr);
+        let age = std::time::SystemTime::now().duration_since(fs::metadata(&b).unwrap().modified().unwrap()).unwrap();
+        assert!(age < Duration::from_secs(3_600), "copy kept the source time: {age:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn cp_and_mv_refuse_to_nest_a_dir_in_itself() {
@@ -2153,6 +2286,34 @@ mod tests {
 
         let args = vec!["-a".to_string(), ".".to_string()];
         assert!(cmd_ls(&args, Some(&d), false).unwrap().stdout.contains(".hidden"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ls_shows_file_operands_as_typed_keeps_going_after_a_bad_one_and_marks_read_only() {
+        let d = tmp("ls-operands");
+        fs::create_dir(d.join("a")).unwrap();
+        fs::write(d.join("a").join("x.txt"), "x").unwrap();
+        fs::write(d.join("y.txt"), "y").unwrap();
+        let ro = d.join("ro.txt");
+        fs::write(&ro, "r").unwrap();
+        let mut perms = fs::metadata(&ro).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&ro, perms).unwrap();
+
+        let args: Vec<String> = ["a/x.txt", "nope", "y.txt", "a"].map(String::from).to_vec();
+        let out = cmd_ls(&args, Some(&d), false).unwrap();
+        assert_eq!(out.code, 1);
+        assert!(out.stderr.contains("nope"), "{}", out.stderr);
+        assert_eq!(out.stdout, "a/x.txt\ny.txt\n\na:\nx.txt\n");
+
+        let long = cmd_ls(&["-l".to_string(), "ro.txt".to_string()], Some(&d), false).unwrap().stdout;
+        assert!(long.starts_with("-r-") && long.contains(" UTC "), "{long}");
+
+        let mut perms = fs::metadata(&ro).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = fs::set_permissions(&ro, perms);
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -2243,9 +2404,30 @@ mod tests {
         let text: String = (0..20_000).map(|i| format!("line{i}\n")).collect();
         fs::write(&path, text).unwrap();
         assert_eq!(
-            read_head_tail(&path, 2, true).unwrap(),
-            "line19998\nline19999\n"
+            read_head_tail(&path, 2, true).unwrap().as_deref(),
+            Some("line19998\nline19999\n")
         );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn head_and_tail_decode_utf16_whole_and_decline_a_window_that_is_too_small() {
+        let d = tmp("headtail-utf16");
+        let path = d.join("u16.txt");
+        // What PowerShell 5.1 `>` writes: BOM, UTF-16LE, CRLF.
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in "one\r\nt\u{e9}w\u{f6}\r\nthree\r\n".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(read_head_tail(&path, 2, false).unwrap().as_deref(), Some("one\nt\u{e9}w\u{f6}\n"));
+        assert_eq!(read_head_tail(&path, 2, true).unwrap().as_deref(), Some("t\u{e9}w\u{f6}\nthree\n"));
+
+        // One 40 MiB line: neither end fits the 32 MiB window, so the real tool must answer.
+        let big = d.join("big.txt");
+        fs::write(&big, vec![b'x'; 40 * 1024 * 1024]).unwrap();
+        assert_eq!(read_head_tail(&big, 5, true).unwrap(), None);
+        assert_eq!(read_head_tail(&big, 5, false).unwrap(), None);
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -2267,6 +2449,20 @@ mod tests {
         let rm = vec!["-rf".to_string(), "a".to_string(), "moved".to_string()];
         assert_eq!(cmd_rm(&rm, Some(&d)).unwrap().code, 0);
         assert!(!d.join("a").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn mkdir_of_an_existing_folder_fails_with_a_backslash_path_too() {
+        let d = tmp("mkdir-exists");
+        fs::create_dir_all(d.join("sub")).unwrap();
+        for p in ["sub", r".\sub"] {
+            let r = cmd_mkdir(&[p.to_string()], Some(&d)).unwrap();
+            assert_eq!(r.code, 1, "{p}: {}", r.stderr);
+        }
+        // A new nested path with a backslash still makes its parents (cmd's mkdir does).
+        assert_eq!(cmd_mkdir(&[r"p\q".to_string()], Some(&d)).unwrap().code, 0);
+        assert!(d.join("p").join("q").is_dir());
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -2372,6 +2568,28 @@ mod tests {
     }
 
     #[test]
+    fn grep_takes_flags_after_the_pattern_and_skips_binary_misses() {
+        let d = scratch("grep-late");
+        fs::create_dir(d.join("src")).unwrap();
+        fs::write(d.join("src/a.txt"), "Foo /api/users\nbar\n").unwrap();
+        fs::write(d.join("src/blob.bin"), b"\x00\x01\xffzzz").unwrap();
+        let out = |args: &[&str]| run("grep", args, &d).map(|o| (o.code, o.stdout));
+        // Options after the pattern and operands, as GNU permutes them.
+        assert_eq!(out(&["-rn", "foo", "src", "-i"]), Some((0, "src/a.txt:1:Foo /api/users\n".into())));
+        // A pattern with a leading slash is text, an operand with one is a path qx cannot place.
+        assert_eq!(out(&["-r", "/api/users", "src"]), Some((0, "src/a.txt:Foo /api/users\n".into())));
+        assert!(out(&["-r", "api", "/src"]).is_none());
+        // A binary file without the needle is a plain miss; with it, or under -v, the real tool answers.
+        assert_eq!(out(&["-rc", "bar", "src"]), Some((0, "src/a.txt:1\nsrc/blob.bin:0\n".into())));
+        assert!(out(&["-r", "zzz", "src"]).is_none());
+        assert!(out(&["-rv", "bar", "src"]).is_none());
+        assert!(out(&["-r", "é", "src"]).is_none());
+        // A bad second operand declines before anything is walked.
+        assert!(out(&["-r", "bar", "src", "missing"]).is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn grep_context_groups_and_flags_follow_gnu() {
         let d = scratch("grep-ctx");
         fs::write(d.join("a.txt"), "alpha\nbeta\nalpha gamma\n").unwrap();
@@ -2430,7 +2648,10 @@ mod tests {
             "1\n3\n5\n"
         );
         assert!(!try_exec("hostname", &[], None, &[]).unwrap().stdout.trim().is_empty());
-        assert!(!try_exec("whoami", &[], None, &[]).unwrap().stdout.trim().is_empty());
+        let me = try_exec("whoami", &[], None, &[]).unwrap().stdout;
+        // whoami.exe prints `host\user` in lower case; scripts compare that string.
+        assert!(!me.trim().is_empty());
+        assert_eq!(me, me.to_lowercase());
         let rp = try_exec("realpath", &[String::from(".")], None, &[]).unwrap();
         assert_eq!(rp.code, 0);
         assert!(rp.stdout.trim().len() > 1);
@@ -2446,6 +2667,21 @@ mod tests {
     fn run(name: &str, args: &[&str], cwd: &Path) -> Option<BuiltinOut> {
         let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         try_exec(name, &a, Some(cwd), &[])
+    }
+
+    #[test]
+    fn mkdir_touch_and_cp_match_the_tools_they_stand_in_for() {
+        let d = scratch("mkdir-touch-cp");
+        assert_eq!(run("mkdir", &[r"p\q\r"], &d).unwrap().code, 0); // cmd's mkdir makes the parents
+        assert!(d.join("p/q/r").is_dir());
+        assert_eq!(run("mkdir", &["x/y"], &d).unwrap().code, 1); // GNU without -p does not
+        assert!(run("touch", &["p"], &d).is_none()); // a folder goes to the real touch
+        fs::write(d.join("f1"), "x").unwrap();
+        let o = run("cp", &["-r", "p", "f1"], &d).unwrap();
+        assert_eq!(o.code, 1);
+        assert!(o.stderr.contains("cannot overwrite non-directory"), "{}", o.stderr);
+        assert_eq!(fs::read_to_string(d.join("f1")).unwrap(), "x");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -2689,6 +2925,22 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// A range at the top of a file past the read cap is answered from a stream that stops at the range.
+    #[test]
+    fn sed_range_of_a_file_past_the_read_cap_streams_and_stops_early() {
+        let d = scratch("sed-large");
+        let mut big = b"a\nb\nc\nd\n".to_vec();
+        big.resize(READ_CAP as usize + 4096, b'z');
+        fs::write(d.join("large.txt"), &big).unwrap();
+        let t = std::time::Instant::now();
+        let out = run("sed", &["-n", "1,3p", "large.txt"], &d).expect("built-in declined the top of a large file");
+        assert_eq!((out.code, out.stdout.as_str()), (0, "a\nb\nc\n"));
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        // A range that needs more than the cap of one line is still the real tool's.
+        assert!(run("sed", &["-n", "5p", "large.txt"], &d).is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn sed_prints_the_range_the_real_tool_prints() {
         let Some(sed) = real_sed() else {
@@ -2804,6 +3056,11 @@ mod tests {
         let here = Path::new(".");
         assert_eq!(try_exec("Test-Path", &["Cargo.toml".into()], Some(here), &[]).unwrap().stdout, "True\n");
         assert_eq!(try_exec("test-path", &["nope".into(), "-PathType".into(), "Leaf".into()], Some(here), &[]).unwrap().stdout, "False\n");
+        // Provider paths belong to the real PowerShell.
+        for (p, a) in [("test-path", "env:PATH"), ("ls", "env:"), ("cat", "HKCU:\\Software"), ("Get-Content", "env:PATH")] {
+            assert!(try_exec(p, &[a.into()], Some(here), &[]).is_none(), "{p} {a}");
+        }
+        assert!(try_exec("ls", &[here.to_string_lossy().into_owned()], Some(here), &[]).is_some());
         assert_eq!(try_exec("Write-Output", &["a".into(), "b".into()], None, &[]).unwrap().stdout, "a\nb\n");
         assert!(try_exec("Write-Host", &["-NoNewline".into(), "a".into()], None, &[]).is_none());
     }}

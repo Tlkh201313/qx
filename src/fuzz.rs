@@ -230,3 +230,43 @@ fn digest_never_grows_the_output_or_drops_a_buried_failure() {
     }
 }
 
+
+/// Any exit code and several kinds of error line at once: every such line is in the reply, or the reply is
+/// lossy (so the caller spools the full text and says so).
+#[test]
+fn digest_keeps_every_error_line_or_says_it_cut() {
+    let mut r = Rng(0x00D1_6E57_0000_0003);
+    let codes = [1, 2, 101, 124, 127, 255, -1];
+    for round in 0..60 {
+        let total = 120 + r.below(500);
+        let mut out = String::new();
+        let mut err = String::new();
+        let mut wanted: Vec<String> = Vec::new();
+        for i in 0..total {
+            let hit = r.below(total) < 5;
+            let line = match r.below(3) {
+                _ if !hit => format!("progress line {i} ok ok ok ok"),
+                0 => format!("error: zz-{round}-{i} broke"),
+                1 => format!("FAIL\tzz/{round}/{i}\t0.1s"),
+                _ => format!("thread 'zz-{round}-{i}' panicked at src/x.rs:1:1"),
+            };
+            if hit {
+                wanted.push(line.clone());
+            }
+            let sink = if r.below(2) == 0 { &mut out } else { &mut err };
+            sink.push_str(&line);
+            sink.push('\n');
+        }
+        let code = codes[round % codes.len()];
+        for label in LABELS {
+            if let Some(d) = digest::digest(label, &out, &err, code) {
+                if d.lossy() {
+                    continue;
+                }
+                for w in &wanted {
+                    assert!(d.stdout.contains(w.as_str()) || d.stderr.contains(w.as_str()), "{label} (exit {code}): lost `{w}` without saying so");
+                }
+            }
+        }
+    }
+}

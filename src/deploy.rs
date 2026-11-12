@@ -75,6 +75,12 @@ pub fn install(src: &Path, dst: &Path) -> std::io::Result<Installed> {
     if same_path(src, dst) {
         return Ok(Installed::Unchanged);
     }
+    if dst.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "that is a folder: give the path of qx.exe inside it",
+        ));
+    }
     let exists = dst.is_file();
     if exists && same_bytes(src, dst)? {
         return Ok(Installed::Unchanged);
@@ -90,7 +96,13 @@ pub fn install(src: &Path, dst: &Path) -> std::io::Result<Installed> {
         .unwrap_or(0);
     let new = parent.join(format!("{name}.new-{}", std::process::id()));
     // Copy first, so a half-written file can never take the canonical name.
-    std::fs::copy(src, &new)?;
+    if let Err(e) = std::fs::copy(src, &new) {
+        let _ = std::fs::remove_file(&new);
+        return Err(e);
+    }
+    // Siblings from earlier deploys go only now that this one will land: the clients that held
+    // them have exited, and one still holding its file simply fails to delete and stays.
+    sweep_aside(dst);
     let aside = if exists {
         let aside = parent.join(format!("{name}.old-{stamp}"));
         if let Err(e) = std::fs::rename(dst, &aside) {
@@ -108,6 +120,8 @@ pub fn install(src: &Path, dst: &Path) -> std::io::Result<Installed> {
         let _ = std::fs::remove_file(&new);
         return Err(e);
     }
+    // Nothing holds the old copy unless a client runs from it: only then does it stay for the next sweep.
+    let aside = aside.filter(|a| std::fs::remove_file(a).is_err());
     Ok(Installed::Replaced { aside })
 }
 
@@ -116,15 +130,22 @@ pub fn sweep_aside(dst: &Path) -> usize {
     let (Some(parent), Ok(name)) = (dst.parent(), file_name(dst)) else {
         return 0;
     };
-    let prefix = format!("{name}.old-");
+    let (old, new) = (format!("{name}.old-"), format!("{name}.new-"));
     let Ok(entries) = std::fs::read_dir(parent) else {
         return 0;
     };
     let mut removed = 0;
     for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().starts_with(&prefix)
-            && std::fs::remove_file(entry.path()).is_ok()
-        {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        // A `.new-*` file is a copy in progress, unless it is old: then a deploy died while writing it.
+        // Creation time, not mtime: a copy keeps the source's mtime, so another deploy's fresh copy can look old.
+        let stale_new = file.starts_with(&new)
+            && file != format!("{name}.new-{}", std::process::id())
+            && entry
+                .metadata()
+                .and_then(|m| m.created())
+                .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > std::time::Duration::from_secs(600)));
+        if (file.starts_with(&old) || stale_new) && std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }
     }
@@ -176,12 +197,6 @@ pub fn run(args: &[String]) -> i32 {
         }
         return 0;
     }
-    // Siblings from a previous deploy can go now: the clients that held them have exited,
-    // and one still holding its file simply fails to delete and stays.
-    let swept = sweep_aside(&dst);
-    if swept > 0 {
-        println!("qx deploy: removed {swept} previous copy/copies");
-    }
     match install(&src, &dst) {
         Ok(Installed::Unchanged) => {
             println!("qx deploy: up to date ({})", dst.display());
@@ -229,15 +244,32 @@ mod tests {
         assert_eq!(install(&src, &dst).unwrap(), Installed::Unchanged);
 
         std::fs::write(&src, "B").unwrap();
-        match install(&src, &dst).unwrap() {
-            Installed::Replaced { aside: Some(aside) } => {
-                assert_eq!(std::fs::read_to_string(&aside).unwrap(), "A");
-            }
-            other => panic!("expected a replaced install, got {other:?}"),
-        }
+        // Nothing holds the old file, so it is deleted at once.
+        assert_eq!(install(&src, &dst).unwrap(), Installed::Replaced { aside: None });
         assert_eq!(std::fs::read_to_string(&dst).unwrap(), "B");
-        assert_eq!(sweep_aside(&dst), 1);
         assert_eq!(sweep_aside(&dst), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_copies_go_only_when_a_new_build_lands_and_a_failed_copy_leaves_nothing() {
+        let dir = tmp("sweep");
+        let (src, dst) = (dir.join("src.exe"), dir.join("qx.exe"));
+        let stale = dir.join("qx.exe.old-1");
+        std::fs::write(&src, "A").unwrap();
+        std::fs::write(&dst, "A").unwrap();
+        std::fs::write(&stale, "older").unwrap();
+        assert_eq!(install(&src, &dst).unwrap(), Installed::Unchanged);
+        assert!(stale.exists(), "nothing was installed, so nothing is swept");
+        std::fs::write(&src, "B").unwrap();
+        install(&src, &dst).unwrap();
+        assert!(!stale.exists());
+
+        let ghost = dir.join("ghost.exe");
+        let fresh = dir.join("sub").join("qx.exe");
+        assert!(install(&ghost, &fresh).is_err());
+        let leftovers = std::fs::read_dir(dir.join("sub")).unwrap().count();
+        assert_eq!(leftovers, 0, "a failed copy must not leave qx.exe.new-<pid> behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -300,6 +332,68 @@ mod tests {
         assert_eq!(sweep_aside(&dst), 1);
         assert!(!aside.exists());
         assert!(same_bytes(&src, &dst).unwrap(), "the new binary must be in place");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_previous_copy_is_deleted_at_once_when_nothing_holds_it() {
+        let dir = tmp("asidegone");
+        let (src, dst) = (dir.join("src.exe"), dir.join("qx.exe"));
+        std::fs::write(&src, "A").unwrap();
+        std::fs::write(&dst, "old").unwrap();
+        assert_eq!(install(&src, &dst).unwrap(), Installed::Replaced { aside: None });
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "A");
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.iter().all(|n| !n.contains(".old-") && !n.contains(".new-")), "{names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_new_file_from_a_crashed_deploy_is_swept() {
+        let dir = tmp("stalenew");
+        let (src, dst) = (dir.join("src.exe"), dir.join("qx.exe"));
+        let stale = dir.join("qx.exe.new-99999");
+        std::fs::write(&src, "A").unwrap();
+        std::fs::write(&stale, "half").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        use std::os::windows::fs::FileTimesExt;
+        let times = std::fs::FileTimes::new().set_created(old).set_modified(old);
+        std::fs::File::options().write(true).open(&stale).unwrap().set_times(times).unwrap();
+        // Another deploy running now copied an old build: old mtime, fresh creation time. It stays.
+        let racing = dir.join("qx.exe.new-77777");
+        std::fs::write(&racing, "copying").unwrap();
+        std::fs::File::options().write(true).open(&racing).unwrap().set_modified(old).unwrap();
+        // A deploy that is running right now has a fresh file: leave it alone.
+        let fresh = dir.join("qx.exe.new-88888");
+        std::fs::write(&fresh, "writing").unwrap();
+        install(&src, &dst).unwrap();
+        assert!(!stale.exists(), "a crashed deploy's copy must go");
+        assert!(fresh.exists(), "a deploy in progress must not lose its file");
+        assert!(racing.exists(), "nor one copying an old build");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_as_the_destination_gets_a_plain_message() {
+        let dir = tmp("folder");
+        let src = dir.join("src.exe");
+        std::fs::write(&src, "A").unwrap();
+        let err = install(&src, &dir).unwrap_err();
+        assert!(err.to_string().contains("folder"), "{err}");
+        assert_eq!(run(&["--to".into(), dir.to_string_lossy().into_owned()]), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_source_with_an_old_mtime_is_not_swept_as_a_stale_copy() {
+        let dir = tmp("oldsrc");
+        let (src, dst) = (dir.join("src.exe"), dir.join("qx.exe"));
+        std::fs::write(&src, "A").unwrap();
+        std::fs::write(&dst, "old").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&src).unwrap().set_modified(old).unwrap();
+        install(&src, &dst).unwrap();
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "A");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

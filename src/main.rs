@@ -19,6 +19,7 @@ mod python;
 mod redact;
 mod resolve;
 mod setup;
+#[cfg_attr(test, allow(dead_code))] // `mcp::serve` starts it outside tests only
 mod warmup;
 
 use std::io::{IsTerminal, Write};
@@ -105,13 +106,34 @@ fn streams(tty: bool, explicit: Option<bool>, redact: Option<&str>) -> bool {
     explicit.unwrap_or(tty && !matches!(redact, Some("1" | "on")))
 }
 
-fn parse_num(v: Option<&String>, fallback: usize) -> usize {
-    v.and_then(|s| s.parse::<usize>().ok()).unwrap_or(fallback)
+/// The number after a flag. `--timeout` (`secs`) also takes `30s`, `5m` and `1h`. A missing or bad value
+/// is an error: a silent default would turn `--timeout 5m` into 120 s and `--timeout --raw` into a swallowed flag.
+fn flag_num(flag: &str, v: Option<&String>, secs: bool) -> Result<u64, String> {
+    let what = if secs { "a number of seconds (or 30s, 5m, 1h)" } else { "a whole number" };
+    let Some(v) = v.filter(|v| !v.starts_with("--")) else {
+        return Err(format!("{flag} needs {what}"));
+    };
+    let (num, scale) = match v.char_indices().last() {
+        Some((i, 's')) if secs => (&v[..i], 1),
+        Some((i, 'm')) if secs => (&v[..i], 60),
+        Some((i, 'h')) if secs => (&v[..i], 3600),
+        _ => (v.as_str(), 1),
+    };
+    num.parse::<u64>().ok().and_then(|n| n.checked_mul(scale)).ok_or_else(|| format!("{flag} needs {what} (got '{v}')"))
+}
+
+/// Seconds left until `deadline` (unix seconds): what a stage of a chained line may still use.
+fn secs_until(deadline: u64) -> u64 {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    deadline.saturating_sub(now)
 }
 
 fn run_cli(args: &[String], force_raw: bool) -> i32 {
     let mut o = RunOpts::default();
     // `echo data | qx grep x`: the command reads qx's stdin. At a terminal it already does.
+    // Not in tests: they share one process, and a test run's stdin is never a terminal, so this
+    // would switch off the parked PowerShell (which refuses a call that reads stdin) for every test.
+    #[cfg(not(test))]
     exec::INHERIT_STDIN.store(!std::io::stdin().is_terminal(), std::sync::atomic::Ordering::Relaxed);
     let tty = o.stream;
     let mut explicit_stream: Option<bool> = None;
@@ -122,6 +144,7 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
 
     let mut i = 0usize;
     let mut shell_cmd: Option<String> = None;
+    let mut deadline: Option<u64> = None;
 
     while i < args.len() {
         let a = args[i].as_str();
@@ -146,27 +169,29 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
                 o.compact = true;
                 i += 1;
             }
-            "--max-lines" => {
+            "--max-lines" | "--head" | "--tail" | "--timeout" | "--deadline" => {
                 i += 1;
-                o.max_lines = parse_num(args.get(i), o.max_lines);
-                o.limited = true;
-                i += 1;
-            }
-            "--head" => {
-                i += 1;
-                o.head = parse_num(args.get(i), o.head);
-                o.limited = true;
-                i += 1;
-            }
-            "--tail" => {
-                i += 1;
-                o.tail = parse_num(args.get(i), o.tail);
-                o.limited = true;
-                i += 1;
-            }
-            "--timeout" => {
-                i += 1;
-                o.timeout = Some(Duration::from_secs(parse_num(args.get(i), 120) as u64));
+                let n = match flag_num(a, args.get(i), a == "--timeout") {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("qx: {e}");
+                        return 2;
+                    }
+                };
+                match a {
+                    "--timeout" => o.timeout = Some(Duration::from_secs(n)),
+                    // The hook gives every stage of a chained line the same end time (unix seconds).
+                    "--deadline" => deadline = Some(n),
+                    _ => {
+                        let n = usize::try_from(n).unwrap_or(usize::MAX);
+                        match a {
+                            "--max-lines" => o.max_lines = n,
+                            "--head" => o.head = n,
+                            _ => o.tail = n,
+                        }
+                        o.limited = true;
+                    }
+                }
                 i += 1;
             }
             "--cwd" => {
@@ -197,6 +222,10 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
         }
     }
 
+    if let Some(d) = deadline {
+        let left = Duration::from_secs(secs_until(d));
+        o.timeout = Some(o.timeout.map_or(left, |t| t.min(left)));
+    }
     o.stream = streams(tty, explicit_stream, std::env::var("QX_REDACT").ok().as_deref());
     if shell_cmd.is_some() && i < args.len() {
         eprintln!("qx: unexpected arguments after -c: {} (put them inside the quoted command)", args[i..].join(" "));
@@ -250,8 +279,8 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
             if std::env::var_os("QX_TRACE").is_some() {
                 eprintln!("[trace] split: {prog:?} {sargs:?}");
             }
-            if let Some(b) = builtin::try_exec(&prog, &sargs, o.cwd.as_deref(), &envs) {
-                return emit(b.into(), &o, &sh);
+            if let Some(out) = run_builtin(&prog, &sargs, &envs, &o) {
+                return emit(out, &o, &sh);
             }
             if let Some(code) = direct_exec(&prog, &sargs, &envs, &o, &sh) {
                 return code;
@@ -262,7 +291,7 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
                 return execute(vec![c], &o, &sh);
             }
         }
-        match exec::build_shell(&run, &o.shell) {
+        match exec::build_shell_in(&run, &o.shell, o.cwd.as_deref()) {
             Ok(mut c) => {
                 exec::apply_envs(&mut c, &envs);
                 (c, sh)
@@ -284,8 +313,8 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
             return code;
         }
         let full_env: Vec<(String, String)> = if o.compact { Vec::new() } else { vec![("QX_LS_FULL".into(), "1".into())] };
-        if let Some(b) = builtin::try_exec(program, rest, o.cwd.as_deref(), &full_env) {
-            return emit(b.into(), &o, &label);
+        if let Some(out) = run_builtin(program, rest, &full_env, &o) {
+            return emit(out, &o, &label);
         }
         match exec::build_command_at(program, rest, o.cwd.as_deref()) {
             Ok(c) => (c, label),
@@ -298,6 +327,21 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
 
     exec::apply_cwd(&mut cmd, &o.cwd);
     execute(vec![cmd], &o, &label)
+}
+
+/// A built-in runs in this process, so `--timeout` is its deadline too (a child is killed by it).
+fn run_builtin(program: &str, args: &[String], envs: &[(String, String)], o: &RunOpts) -> Option<exec::Outcome> {
+    exec::set_deadline(o.timeout.map(|t| Instant::now() + t));
+    let b = builtin::try_exec(program, args, o.cwd.as_deref(), envs);
+    let stopped = exec::should_stop();
+    exec::set_deadline(None);
+    let mut out: exec::Outcome = b?.into();
+    // A built-in that finished its work right at the deadline did the work: it is reported done.
+    if stopped && out.code != 0 {
+        out.timed_out = true;
+        out.code = 124;
+    }
+    Some(out)
 }
 
 /// `npm run/test/start` and local-bin `npx` without npm's ~100 ms CLI startup.
@@ -419,7 +463,8 @@ fn emit(out: exec::Outcome, o: &RunOpts, label: &str) -> i32 {
             // unless the caller asked for a cut with --max-lines, --head or --tail.
             None if !o.limited && claude_shows_whole(so.len() + se.len()) => (std::mem::take(&mut so), std::mem::take(&mut se), false, ""),
             None => {
-                let (a, cut) = compact::compact(&so, o.max_lines, o.head, o.tail);
+                let (max, head, tail) = if o.limited { (o.max_lines, o.head, o.tail) } else { digest::plain_budget(label, (o.max_lines, o.head, o.tail)) };
+                let (a, cut) = compact::compact(&so, max, head, tail);
                 let (b, cut_err) = compact::compact(&se, o.max_lines.min(120), o.head.min(50), o.tail.min(40));
                 (a, b, cut | cut_err, "")
             }
@@ -691,7 +736,8 @@ FLAGS
   --max-lines N       compaction threshold (default 200)
   --head N            lines kept at the start (default 80)
   --tail N            lines kept at the end (default 60)
-  --timeout SECS      kill after N seconds
+  --timeout SECS      kill after N seconds (30, 30s, 5m, 1h)
+  --deadline EPOCH    kill at this unix time (the hook shares one end time across a chained line)
   --cwd DIR           working directory
   --shell cmd|bash|powershell    shell for -c (default auto: cmdlet or $variable
                                  syntax -> powershell, a POSIX utility in a pipeline
@@ -707,8 +753,11 @@ SAFETY GATE
   QX_NODE_CACHE=off          disable Node's compile cache
   QX_PYTHON_FAST=1|off       default skips startup hooks keeping system certs; 1 drops certs (fastest), off disables
   QX_PS_PROFILE=1            keep the PowerShell profile (qx adds -NoProfile by default)
-  QX_MCP_WORKERS=N           parallel MCP tool calls (default 4)
-  QX_FS_THREADS=N            fs grep scan threads (default CPUs/2, max 8)
+  QX_MCP_WORKERS=N           parallel MCP processes (default 8, max 32)
+  QX_MCP_QUEUE=N             calls allowed to wait for a slot (default 64, max 1024)
+  QX_WARM=off                no startup warm-up; QX_PS_WARM=off: no parked PowerShell
+  QX_INDEX=off               no workspace file index for fs glob/grep
+  QX_FS_THREADS=N            fs grep scan threads (default CPUs/2 up to 8; max 32)
   QX_TRACE=1                 print phase timings and the -c split to stderr
 
 BUILT-INS (no process spawn)
@@ -717,6 +766,7 @@ BUILT-INS (no process spawn)
   mkdir rm del erase cp copy mv move touch
   which basename dirname realpath
   whoami hostname seq
+  start-sleep get-content gc test-path write-output write-host (PowerShell spellings)
   grep takes literal patterns, -i -n -l -r -v -q -c -A/-B/-C -F -e PAT; else the real grep.
   sed answers sed -n 'A,Bp' line ranges; `where` is always the real where.exe.
   head -c N / tail -c N read one byte window when it is text; binary runs the real tool.
@@ -736,6 +786,7 @@ EXAMPLES
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
@@ -748,6 +799,58 @@ mod tests {
         assert_eq!(run_cli(&s(&["--capture", "-c", "exit 3", "--cwd", &missing.to_string_lossy()]), false), 2);
         assert_eq!(run_cli(&s(&["--capture", "-c", "exit 0", "stray"]), false), 2);
         assert_eq!(run_cli(&s(&["--capture", "-c", "exit 3"]), false), 3);
+    }
+
+    #[test]
+    fn a_bad_flag_number_is_an_error_not_a_default() {
+        let n = |flag: &str, v: &str, secs| flag_num(flag, Some(&v.to_string()), secs);
+        assert_eq!(n("--timeout", "30", true), Ok(30));
+        assert_eq!(n("--timeout", "30s", true), Ok(30));
+        assert_eq!(n("--timeout", "5m", true), Ok(300));
+        assert_eq!(n("--timeout", "1h", true), Ok(3600));
+        assert_eq!(n("--head", "20", false), Ok(20));
+        for (flag, v, secs) in [("--timeout", "0.5", true), ("--timeout", "abc", true), ("--head", "5m", false), ("--head", "-1", false)] {
+            let e = n(flag, v, secs).unwrap_err();
+            assert!(e.starts_with(flag) && e.contains(&format!("got '{v}'")), "{e}");
+        }
+        assert!(flag_num("--timeout", None, true).unwrap_err().contains("needs a number of seconds"));
+        // `--timeout --raw cmd` must not swallow --raw as the number.
+        assert!(flag_num("--timeout", Some(&"--raw".to_string()), true).is_err());
+        // Through the command line: exit 2 before anything runs; the accepted forms still run.
+        for bad in [&["--timeout", "0.5"][..], &["--timeout", "--raw"], &["--head"], &["--tail", "x"], &["--deadline", "soon"]] {
+            let mut a = s(bad);
+            a.extend(s(&["--capture", "-c", "exit 3"]));
+            assert_eq!(run_cli(&a, false), 2, "{bad:?}");
+        }
+        assert_eq!(run_cli(&s(&["--capture", "--timeout", "5m", "-c", "exit 3"]), false), 3);
+    }
+
+    #[test]
+    fn a_deadline_cuts_a_command_short_and_a_past_one_stops_it_at_once() {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let t = std::time::Instant::now();
+        let code = run_cli(&s(&["--capture", "--deadline", &(now + 2).to_string(), "ping", "-n", "9", "127.0.0.1"]), false);
+        assert_eq!(code, 124);
+        assert!(t.elapsed().as_secs() < 6, "{:?}", t.elapsed());
+        assert_eq!(secs_until(0), 0);
+        assert_eq!(run_cli(&s(&["--capture", "--deadline", "1", "-c", "exit 0"]), false), 124);
+        // Plenty of time left: the command runs as before.
+        assert_eq!(run_cli(&s(&["--capture", "--deadline", &(now + 600).to_string(), "-c", "exit 3"]), false), 3);
+    }
+
+    #[test]
+    fn a_builtin_run_from_the_command_line_stops_at_the_timeout_flag() {
+        let d = std::env::temp_dir().join("qx-cli-builtin-timeout-test");
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("a")).unwrap();
+        fs::write(d.join("a").join("f"), "x").unwrap();
+        let cwd = d.to_string_lossy().to_string();
+        assert_eq!(run_cli(&s(&["--capture", "--cwd", &cwd, "cp", "-r", "a", "kept"]), false), 0);
+        assert!(d.join("kept").join("f").exists());
+        // A timeout already over: the copy stops before it starts instead of running without a limit.
+        assert_eq!(run_cli(&s(&["--capture", "--timeout", "0", "--cwd", &cwd, "cp", "-r", "a", "never"]), false), 124);
+        assert!(!d.join("never").join("f").exists());
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

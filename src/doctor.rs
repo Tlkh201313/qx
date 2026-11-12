@@ -110,8 +110,8 @@ pub fn run() -> i32 {
         Some("strict") => "strict",
         _ => "safe",
     };
-    println!("[guard] {guard_mode} — deny catastrophic, warn risky, audit to %LOCALAPPDATA%\\qx\\audit.jsonl");
-    println!("[redact] on for captured/MCP output (QX_REDACT=off disables)");
+    println!("[guard] this shell: {guard_mode} (each client uses its own QX_GUARD) — deny catastrophic, warn risky, audit to %LOCALAPPDATA%\\qx\\audit.jsonl");
+    println!("[redact] on for command output, captured and MCP (QX_REDACT=off disables); fs returns files as written");
 
     // 5. Python startup. Site-packages `.pth` hooks run on every launch.
     python_startup();
@@ -205,7 +205,7 @@ fn clients_section() {
             .unwrap_or_else(|| "-".to_string());
         let command = status.command.clone();
         let same = match (&command, &canonical) {
-            (Some(c), Some(expected)) => Path::new(c) == expected.as_path(),
+            (Some(c), Some(expected)) => crate::setup::same_path(c, expected),
             (Some(_), None) => true,
             (None, _) => false,
         };

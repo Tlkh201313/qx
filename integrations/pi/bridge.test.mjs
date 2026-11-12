@@ -1,5 +1,9 @@
 // Run: node integrations/pi/bridge.test.mjs   (no qx binary needed)
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { QxBridge } from "./qx/bridge.js";
 
 const within = (ms, promise, what) =>
@@ -46,6 +50,125 @@ process.on("uncaughtException", (error) => {
   assert.equal(failures.length, 0, "a stale child's event must not fail the current one");
   bridge.failFrom(fresh, new Error("current child died"));
   assert.equal(failures.length, 1);
+}
+
+// A child that starts and never answers. The bridge runs `<exe> mcp`, so with node as the exe
+// `mcp` is a script path in the current folder. It reads stdin and quits when the pipe closes,
+// so a failed run never leaves it behind.
+const silentDir = mkdtempSync(join(tmpdir(), "qx-pi-silent-"));
+writeFileSync(
+  join(silentDir, "mcp"),
+  "process.stdin.resume();\nprocess.stdin.on('end', () => process.exit(0));\nprocess.stdin.on('error', () => process.exit(0));\nsetTimeout(() => process.exit(0), 60000);\n",
+);
+const silentBridge = () => {
+  const bridge = new QxBridge(process.execPath);
+  const home = process.cwd();
+  process.chdir(silentDir);
+  return {
+    bridge,
+    // spawn runs synchronously inside call(), so the folder can go back at once.
+    call(signal) {
+      try {
+        return bridge.call("run", { program: "pwd" }, signal);
+      } finally {
+        process.chdir(home);
+      }
+    },
+  };
+};
+const exited = (child) =>
+  new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) resolve();
+    else child.once("exit", resolve);
+  });
+
+try {
+  // 4. A qx that never answers initialize fails the call after the start timeout and is killed.
+  {
+    const { bridge, call } = silentBridge();
+    bridge.startTimeoutMs = 300;
+    try {
+      const pending = call();
+      const child = bridge.child;
+      await within(3000, assert.rejects(pending, /initialize/), "start timeout");
+      await within(3000, exited(child), "silent child killed after the start timeout");
+      assert.equal(bridge.ready, null, "the next call must start a fresh child");
+    } finally {
+      bridge.close();
+    }
+  }
+
+  // 5. An abort while qx is still starting fails that call at once.
+  {
+    const { bridge, call } = silentBridge();
+    const controller = new AbortController();
+    try {
+      const pending = call(controller.signal);
+      setTimeout(() => controller.abort(), 200);
+      await within(2000, assert.rejects(pending, /aborted/), "abort during start");
+    } finally {
+      bridge.close();
+    }
+  }
+} finally {
+  try {
+    rmSync(silentDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch {}
+}
+
+// 6. Finished calls leave no abort listener behind, so a later abort cancels nothing they did.
+{
+  const bridge = new QxBridge("unused");
+  const sent = [];
+  bridge.ready = Promise.resolve();
+  bridge.child = {
+    killed: false,
+    stdin: {
+      writable: true,
+      write(line) {
+        const message = JSON.parse(line);
+        sent.push(message);
+        if (message.id === undefined) return;
+        // Every third call fails, so the error path is covered too.
+        const reply =
+          message.id % 3 === 0
+            ? { jsonrpc: "2.0", id: message.id, error: { message: "no" } }
+            : { jsonrpc: "2.0", id: message.id, result: { content: [] } };
+        setImmediate(() => bridge.onData(`${JSON.stringify(reply)}\n`));
+      },
+    },
+  };
+  const controller = new AbortController();
+  const calls = [];
+  for (let i = 0; i < 200; i++) {
+    calls.push(bridge.call("run", { program: "pwd" }, controller.signal));
+  }
+  const settled = await within(5000, Promise.allSettled(calls), "200 calls");
+  assert.ok(settled.some((s) => s.status === "rejected"), "the error replies must reject");
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0, "abort listeners left behind");
+  controller.abort();
+  const cancelled = sent.filter((m) => m.method === "notifications/cancelled");
+  assert.equal(cancelled.length, 0, "an abort after the replies must cancel nothing");
+}
+
+// 7. An abort while a call runs still cancels it in qx and rejects it.
+{
+  const bridge = new QxBridge("unused");
+  const sent = [];
+  bridge.ready = Promise.resolve();
+  bridge.child = {
+    killed: false,
+    stdin: { writable: true, write: (line) => sent.push(JSON.parse(line)) },
+  };
+  const controller = new AbortController();
+  const pending = bridge.call("run", { program: "pwd" }, controller.signal);
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  await within(1000, assert.rejects(pending, /aborted/), "abort of a running call");
+  const request = sent.find((m) => m.method === "tools/call");
+  const cancel = sent.find((m) => m.method === "notifications/cancelled");
+  assert.equal(cancel?.params?.requestId, request.id);
+  assert.equal(bridge.pending.size, 0);
 }
 
 console.log("bridge ok");

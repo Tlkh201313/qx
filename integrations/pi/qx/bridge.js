@@ -18,6 +18,8 @@ export class QxBridge {
     this.pending = new Map();
     this.buffer = "";
     this.ready = null;
+    // A qx that starts but never answers initialize is killed after this long.
+    this.startTimeoutMs = 10_000;
   }
 
   start() {
@@ -42,6 +44,14 @@ export class QxBridge {
     child.stdin.on("error", (error) => this.failFrom(child, error));
     child.on("error", (error) => this.failFrom(child, error));
     child.on("exit", () => this.failFrom(child, new Error("qx exited")));
+    const timer = setTimeout(() => {
+      this.failFrom(child, new Error(`qx did not answer initialize within ${this.startTimeoutMs} ms`));
+      try {
+        child.kill();
+      } catch {
+        // already dead
+      }
+    }, this.startTimeoutMs);
     this.ready = this.request("initialize", {
       protocolVersion: PROTOCOL,
       capabilities: {},
@@ -53,7 +63,8 @@ export class QxBridge {
       .catch((error) => {
         this.ready = null;
         throw error;
-      });
+      })
+      .finally(() => clearTimeout(timer));
     return this.ready;
   }
 
@@ -112,32 +123,36 @@ export class QxBridge {
   }
 
   request(method, params, signal) {
+    if (signal?.aborted) return Promise.reject(new Error("aborted"));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      // Only a request still waiting is cancelled in qx.
+      const onAbort = () => {
+        const entry = this.pending.get(id);
+        if (!entry) return;
+        this.pending.delete(id);
+        this.notify("notifications/cancelled", { requestId: id, reason: "aborted" });
+        entry.reject(new Error("aborted"));
+      };
+      // The listener goes with the reply, the error or the abort, so a long-lived signal
+      // does not collect one per call.
+      const settle = (finish) => (value) => {
+        signal?.removeEventListener("abort", onAbort);
+        finish(value);
+      };
+      this.pending.set(id, { resolve: settle(resolve), reject: settle(reject) });
+      signal?.addEventListener("abort", onAbort, { once: true });
       try {
         this.send({ jsonrpc: "2.0", id, method, params });
       } catch (error) {
         this.pending.delete(id);
-        reject(error);
-        return;
+        settle(reject)(error);
       }
-      if (!signal) return;
-      const onAbort = () => {
-        this.notify("notifications/cancelled", { requestId: id, reason: "aborted" });
-        const entry = this.pending.get(id);
-        if (entry) {
-          this.pending.delete(id);
-          entry.reject(new Error("aborted"));
-        }
-      };
-      if (signal.aborted) onAbort();
-      else signal.addEventListener("abort", onAbort, { once: true });
     });
   }
 
   async call(tool, args, signal) {
-    await this.start();
+    await untilAborted(this.start(), signal);
     const result = await this.request("tools/call", { name: tool, arguments: args }, signal);
     const content = Array.isArray(result?.content) ? result.content : [];
     const text = content
@@ -167,4 +182,15 @@ export class QxBridge {
       // already dead
     }
   }
+}
+
+/** `promise`, or a rejection as soon as `signal` aborts; the start it waits on goes on for other calls. */
+function untilAborted(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(new Error("aborted"));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(new Error("aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
 }
