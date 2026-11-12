@@ -1629,8 +1629,11 @@ fn cmd_mkdir(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     for p in paths {
         let path = path_of(cwd, p);
         // A `\` path only reaches here from a cmd line (bash eats it), and cmd's mkdir makes the parents.
-        let res = if parents || p.contains('\\') {
+        let res = if parents {
             fs::create_dir_all(&path)
+        } else if p.contains('\\') {
+            // ... but an existing folder is an error there, as in `mkdir` without `-p`.
+            if path.exists() { fs::create_dir(&path) } else { fs::create_dir_all(&path) }
         } else {
             fs::create_dir(&path)
         };
@@ -2446,6 +2449,20 @@ mod tests {
         let rm = vec!["-rf".to_string(), "a".to_string(), "moved".to_string()];
         assert_eq!(cmd_rm(&rm, Some(&d)).unwrap().code, 0);
         assert!(!d.join("a").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn mkdir_of_an_existing_folder_fails_with_a_backslash_path_too() {
+        let d = tmp("mkdir-exists");
+        fs::create_dir_all(d.join("sub")).unwrap();
+        for p in ["sub", r".\sub"] {
+            let r = cmd_mkdir(&[p.to_string()], Some(&d)).unwrap();
+            assert_eq!(r.code, 1, "{p}: {}", r.stderr);
+        }
+        // A new nested path with a backslash still makes its parents (cmd's mkdir does).
+        assert_eq!(cmd_mkdir(&[r"p\q".to_string()], Some(&d)).unwrap().code, 0);
+        assert!(d.join("p").join("q").is_dir());
         let _ = fs::remove_dir_all(&d);
     }
 

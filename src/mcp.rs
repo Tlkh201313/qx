@@ -608,6 +608,8 @@ fn soft_ms() -> u64 {
 const JOB_MAX_MS: u64 = 3_600_000;
 /// Live background jobs; below the process slots so a few jobs never starve ordinary commands.
 const MAX_LIVE_JOBS: usize = 6;
+/// A finished job stays pollable this long after its result was first reported.
+const JOB_GRACE_MS: u64 = 30_000;
 
 type RunResult = Result<(exec::Outcome, &'static str), String>;
 
@@ -633,6 +635,9 @@ struct JobRec {
     progress: Arc<Mutex<Option<Arc<exec::Progress>>>>,
     result: Mutex<Option<RunResult>>,
     cv: std::sync::Condvar,
+    /// When a poll first reported the result: a second poll (a retry, a parallel call) still gets it until
+    /// `JOB_GRACE_MS` later, then the job is forgotten.
+    reported: Mutex<Option<std::time::Instant>>,
 }
 
 static JOBS: Mutex<Vec<Arc<JobRec>>> = Mutex::new(Vec::new());
@@ -690,6 +695,7 @@ fn spawn_runner(ctx: RunCtx, work: impl FnOnce() -> RunResult + Send + 'static) 
         progress: Arc::new(Mutex::new(None)),
         result: Mutex::new(None),
         cv: std::sync::Condvar::new(),
+        reported: Mutex::new(None),
     });
     let r = rec.clone();
     let spawned = std::thread::Builder::new().name("qx-run".into()).spawn(move || {
@@ -710,6 +716,7 @@ fn spawn_runner(ctx: RunCtx, work: impl FnOnce() -> RunResult + Send + 'static) 
 /// Make `rec` pollable. False when too many jobs are alive already.
 fn register_job(rec: &Arc<JobRec>) -> bool {
     let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+    sweep_reported(&mut jobs);
     // Results nobody fetched are dropped oldest first, so the list cannot grow without bound.
     while jobs.iter().filter(|j| j.done()).count() > 16 {
         if let Some(i) = jobs.iter().position(|j| j.done()) {
@@ -725,12 +732,16 @@ fn register_job(rec: &Arc<JobRec>) -> bool {
     true
 }
 
-fn find_job(id: &str) -> Option<Arc<JobRec>> {
-    JOBS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|j| j.id() == id).cloned()
+/// Drop jobs whose result was reported more than `JOB_GRACE_MS` ago. Called with the list locked.
+fn sweep_reported(jobs: &mut Vec<Arc<JobRec>>) {
+    let grace = Duration::from_millis(JOB_GRACE_MS);
+    jobs.retain(|j| j.reported.lock().unwrap_or_else(|e| e.into_inner()).is_none_or(|t| t.elapsed() < grace));
 }
 
-fn forget_job(id: &str) {
-    JOBS.lock().unwrap_or_else(|e| e.into_inner()).retain(|j| j.id() != id);
+fn find_job(id: &str) -> Option<Arc<JobRec>> {
+    let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+    sweep_reported(&mut jobs);
+    jobs.iter().find(|j| j.id() == id).cloned()
 }
 
 /// The client is gone: stop every background job too.
@@ -794,7 +805,8 @@ fn running_reply(id: Option<Value>, rec: &JobRec, headline: &str) -> Value {
 fn job_call(id: Option<Value>, job: &str, wait_ms: u64, kill: bool) -> Value {
     let call = Inflight::begin(&id);
     if job == "list" {
-        let jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+        sweep_reported(&mut jobs);
         if jobs.is_empty() {
             return tool_text(id, "[qx] no background jobs", false);
         }
@@ -828,7 +840,7 @@ fn job_call(id: Option<Value>, job: &str, wait_ms: u64, kill: bool) -> Value {
     };
     match rec.wait(until, &call, kill) {
         Some(mut res) => {
-            forget_job(job);
+            rec.reported.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(std::time::Instant::now);
             if stopping {
                 if let Ok((o, _)) = &mut res {
                     o.timed_out = false;
@@ -897,6 +909,8 @@ fn flag_arg(args: &Value, keys: &[&str]) -> bool {
 const RUN_KEYS: &[&str] = &[
     "program", "args", "command", "shell", "cwd", "workdir", "env", "timeout_ms", "timeoutMs", "kill_on_timeout", "mode",
     "background", "run_in_background", "job", "wait_ms", "kill",
+    // Other agents' shell tools carry it; a note about the command, harmless to ignore.
+    "description",
 ];
 
 /// `env`: an object of strings. A name with `=` or nothing in it cannot be an environment variable.
@@ -2020,6 +2034,9 @@ mod tests {
         // A typo used to run the command in the wrong place, in silence.
         let (bad, out) = said(json!({"program":"echo","args":["x"],"cwdd":"."}));
         assert!(bad && out.contains("cwdd") && out.contains("cwd") && out.contains("timeout_ms"), "{out}");
+        // Other agents' shell tools pass `description`; it is ignored, not an error.
+        let (bad, out) = said(json!({"program":"cmd","args":["/c","echo","hi"],"description":"say hi"}));
+        assert!(!bad && out.contains("hi"), "{out}");
         for env in [json!("A=1"), json!({"A":1}), json!({"A=B":"x"}), json!({"":"x"})] {
             let (bad, out) = said(json!({"program":"echo","args":["x"],"env":env}));
             assert!(bad && out.contains("env"), "{env}: {out}");
@@ -2058,6 +2075,24 @@ mod tests {
         let r = run(json!({"job":job,"wait_ms":8000}));
         assert_eq!(r.pointer("/result/structuredContent/exit_code"), Some(&json!(0)), "{r}");
         assert!(r.pointer("/result/structuredContent/timed_out").is_none(), "{r}");
+    }
+
+    #[test]
+    fn a_second_poll_of_a_finished_job_still_gets_the_result() {
+        let _server = server_lock();
+        let run = |args: Value| client::scoped(Client::Dsh, || call(args));
+        let r = run(json!({"program":"sleep","args":["1"],"background":true}));
+        let job = r
+            .pointer("/result/structuredContent/job")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("a job handle, got {r}"))
+            .to_string();
+        let first = run(json!({"job":job,"wait_ms":8000}));
+        assert_eq!(first.pointer("/result/structuredContent/exit_code"), Some(&json!(0)), "{first}");
+        // Used to answer "no job j1; known: none": the first report forgot the job at once.
+        let second = run(json!({"job":job,"wait_ms":8000}));
+        assert_eq!(second.pointer("/result/structuredContent/exit_code"), Some(&json!(0)), "{second}");
+        assert_ne!(second.pointer("/result/isError"), Some(&json!(true)), "{second}");
     }
 
     #[test]

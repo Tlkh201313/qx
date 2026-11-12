@@ -488,10 +488,13 @@ pub fn prune_dsh_binaries(dsh_home: &Path) -> Vec<String> {
     removed
 }
 
-/// `qx.exe`, or `qx` + a separator + anything + `.exe` (`qx-1a2b.exe`): not `qxl-viewer.exe`.
+/// `qx.exe`, or `qx` + a separator + a hex build id (`qx-1a2b3c4d5e6f.exe`): not `qxl-viewer.exe`, `qx-lint.exe`.
 fn is_qx_build(lower_name: &str) -> bool {
     let Some(stem) = lower_name.strip_suffix(".exe") else { return false };
-    stem == "qx" || stem.strip_prefix("qx").is_some_and(|r| r.starts_with(|c: char| !c.is_ascii_alphanumeric()))
+    stem == "qx"
+        || stem.strip_prefix("qx").and_then(|r| r.strip_prefix(|c: char| !c.is_ascii_alphanumeric())).is_some_and(|id| {
+            id.len() >= 6 && id.bytes().all(|b| b.is_ascii_hexdigit())
+        })
 }
 
 fn dsh_references(dsh_home: &Path) -> Vec<String> {
@@ -733,17 +736,17 @@ mod tests {
         let root = std::env::temp_dir().join(format!("qx-dshbin-{}", std::process::id()));
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        for name in ["qx.exe", "qx-aaa.exe", "qx-bbb.exe"] {
+        for name in ["qx.exe", "qx-aaaaaa.exe", "qx-bbbbbb.exe"] {
             std::fs::write(bin.join(name), "x").unwrap();
         }
         std::fs::write(
             root.join("cordis.patch.yml"),
-            "        command: 'C:/q/.dsh/bin/qx-bbb.exe'\n",
+            "        command: 'C:/q/.dsh/bin/qx-bbbbbb.exe'\n",
         )
         .unwrap();
         assert_eq!(prune_dsh_binaries(&root).len(), 2);
-        assert!(bin.join("qx-bbb.exe").is_file());
-        assert!(!bin.join("qx-aaa.exe").exists());
+        assert!(bin.join("qx-bbbbbb.exe").is_file());
+        assert!(!bin.join("qx-aaaaaa.exe").exists());
         assert!(!bin.join("qx.exe").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -754,17 +757,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        for name in ["qx.exe", "qx-aaa.exe", "qx_1.exe", "qxl-viewer.exe", "QXtool.exe", "qx-keep.txt"] {
+        for name in ["qx.exe", "qx-0a1b2c3d4e5f.exe", "qx_1a2b3c.exe", "qxl-viewer.exe", "QXtool.exe", "qx-keep.txt", "qx-lint.exe", "qx-cache.exe"] {
             std::fs::write(bin.join(name), "x").unwrap();
         }
         std::fs::write(root.join("cordis.patch.yml"), "# nothing references a copy\n").unwrap();
         let mut removed = prune_dsh_binaries(&root);
         removed.sort();
-        assert_eq!(removed, ["qx-aaa.exe", "qx.exe", "qx_1.exe"]);
-        for spared in ["qxl-viewer.exe", "QXtool.exe", "qx-keep.txt"] {
+        assert_eq!(removed, ["qx-0a1b2c3d4e5f.exe", "qx.exe", "qx_1a2b3c.exe"]);
+        for spared in ["qxl-viewer.exe", "QXtool.exe", "qx-keep.txt", "qx-lint.exe", "qx-cache.exe"] {
             assert!(bin.join(spared).is_file(), "{spared} is not a qx build and must stay");
         }
-        for gone in ["qx.exe", "qx-aaa.exe", "qx_1.exe"] {
+        for gone in ["qx.exe", "qx-0a1b2c3d4e5f.exe", "qx_1a2b3c.exe"] {
             assert!(!bin.join(gone).exists(), "{gone} is an unreferenced qx copy");
         }
         let _ = std::fs::remove_dir_all(&root);

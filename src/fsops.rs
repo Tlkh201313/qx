@@ -1793,17 +1793,12 @@ fn carry_over_encoding<'a>(before: &[u8], content: &'a str) -> Result<std::borro
 fn glob(root: &Root, args: &Value) -> Result<Reply, FsError> {
     let pattern = req_str(args, "pattern")?;
     let reply = glob_once(root, args, pattern)?;
-    // `app/[id]/*.tsx` names a folder called `[id]`, which as a pattern is a one-letter class. When
-    // that finds nothing, the brackets of the folder part are tried as plain characters.
-    if reply.structured["count"] == 0 {
-        if let Some((dirs, file)) = pattern.rsplit_once('/') {
-            if dirs.contains('[') {
-                let literal = format!("{}/{file}", dirs.replace('[', "[[]"));
-                let retry = glob_once(root, args, &literal)?;
-                if retry.structured["count"] != 0 {
-                    return Ok(retry);
-                }
-            }
+    // `app/[id]/*.tsx` and `pages/[id].tsx` name a folder or file called `[id]`, which as a pattern is a
+    // one-letter class. When that finds nothing, every bracket is tried as a plain character.
+    if reply.structured["count"] == 0 && pattern.contains('[') {
+        let retry = glob_once(root, args, &pattern.replace('[', "[[]"))?;
+        if retry.structured["count"] != 0 {
+            return Ok(retry);
         }
     }
     Ok(reply)
@@ -5111,6 +5106,13 @@ mod tests {
         fs::write(dir.join("app/i/x.tsx"), "").unwrap();
         let r = invoke(&dir, "glob", json!({"pattern":"app/[id]/*.tsx"}));
         assert!(r.text.contains("app/i/x.tsx") && !r.text.contains("page.tsx"), "{}", r.text);
+        // A file called `[id].tsx`, with and without a folder part.
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::write(dir.join("pages/[id].tsx"), "").unwrap();
+        for pat in ["pages/[id].tsx", "**/[id].tsx", "[id].tsx"] {
+            let r = invoke(&dir.join(if pat == "[id].tsx" { "pages" } else { "." }), "glob", json!({"pattern": pat}));
+            assert_eq!(r.structured["count"], 1, "{pat}: {}", r.text);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

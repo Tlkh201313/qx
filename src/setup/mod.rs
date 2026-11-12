@@ -437,8 +437,10 @@ pub fn apply(ch: &Change) -> std::io::Result<()> {
             std::fs::copy(&ch.file, &backup)?;
         }
     }
-    // A JSON config qx emptied to `{}` goes too: the client reads a missing file as `{}`.
-    if text.is_empty() || text.trim_start_matches('\u{feff}').trim() == "{}" {
+    // A JSON config qx emptied to `{}` goes too: the client reads a missing file as `{}`. A link is
+    // not deleted: the real file (the dotfiles copy) is the one that must lose the qx entry.
+    let is_link = target != ch.file;
+    if !is_link && (text.is_empty() || text.trim_start_matches('\u{feff}').trim() == "{}") {
         return match std::fs::remove_file(&ch.file) {
             Ok(()) => {
                 if ch.client == Client::Pi {
@@ -485,14 +487,76 @@ fn write_target(file: &Path) -> PathBuf {
         .unwrap_or_else(|_| file.to_path_buf())
 }
 
-/// A file qx made, and now empties, holds nothing worth a `.qx-bak`: the text qx wrote itself,
-/// or a config with no member left. (pi's extension files are compared with what qx generates.)
+/// A file qx made, and now empties, holds nothing worth a `.qx-bak`: what qx itself writes, down to
+/// the last key. (pi's extension files are compared with what qx generates; a config must hold only
+/// qx's entry, so one with the user's own `env`, `timeout` or other key is backed up.)
 fn leaves_nothing_of_the_users(client: Client, text: &str, existing: &[u8]) -> bool {
+    let Ok(existing) = std::str::from_utf8(existing) else {
+        return false;
+    };
     if client == Client::Pi && text.is_empty() {
-        return std::str::from_utf8(existing).is_ok_and(pi::is_generated);
+        return pi::is_generated(existing);
     }
     let bare = text.trim_start_matches('\u{feff}').trim();
-    bare.is_empty() || bare == "{}"
+    (bare.is_empty() || bare == "{}")
+        && match client {
+            Client::ClaudeCode | Client::OpenCode | Client::Pi => parse_strict(existing).is_some_and(|doc| only_qx_wrote(&doc)),
+            _ => only_qx_lines(client, existing),
+        }
+}
+
+/// TOML and YAML: every line is one a fresh install writes (the `command` line names the exe).
+fn only_qx_lines(client: Client, existing: &str) -> bool {
+    let exe = Path::new("qx");
+    let fresh = match client {
+        Client::Codex => toml::edit_codex(None, exe, Action::Install),
+        Client::Dsh => yaml::edit_dsh(None, exe, Action::Install),
+        Client::Hermes => yaml::edit_hermes(None, exe, Action::Install),
+        _ => return false,
+    };
+    let Edit::Changed(fresh) = fresh else {
+        return false;
+    };
+    let known: std::collections::HashSet<&str> = fresh.lines().map(str::trim).collect();
+    existing
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .map(str::trim)
+        .all(|l| l.is_empty() || l.starts_with("command") || known.contains(l))
+}
+
+/// A document that is one chain of single-key objects down to a qx server entry or qx hook group.
+fn only_qx_wrote(doc: &Value) -> bool {
+    match doc {
+        Value::Object(m) if m.len() == 1 => {
+            let (key, value) = m.iter().next().expect("one member");
+            if key == "qx" { is_pristine_entry(value) } else { only_qx_wrote(value) }
+        }
+        Value::Array(groups) if groups.len() == 1 => {
+            let exe = groups[0]["hooks"][0]["command"].as_str().unwrap_or_default();
+            groups[0] == claude_hook(Path::new(exe))
+        }
+        _ => false,
+    }
+}
+
+/// The server entry as `claude_entry` / `opencode_entry` write it, apart from the exe path: no extra
+/// key, `QX_CLIENT` the only variable, the default timeout.
+fn is_pristine_entry(entry: &Value) -> bool {
+    let Some(m) = entry.as_object() else {
+        return false;
+    };
+    let only_client = |v: &Value| v.as_object().is_some_and(|env| env.keys().all(|k| k == "QX_CLIENT"));
+    m.iter().all(|(k, v)| match k.as_str() {
+        "type" | "command" => true,
+        "args" => *v == json!(["mcp"]),
+        "env" | "environment" => only_client(v),
+        "enabled" => *v == json!(true),
+        "codemode" => *v == json!(false),
+        "timeout" => *v == json!({ "execution": 600000 }) || *v == json!(600),
+        "exposure" => *v == json!("direct"),
+        _ => false,
+    })
 }
 
 /// Two spellings of one file: slashes and case do not matter on Windows.
@@ -1132,10 +1196,25 @@ ew\qx.exe");
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link must stay a link");
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "{\"a\": 1}\n", "the target holds the edit");
         assert_eq!(std::fs::read_to_string(p.home.join("settings.json.qx-bak")).unwrap(), "{}\n");
-        let gone = Change { client: Client::ClaudeCode, file: link.clone(), edit: Edit::Changed(String::new()) };
+        // Removing empties the file the link points at; the link stays, so the dotfiles copy loses the entry.
+        let gone = Change { client: Client::ClaudeCode, file: link.clone(), edit: Edit::Changed("{}\n".into()) };
         apply(&gone).unwrap();
-        assert!(std::fs::symlink_metadata(&link).is_err(), "removing deletes the link");
-        assert!(real.exists(), "and never the file it pointed at");
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "removing keeps the link");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "{}\n", "the target holds the emptied text");
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn removing_a_customised_entry_keeps_a_backup() {
+        let p = paths("rt-claude-custom");
+        let file = claude_file(&p);
+        let custom = "{\"mcpServers\":{\"qx\":{\"type\":\"stdio\",\"command\":\"C:/q/qx.exe\",\"args\":[\"mcp\"],\"env\":{\"QX_CLIENT\":\"claude-code\",\"MY\":\"1\"},\"timeout\":5}}}";
+        put(&file, custom);
+        for ch in plan(Client::ClaudeCode, &p, q(), Action::Remove).unwrap() {
+            apply(&ch).unwrap();
+        }
+        assert!(!file.exists(), "the emptied file goes");
+        assert_eq!(std::fs::read_to_string(p.home.join(".claude.json.qx-bak")).unwrap(), custom, "the user's own env and timeout stay recoverable");
         let _ = std::fs::remove_dir_all(&p.home);
     }
 

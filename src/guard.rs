@@ -296,7 +296,7 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
                 }
             }
         }
-        "set-content" | "add-content" | "out-file" | "tee" | "tee-object" => {
+        "set-content" | "add-content" | "out-file" | "tee" | "tee-object" | "new-item" | "ni" => {
             for a in args.iter().filter(|a| !a.starts_with('-')) {
                 deny_if_protected(a, cwd, &mut d);
             }
@@ -422,7 +422,8 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
                 d.warn("recursively deletes S3 objects");
             }
         }
-        "shutdown" if args.iter().any(|a| a.eq_ignore_ascii_case("/a") || a.eq_ignore_ascii_case("-a")) => {} // aborts one
+        // `shutdown /a` aborts one; `/a` next to `/s /r ..` (or inside a `/c` comment) is still a shutdown.
+        "shutdown" if args.iter().all(|a| a.eq_ignore_ascii_case("/a") || a.eq_ignore_ascii_case("-a")) && !args.is_empty() => {}
         "shutdown" | "restart-computer" | "stop-computer" => {
             d.deny("system shutdown/restart is not an agent action");
         }
@@ -435,6 +436,17 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
             if w.as_deref() == Some("add")
                 && args.iter().any(|a| a.to_ascii_lowercase().split('\\').any(|c| c == "run" || c == "runonce"))
             {
+                d.deny("registry autostart persistence");
+            }
+        }
+        "register-scheduledtask" | "set-scheduledtask" | "unregister-scheduledtask" => d.deny("scheduled-task persistence"),
+        // `Set-ItemProperty HKCU:\...\Run -Name x -Value calc.exe` is `reg add` with PowerShell's syntax.
+        "set-itemproperty" | "new-itemproperty" | "sp" => {
+            let autostart = |a: &String| {
+                let l = a.to_ascii_lowercase();
+                l.contains(['\\', '/']) && l.split(['\\', '/']).any(|c| c == "run" || c == "runonce")
+            };
+            if args.iter().any(autostart) {
                 d.deny("registry autostart persistence");
             }
         }
@@ -486,7 +498,7 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
         }
         // `at 10:00 x.exe` schedules a task like `schtasks /create`; a bare `at` only lists jobs.
         "at" if !args.is_empty() => d.deny("scheduled-task persistence"),
-        "rsync" if args.iter().any(|a| a.starts_with("--delete") || a == "--remove-source-files") => {
+        "rsync" if args.iter().any(|a| a.starts_with("--delete") || a == "--del" || a == "--remove-source-files") => {
             match args.iter().rfind(|a| !a.starts_with('-')).map(|t| absolutize(t, cwd)) {
                 Some(p) if protected(&p, cwd).is_some() => d.deny(format!("rsync --delete removes files in {}", p.display())),
                 _ => d.warn("rsync --delete removes files from the destination"),
@@ -616,6 +628,14 @@ pub fn check_shell_mode(m: Mode, command: &str, cwd: Option<&Path>) -> Decision 
     if plain != command {
         merge(&mut d, judge_line(m, &plain, cwd, true));
     }
+    // `f(){ rm -rf "$@"; }; f /c/Windows`: a function body runs with the arguments of each call.
+    for body in function_calls(command) {
+        if !spend() {
+            merge(&mut d, too_deep());
+            break;
+        }
+        merge(&mut d, check_shell_mode(m, &body, cwd));
+    }
     // cmd's `for %i in (set) do body` runs the body once per item with `%i` replaced: judge it that way.
     for (var, items, body) in for_loops(command) {
         match items {
@@ -639,6 +659,62 @@ pub fn check_shell_mode(m: Mode, command: &str, cwd: Option<&Path>) -> Decision 
         }
     }
     finalize(m, d)
+}
+
+/// Functions defined in `line` (`name() { .. }`, `function name { .. }`), once per later call of them,
+/// with `$@ $* $args $1..$9` in the body replaced by that call's arguments.
+fn function_calls(line: &str) -> Vec<String> {
+    const MAX_CALLS: usize = 16;
+    let mut out = Vec::new();
+    for (open, _) in line.match_indices('{') {
+        let head = line[..open].trim_end();
+        let (head, parens) = head.strip_suffix("()").map_or((head, false), |h| (h.trim_end(), true));
+        let name_at = head
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| !(c.is_alphanumeric() || matches!(c, '_' | '-')))
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let (before, name) = head.split_at(name_at);
+        if name.is_empty() || !(parens || before.trim_end().to_ascii_lowercase().ends_with("function")) {
+            continue;
+        }
+        let mut depth = 1usize;
+        let Some(end) = line[open + 1..].char_indices().find_map(|(j, c)| {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+            None
+        }) else {
+            continue;
+        };
+        let body = &line[open + 1..open + 1 + end];
+        for (seg, _) in split_segments(&line[open + 1 + end + 1..], true) {
+            let words = tokenize(&seg);
+            if words.first().is_some_and(|w| w == name) && out.len() < MAX_CALLS {
+                out.push(bind_params(body, &words[1..]));
+            }
+        }
+    }
+    out
+}
+
+/// `body` with its positional parameters and `$@ $* $args` replaced by `args` (a word with a space is quoted).
+fn bind_params(body: &str, args: &[String]) -> String {
+    let quote = |a: &String| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() };
+    let all = args.iter().map(quote).collect::<Vec<_>>().join(" ");
+    let mut out = body.replace("\"$@\"", &all).replace("\"$*\"", &all).replace("$@", &all).replace("$*", &all).replace("$args", &all);
+    for n in (1..=9).rev() {
+        let arg = args.get(n - 1).map(quote).unwrap_or_default();
+        out = out.replace(&format!("${{{n}}}"), &arg).replace(&format!("${n}"), &arg);
+    }
+    out
 }
 
 /// Stands in for the values of a `for /f` loop; a delete of it reports this text as unresolved.
@@ -716,17 +792,31 @@ fn for_loops(line: &str) -> Vec<(char, Option<Vec<String>>, String)> {
         let items = match kind.as_str() {
             "/l" => continue,
             "/f" => None,
-            _ => Some(
-                set.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '='))
-                    .map(|s| s.trim_matches('"'))
-                    .filter(|s| !s.is_empty())
-                    .take(MAX_ITEMS)
-                    .map(|s| match &root {
-                        Some(r) => format!("{}\\{s}", r.trim_end_matches(['\\', '/'])),
-                        None => s.to_string(),
-                    })
-                    .collect(),
-            ),
+            _ => {
+                // Items split at spaces, `,` `;` `=` outside quotes: `("C:\Program Files")` is one item.
+                let (mut parts, mut cur, mut quoted) = (Vec::new(), String::new(), false);
+                for c in set.chars().chain(std::iter::once(' ')) {
+                    if c == '"' {
+                        quoted = !quoted;
+                    } else if !quoted && (c.is_whitespace() || matches!(c, ',' | ';' | '=')) {
+                        if !cur.is_empty() {
+                            parts.push(std::mem::take(&mut cur));
+                        }
+                    } else {
+                        cur.push(c);
+                    }
+                }
+                Some(
+                    parts
+                        .into_iter()
+                        .take(MAX_ITEMS)
+                        .map(|s| match &root {
+                            Some(r) => format!("{}\\{s}", r.trim_end_matches(['\\', '/'])),
+                            None => s,
+                        })
+                        .collect(),
+                )
+            }
         };
         out.push((var, items, body));
     }
@@ -1036,7 +1126,7 @@ fn strip_leading_redirects(w: &mut Vec<String>) {
 /// cmd's echo-off `@` and a grouping `(` glued to the command word.
 fn strip_sigils(w: &mut [String]) {
     while let Some(first) = w.first_mut() {
-        let sigil = first.len() > 1 && ((first.starts_with('@') && !first.starts_with("@(")) || first.starts_with('('));
+        let sigil = first.len() > 1 && (first.starts_with('@') || first.starts_with('('));
         if !sigil {
             return;
         }
@@ -1346,7 +1436,15 @@ fn inline_code(name: &str, args: &[String]) -> Option<String> {
         "php" => &["-r"],
         _ => return None,
     };
-    let i = args.iter().position(|a| flags.contains(&a.as_str()))?;
+    // `python -Ic code`, `perl -le code`: a short-flag group that ends in the code flag runs the next argument.
+    let grouped = |a: &str| {
+        a.len() > 2
+            && a.starts_with('-')
+            && !a.starts_with("--")
+            && a[1..].chars().all(|c| c.is_ascii_alphabetic())
+            && flags.iter().any(|f| f.len() == 2 && a.ends_with(&f[1..]))
+    };
+    let i = args.iter().position(|a| flags.contains(&a.as_str()) || grouped(a))?;
     Some(args[i + 1..].join(" "))
 }
 
@@ -1630,7 +1728,13 @@ fn unwrap_wrapper(name: &str, args: &[String]) -> Option<(String, Vec<String>)> 
                 match a.strip_prefix("--split-string").or_else(|| a.strip_prefix("-S")) {
                     Some("") => split.extend(it.next().map(|v| tokenize(v)).unwrap_or_default()),
                     Some(v) => split.extend(tokenize(v.strip_prefix('=').unwrap_or(v))),
-                    None => split.push(a.clone()),
+                    None => {
+                        split.push(a.clone());
+                        // `env -u X -S "rm .."`: the option's value is not the command.
+                        if matches!(a.as_str(), "-u" | "--unset" | "-C" | "--chdir") {
+                            split.extend(it.next().cloned());
+                        }
+                    }
                 }
             }
             let args = &split[..];
@@ -3730,6 +3834,10 @@ mod tests {
             r"for /D %%G in (C:\Users\*) do @rd /s /q %%G",
             r"for /r C:\Windows %i in (*) do del /q %i",
             r"for /d %i in (a C:\Windows) do (rd /s /q %~fi)",
+            r"for /d %i in (C:\Users\*) do @(rd /s /q %i)",
+            r#"for /d %i in ("C:\Program Files") do rd /s /q %i"#,
+            r"@(rd /s /q C:\Windows)",
+            r"echo a & @(rd /s /q C:\Windows)",
             r"echo start & for /d %i in (C:\Windows) do rd /s /q %i",
             "for /f %i in (list.txt) do rd /s /q %i",
             r#"for /f "delims=" %i in ('dir /b /ad') do rd /s /q %i"#,
@@ -3805,10 +3913,48 @@ mod tests {
             "$'rm' -rf /c/Windows",
             "alias x='rm -rf /c/Windows'; x",
             "f(){ rm -rf /c/Windows; }; f",
+            r#"f(){ rm -rf "$@"; }; f /c/Windows"#,
+            r#"function f { rm -rf $args }; f C:\Windows"#,
+            r#"d() { rm -rf "$1"; }; d /c/Windows"#,
+            r#"env -u X -S "rm -rf /c/Windows""#,
+            r#"env --unset=X -S "rm -rf /c/Windows""#,
         ] {
             assert!(denied(bad), "{bad}");
         }
-        for ok in [r"bin\tool --version", "alias ll='ls -la'", "git commit -S -m x"] {
+        for ok in [
+            r"bin\tool --version",
+            "alias ll='ls -la'",
+            "git commit -S -m x",
+            r#"f(){ echo "$@"; }; f hi"#,
+            r#"clean() { rm -rf "$1"; }; clean build"#,
+            "env -u X ls",
+            "${HOME:-x}",
+        ] {
+            assert!(!denied(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn powershell_persistence_and_protected_new_item_are_denied() {
+        for bad in [
+            "Register-ScheduledTask -TaskName x -Action $a",
+            "Unregister-ScheduledTask -TaskName x -Confirm:$false",
+            r"Set-ItemProperty -Path HKCU:\Software\Microsoft\Windows\CurrentVersion\Run -Name x -Value calc.exe",
+            r"New-ItemProperty -Path HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce -Name x -Value calc.exe",
+            r"sp HKCU:\Software\Microsoft\Windows\CurrentVersion\Run x calc.exe",
+            r"New-Item -Force C:\Windows\x.bat",
+            r"ni C:\Windows\System32\x.dll",
+            "rsync --del src/ /c/Windows/",
+        ] {
+            assert!(denied(bad), "{bad}");
+        }
+        for ok in [
+            r"Set-ItemProperty -Path HKCU:\Software\X\Config -Name Run -Value 1",
+            r"Set-ItemProperty -Path HKCU:\Software\X\Runtime -Name a -Value 1",
+            "New-Item -ItemType Directory build",
+            "ni notes.txt",
+            "Get-ScheduledTask",
+        ] {
             assert!(!denied(ok), "{ok}");
         }
     }
@@ -3824,10 +3970,13 @@ mod tests {
             r#"python -c "import shutil,os; shutil.rmtree(os.path.expanduser('~'))""#,
             r#"node -e "require('fs').rmSync('/', {recursive: true})""#,
             r#"python -c "import subprocess; subprocess.run(['rm','-rf','/c/Windows'])""#,
+            r#"python -Ic "import shutil; shutil.rmtree('C:/Windows')""#,
+            r#"perl -le "system('rm -rf /c/Windows')""#,
         ] {
             assert!(denied(bad), "{bad}");
         }
         for ok in [
+            r#"python -Ic "print(1)""#,
             r#"python -c "import os; os.system('rm -rf build')""#,
             r#"python -c "import shutil; shutil.rmtree('build')""#,
             r#"node -e "require('fs').rmSync('dist', {recursive: true})""#,
@@ -3893,7 +4042,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("qx-build-cache");
         assert_eq!(level(&format!("rm -rf {}", tmp.display())), Level::Allow);
         assert_eq!(level(&format!("rm -rf {}", std::env::temp_dir().display())), Level::Warn);
-        for c in ["shutdown /s /t 0", "bcdedit /set testsigning on", "bcdedit /delete {current}", r"rsync -a --delete src/ C:\Windows\", "at 10:00 calc.exe", r"Clear-Content C:\Windows\win.ini"] {
+        for c in ["shutdown /s /t 0", "shutdown /s /t 0 /c /a", "shutdown /r /a", "bcdedit /set testsigning on", "bcdedit /delete {current}", r"rsync -a --delete src/ C:\Windows\", "at 10:00 calc.exe", r"Clear-Content C:\Windows\win.ini"] {
             assert!(denied(c), "{c}");
         }
     }

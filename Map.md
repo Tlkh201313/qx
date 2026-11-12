@@ -19,7 +19,7 @@ qx = Rust 2021, single binary `qx.exe`, deps only `regex` + `serde_json`. Window
 ## Features → files (src/)
 | Feature | File |
 |---|---|
-| Safety gate: deny/warn rules, path expansion (8.3 names, `~user`, admin shares, cygdrive, braces, streams), launcher peeling, `for`/`forfiles` bodies per item, inline perl/ruby/php/python/node code, home data folders | `guard.rs` |
+| Safety gate: deny/warn rules, path expansion (8.3 names, `~user`, admin shares, cygdrive, braces, streams), launcher peeling, `for`/`forfiles` bodies per item, shell functions per call (`function_calls`), PowerShell autostart/scheduled-task cmdlets, inline perl/ruby/php/python/node code, home data folders | `guard.rs` |
 | Secret redaction of command output (key=value, tokens, Authorization schemes, .netrc, cookies, URL users); `fs` returns files unredacted | `redact.rs` |
 | Output compaction (ANSI, dedupe, head+tail, rescue buried errors) | `compact.rs` |
 | Command-aware digests (git status/diff, tests, builds, grep, JSON) — runs before compact; a red run keeps unknown column-0 and failure-word lines in the room left; long grep hits keep head+tail and spool | `digest.rs` |
@@ -31,7 +31,7 @@ qx = Rust 2021, single binary `qx.exe`, deps only `regex` + `serde_json`. Window
 | Python fast-TLS stub (`CERTS_TLS_STUB`, `PYTHON_FAST_TLS_DIR`) | `exec.rs` |
 | MCP server: `run` + `fs` tools, jobs, limits; `run` keys (`RUN_KEYS`, unknown key is an error), `env` object, `kill_on_timeout`, protocol versions (`PROTOCOL_VERSIONS`), fs calls cancellable (`cancellable`), job result kept for every poll, kill says "stopped on request" | `mcp.rs` |
 | Per-client tool names/wording (Claude, Codex, OpenCode, dsh, Hermes, pi) | `client.rs` |
-| `fs` tool ops: read/write/edit/glob/grep/list/stat, `FS_*` errors, atomic writes; lean (frameless) replies for Claude Code/Codex (`lean_read`); 49k reply cap (`CLIENT_REPLY_BYTES`, also drives `run` stream caps in `mcp.rs` `stream_caps`); scratch dir (`scratch_root`); grep context (streamed window, `context_lines`); write/edit refuse `guard::write_protected` paths (`FS_PROTECTED`); glob retries with `[` literal; git runs with `core.fsmonitor=false` | `fsops.rs` |
+| `fs` tool ops: read/write/edit/glob/grep/list/stat, `FS_*` errors, atomic writes; lean (frameless) replies for Claude Code/Codex (`lean_read`); 49k reply cap (`CLIENT_REPLY_BYTES`, also drives `run` stream caps in `mcp.rs` `stream_caps`); scratch dir (`scratch_root`); grep context (streamed window, `context_lines`); write/edit refuse `guard::write_protected` paths (`FS_PROTECTED`); glob retries with every `[` literal (folder or file part); git runs with `core.fsmonitor=false` | `fsops.rs` |
 | Live workspace file list for glob/grep (ReadDirectoryChangesW); folders git ignores are left out (`git_ignored_dirs` in `fsops.rs`, kept in `Snapshot.skipped`; a new folder asks `git check-ignore`, 16 per tree); a `.gitignore`/`info/exclude` change or an 8.3 alias rebuilds it; files named like skipped folders are indexed | `index.rs` |
 | Unknown `fs` option keys named in an `[qx] ignored (not fs options)` line (`KNOWN_KEYS`) | `fsops.rs` |
 | Warm start of PowerShell, tool lookups, file cache | `warmup.rs` |

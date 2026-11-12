@@ -110,7 +110,7 @@ const PREFIXES: &[(&str, usize, Body)] = &[
     ("xoxa-", 10, Body::Word),
     ("xoxs-", 10, Body::Word),
     ("xoxe-", 10, Body::Word),
-    ("xapp-", 10, Body::Word),
+    ("xapp-", 10, Body::WordDigit),
     ("AIza", 30, Body::Word),
     ("ya29.", 30, Body::Wide),
     ("GOCSPX-", 20, Body::Word),
@@ -121,7 +121,7 @@ const PREFIXES: &[(&str, usize, Body)] = &[
     ("dop_v1_", 40, Body::Word),
     ("sntrys_", 20, Body::Wide),
     ("SG.", 30, Body::DottedDigit),
-    ("hvs.", 24, Body::Word),
+    ("hvs.", 24, Body::WordDigit),
     ("hvb.", 24, Body::Word),
     ("shpat_", 20, Body::Alnum),
     ("shpca_", 20, Body::Alnum),
@@ -409,6 +409,15 @@ fn short_key_starts(b: &[u8], s: usize) -> bool {
     !prev.is_ascii_alphanumeric() || (prev.is_ascii_lowercase() && b[s].is_ascii_uppercase()) || escaped_break(b, s)
 }
 
+/// A short key glued to a longer name: `ansible_ssh_pass`, `db-pass`, `dbPass`.
+fn compound_key(b: &[u8], key_at: usize) -> bool {
+    let Some(&prev) = key_at.checked_sub(1).map(|i| &b[i]) else {
+        return false;
+    };
+    (matches!(prev, b'_' | b'-') && key_at >= 2 && b[key_at - 2].is_ascii_alphanumeric())
+        || (prev.is_ascii_lowercase() && b[key_at].is_ascii_uppercase())
+}
+
 /// A JSON escape `\n`, `\t` or `\r` just before `s` (an odd run of backslashes): the text after it starts
 /// a new word. `C:\nsk-...` is an escaped backslash and the folder `nsk-...`.
 fn escaped_break(b: &[u8], s: usize) -> bool {
@@ -428,6 +437,8 @@ fn escaped_break(b: &[u8], s: usize) -> bool {
 fn value_is_path(v: &[u8]) -> bool {
     let v = v.strip_prefix(b"\\\"").or_else(|| v.strip_prefix(b"\"")).or_else(|| v.strip_prefix(b"'")).unwrap_or(v);
     matches!(v.first(), Some(b'/' | b'~'))
+        || v.starts_with(b"./")
+        || v.starts_with(b"../")
         || v.starts_with(b"\\\\")
         || (v.len() >= 3 && v[0].is_ascii_alphabetic() && v[1] == b':' && matches!(v[2], b'\\' | b'/'))
 }
@@ -489,8 +500,9 @@ fn mask_key_values(line: &str) -> (Cow<'_, str>, usize) {
         let Some(key_at) = key_at else {
             continue;
         };
-        // A bare `PASS:` is a test runner's verdict (`--- PASS: TestX`).
-        if short && sep == b':' && &b[key_at..e] == b"PASS" && !key_at.checked_sub(1).is_some_and(|i| is_name_byte(b[i])) {
+        // A capitalised `Pass:` / `PASS:` is a test runner's verdict (`--- PASS: TestX`, `Pass: true`);
+        // lowercase `pass: x`, `db_pass:`, `dbPass:` and the JSON key `"pass":` are config keys.
+        if short && sep == b':' && !quoted && !compound_key(b, key_at) && b[key_at..e].iter().any(u8::is_ascii_uppercase) {
             continue;
         }
         let mut j = p + 1;
@@ -780,7 +792,8 @@ fn mask_auth(line: &str) -> (Cow<'_, str>, usize) {
             while end < bytes.len() && bytes[end].is_ascii_graphic() && !matches!(bytes[end], b'"' | b'\'' | b'\\') {
                 end += 1;
             }
-            if end - start >= 8 {
+            // A digit rules out prose (`Authorization: Requested resource unavailable`).
+            if end - start >= 8 && bytes[start..end].iter().any(u8::is_ascii_digit) {
                 ranges.push((start, end));
             }
             p = end.max(p);
@@ -1157,6 +1170,8 @@ mod tests {
             ("ENCRYPTION_KEY=abcd1234wxyz", "abcd1234wxyz"),
             ("SIGNING_KEY=abcd1234wxyz", "abcd1234wxyz"),
             ("ansible_ssh_pass: hunter2xyz", "hunter2xyz"),
+            ("pass: hunter2xyz", "hunter2xyz"),
+            ("pwd: hunter2xyz", "hunter2xyz"),
             ("https://x.example/login?user=bob&pass=hunter2xyz", "hunter2xyz"),
             ("dbPass=hunter2xyz", "hunter2xyz"),
             ("mytool --pass hunter2xyz", "hunter2xyz"),
@@ -1174,6 +1189,14 @@ mod tests {
             "pwd: C:\\Users\\x\\project",
             "--- PASS: TestParseConfig (0.00s)",
             "PASS: tests/run-all.sh",
+            "Pass: true",
+            "  pass: ./build/out.o",
+            "pwd: ../src/lib",
+            // Names that open like a prefix rule but hold no digit: a package or a sentence.
+            "see xapp-server-monitoring-tool-docs",
+            "hvs.configuration_reader_module_v",
+            "Authorization: Requested resource unavailable",
+            "Authorization: Required parameter missing",
         ]);
     }
 

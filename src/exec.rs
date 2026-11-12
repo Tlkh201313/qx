@@ -493,9 +493,11 @@ fn posix_flags(program: &str, args: &[String], cwd: Option<&Path>) -> bool {
     match program.to_ascii_lowercase().as_str() {
         "find" | "sort" if args.iter().any(|a| a.len() > 1 && a.starts_with('-')) => true,
         // find.exe takes a quoted string, never a directory: `find logs` is the POSIX walk.
-        "find" => args.first().is_some_and(|a| {
-            !a.starts_with('/') && cwd.map_or_else(|| PathBuf::from(a), |c| c.join(a)).is_dir()
-        }),
+        // `find "err" log.txt` is find.exe even when a folder `err` exists: a later operand that is a file.
+        "find" => {
+            let at = |a: &String| cwd.map_or_else(|| PathBuf::from(a), |c| c.join(a));
+            args.first().is_some_and(|a| !a.starts_with('/') && at(a).is_dir()) && !args[1..].iter().any(|a| at(a).is_file())
+        }
         // `timeout 30 git status` runs a command; Windows' `timeout 5`, `timeout /t 5` and `timeout 5 /nobreak` only wait.
         "timeout" => {
             args.len() >= 2 && !args[0].starts_with('/') && !args[1].eq_ignore_ascii_case("/nobreak")
@@ -738,24 +740,32 @@ const CMD_LINE_CAP: usize = 8_000;
 /// `cat C:\a\b` opens `C:ab`, `rm out\*` removes nothing. Turn the `\` of a path-shaped
 /// word (`X:\..`, `.\..`, `..\..`, `name\name`, `dir\*`) into `/` before the line reaches bash.
 /// Quoted text, `\\`, `\$`, `\"`, `\ ` and the like stay as typed, and so does a word that
-/// already has a `/` (a sed script, `a\.b/c`) unless it starts with a drive. Heredocs and
-/// `$'..'` are left alone: their text is data.
-pub fn slash_windows_paths(line: &str) -> std::borrow::Cow<'_, str> {
+/// already has a `/` (a sed script, `a\.b/c`) unless it starts with a drive, `.\` or `..\`.
+/// A `\` before `* ? [ { . _ - ~` in any other word is an escape (`find -name foo\*`,
+/// `echo a\.b`) unless the text before it is a folder under `cwd` (`out\*`, `dir\.git`).
+/// Heredocs and `$'..'` are left alone: their text is data.
+pub fn slash_windows_paths<'a>(line: &'a str, cwd: Option<&Path>) -> std::borrow::Cow<'a, str> {
     use std::borrow::Cow;
     // A char that can follow a path's `\` (every other escape, `\$ \" \<space>`, is kept).
     fn path_next(c: char) -> bool {
         c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '*' | '?' | '[' | '{' | '~')
     }
     // (char, true when it is bare text of the word: the only place a `\` may be rewritten)
-    fn flush(word: &mut Vec<(char, bool)>, out: &mut String) {
+    fn flush(word: &mut Vec<(char, bool)>, out: &mut String, cwd: Option<&Path>) {
         let bare = |i: usize| word.get(i).is_some_and(|&(_, b)| b);
+        let is = |i: usize, ch: char| bare(i) && word[i].0 == ch;
         let drive = bare(0)
             && bare(1)
             && bare(2)
             && word[0].0.is_ascii_alphabetic()
             && word[1].0 == ':'
             && matches!(word[2].0, '\\' | '/');
-        let convert = drive || !word.iter().any(|&(c, b)| b && c == '/');
+        let anchored = drive || (is(0, '.') && (is(1, '\\') || (is(1, '.') && is(2, '\\'))));
+        let convert = anchored || !word.iter().any(|&(c, b)| b && c == '/');
+        let is_dir = |p: &str| {
+            !p.is_empty() && cwd.map_or_else(|| Path::new(p).is_dir(), |d| d.join(p).is_dir())
+        };
+        let mut so_far = String::new(); // the word as written to `out`
         for i in 0..word.len() {
             let (c, b) = word[i];
             let hit = convert
@@ -763,8 +773,11 @@ pub fn slash_windows_paths(line: &str) -> std::borrow::Cow<'_, str> {
                 && c == '\\'
                 && i > 0
                 && bare(i - 1)
-                && (word[i - 1].0.is_alphanumeric() || matches!(word[i - 1].0, '.' | '_' | '-' | ':' | '~'));
-            out.push(if hit { '/' } else { c });
+                && (word[i - 1].0.is_alphanumeric() || matches!(word[i - 1].0, '.' | '_' | '-' | ':' | '~'))
+                && (anchored || word.get(i + 1).is_some_and(|w| w.0.is_alphanumeric()) || is_dir(&so_far));
+            let ch = if hit { '/' } else { c };
+            out.push(ch);
+            so_far.push(ch);
         }
         word.clear();
     }
@@ -810,17 +823,22 @@ pub fn slash_windows_paths(line: &str) -> std::borrow::Cow<'_, str> {
                 None => word.push((c, false)),
             },
             c if c.is_whitespace() || matches!(c, '|' | '&' | ';' | '(' | ')' | '<' | '>') => {
-                flush(&mut word, &mut out);
+                flush(&mut word, &mut out, cwd);
                 out.push(c);
             }
             _ => word.push((c, true)),
         }
     }
-    flush(&mut word, &mut out);
+    flush(&mut word, &mut out, cwd);
     Cow::Owned(out)
 }
 
 pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
+    build_shell_in(command, shell, None)
+}
+
+/// `build_shell` for a command that will run in `cwd` (None: qx's own folder).
+pub fn build_shell_in(command: &str, shell: &str, cwd: Option<&Path>) -> Result<Command, String> {
     let shell = shell.trim().to_ascii_lowercase();
     let shell = shell.strip_suffix(".exe").unwrap_or(&shell);
     // Names models use for the shells qx has: anything unknown means "decide for me".
@@ -841,7 +859,7 @@ pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
                     .to_string()
             })?;
             let mut c = Command::new(b);
-            add_args(&mut c, &["-c", slash_windows_paths(command).as_ref()]);
+            add_args(&mut c, &["-c", slash_windows_paths(command, cwd).as_ref()]);
             prepare(&mut c);
             apply_python_fast(&mut c);
             apply_child_defaults(&mut c, false);
@@ -1906,7 +1924,7 @@ pub fn run_shell(
     timeout: Option<Duration>,
 ) -> Result<Outcome, String> {
     for attempt in 0..2 {
-        let mut cmd = build_shell(command, shell)?;
+        let mut cmd = build_shell_in(command, shell, cwd.as_deref())?;
         apply_envs(&mut cmd, envs);
         apply_cwd(&mut cmd, cwd);
         let out = run_captured(cmd, timeout).map_err(|e| format!("failed to start: {e}"))?;
@@ -2536,7 +2554,10 @@ mod tests {
 
     #[test]
     fn windows_paths_get_forward_slashes_before_bash() {
-        let s = |l: &str| slash_windows_paths(l).into_owned();
+        let d = scratch("slash-dirs");
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        std::fs::create_dir_all(d.join("logs")).unwrap();
+        let s = |l: &str| slash_windows_paths(l, Some(&d)).into_owned();
         // The five shapes that lost their backslashes under Git Bash.
         assert_eq!(s(r".\cache"), "./cache");
         assert_eq!(s(r"rm -rf .\cache 2>/dev/null"), "rm -rf ./cache 2>/dev/null");
@@ -2551,6 +2572,12 @@ mod tests {
         assert_eq!(s(r"ls C:\w\*.tmp"), "ls C:/w/*.tmp");
         assert_eq!(s(r"grep -c name C:\w\Cargo.toml > out.txt"), "grep -c name C:/w/Cargo.toml > out.txt");
         assert_eq!(s(r"ls ..\..\x"), "ls ../../x");
+        // A word that starts `.\`, `..\` or `X:\` is a path even when it also holds a `/`.
+        assert_eq!(s(r"rm -f .\cache/k.txt"), "rm -f ./cache/k.txt");
+        assert_eq!(s(r"ls ..\a/b\c"), "ls ../a/b/c");
+        // `\*` after a folder that exists is a path; after anything else it is an escape.
+        assert_eq!(s(r"ls logs\*.tmp"), "ls logs/*.tmp");
+        assert_eq!(s(r"ls out\.git"), "ls out/.git");
         // Quoted text and real escapes are the user's and stay.
         for same in [
             r"printf '%s\n' a\\b",
@@ -2560,6 +2587,11 @@ mod tests {
             r"echo \$HOME",
             r#"echo \"q\""#,
             r"echo \n",
+            r"find . -name foo\* | head",
+            r"echo a\* | cat",
+            r"echo a\.b | cat",
+            r"ls f\[1\].txt",
+            r"grep -rn x --include=a\*",
             "sed s/a\\.b/x/ f",
             "cat <<EOF\nC:\\a\\b\nEOF",
             r"echo $'a\nb'",
@@ -2567,7 +2599,8 @@ mod tests {
         ] {
             assert_eq!(s(same), same, "{same}");
         }
-        assert!(matches!(slash_windows_paths("ls -la"), std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(slash_windows_paths("ls -la", None), std::borrow::Cow::Borrowed(_)));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -2586,6 +2619,14 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "", "cache is gone, so cat finds nothing");
         assert!(d.join(".cache").join("x.txt").is_file(), ".cache must survive `rm .\\cache`");
         assert!(!d.join("cache").exists(), "`rm -rf .\\cache` removes ./cache");
+        // A path that mixes both separators is still the path, not a sibling named `.cache`.
+        std::fs::create_dir_all(d.join("cache")).unwrap();
+        std::fs::write(d.join("cache").join("k.txt"), "k").unwrap();
+        std::fs::write(d.join(".cache").join("k.txt"), "k").unwrap();
+        let mut c = build_shell(r"rm -f .\cache/k.txt", "bash").unwrap();
+        c.current_dir(&d).output().unwrap();
+        assert!(!d.join("cache").join("k.txt").exists(), "`rm .\\cache/k.txt` removes cache/k.txt");
+        assert!(d.join(".cache").join("k.txt").is_file(), "and leaves .cache/k.txt");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2594,6 +2635,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn find_with_a_string_and_a_file_stays_find_exe_even_if_a_folder_has_that_name() {
+        let d = scratch("find-route");
+        std::fs::create_dir_all(d.join("err")).unwrap();
+        std::fs::write(d.join("l.txt"), "x").unwrap();
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(!posix_flags("find", &a(&["err", "l.txt"]), Some(&d)), "find \"err\" l.txt searches the file");
+        assert!(posix_flags("find", &a(&["err"]), Some(&d)), "find err walks the folder");
+        assert!(posix_flags("find", &a(&["err", "err"]), Some(&d)), "two folders are a walk");
+        assert!(posix_flags("find", &a(&["err", "-name", "x"]), Some(&d)));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

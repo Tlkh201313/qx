@@ -291,7 +291,7 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
                 return execute(vec![c], &o, &sh);
             }
         }
-        match exec::build_shell(&run, &o.shell) {
+        match exec::build_shell_in(&run, &o.shell, o.cwd.as_deref()) {
             Ok(mut c) => {
                 exec::apply_envs(&mut c, &envs);
                 (c, sh)
