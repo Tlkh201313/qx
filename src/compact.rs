@@ -4,6 +4,8 @@
 //! or a compiler error in the middle of a long log). `compact` rescues lines that
 //! look diagnostic before it truncates.
 
+use std::borrow::Cow;
+
 /// Remove ANSI escape sequences (colors, cursor moves, OSC titles).
 pub fn strip_ansi(s: &str) -> String {
     if !s.contains('\x1b') {
@@ -67,8 +69,6 @@ const IMPORTANT_MARKERS: &[&str] = &[
     "exception",
     "traceback",
     "fatal",
-    "failed",
-    "failure",
     "assertion",
     "not found",
     "cannot",
@@ -77,7 +77,7 @@ const IMPORTANT_MARKERS: &[&str] = &[
     "denied",
     "segmentation fault",
     "warn",
-    "fail",
+    "fail", // also covers "failed" and "failure"
     "✗",
     "✘",
     "timed out",
@@ -87,8 +87,16 @@ const IMPORTANT_MARKERS: &[&str] = &[
 ];
 
 pub fn interesting(line: &str) -> bool {
-    let l = line.to_ascii_lowercase();
-    IMPORTANT_MARKERS.iter().any(|m| l.contains(m))
+    // One lowercase buffer per thread: this runs on every line of a long log.
+    thread_local! {
+        static LOWER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+    LOWER.with(|cell| {
+        let mut l = cell.borrow_mut();
+        l.clear();
+        l.extend(line.chars().map(|c| c.to_ascii_lowercase()));
+        IMPORTANT_MARKERS.iter().any(|m| l.contains(m))
+    })
 }
 
 /// Appends the line, cut at `MAX_LINE_CHARS`; true when it was cut (the caller spools the original).
@@ -105,7 +113,7 @@ fn push_capped(out: &mut String, line: &str) -> bool {
 
 /// Collapse runs of three or more identical lines into `line  (xN)`.
 /// Returns the new lines and how many source lines were removed.
-fn collapse(lines: &[&str]) -> (Vec<String>, usize) {
+fn collapse<'a>(lines: &[&'a str]) -> (Vec<Cow<'a, str>>, usize) {
     let mut out = Vec::with_capacity(lines.len());
     let mut collapsed = 0usize;
     let mut i = 0usize;
@@ -116,12 +124,10 @@ fn collapse(lines: &[&str]) -> (Vec<String>, usize) {
         }
         let run = j - i;
         if run >= 3 {
-            out.push(format!("{}  (x{})", lines[i], run));
+            out.push(Cow::Owned(format!("{}  (x{})", lines[i], run)));
             collapsed += run - 1;
         } else {
-            for line in &lines[i..j] {
-                out.push((*line).to_string());
-            }
+            out.extend(lines[i..j].iter().map(|l| Cow::Borrowed(*l)));
         }
         i = j;
     }
@@ -144,37 +150,34 @@ fn names_a_file(line: &str) -> bool {
 /// Runs of 8+ lines that differ only in their digits (progress counters,
 /// timestamps) keep the first and last line plus a count. Only used over budget,
 /// where head/tail would drop them anyway; diagnostics are never collapsed.
-fn collapse_similar(lines: Vec<String>) -> (Vec<String>, bool) {
-    let keys: Vec<String> = lines
-        .iter()
-        .map(|l| {
-            let mut k = String::with_capacity(l.len());
-            let mut digits = false;
-            for c in l.chars() {
-                if c.is_ascii_digit() {
-                    if !digits {
-                        k.push('#');
-                    }
-                } else {
-                    k.push(c);
-                }
-                digits = c.is_ascii_digit();
-            }
-            k
+fn collapse_similar(lines: Vec<Cow<'_, str>>) -> (Vec<Cow<'_, str>>, bool) {
+    // A line's shape: each run of digits is one `#`. Compared on the fly, so no key string per line.
+    fn shape(l: &str) -> impl Iterator<Item = char> + '_ {
+        let mut digits = false;
+        l.chars().filter_map(move |c| {
+            let d = c.is_ascii_digit();
+            let keep = if d { (!digits).then_some('#') } else { Some(c) };
+            digits = d;
+            keep
         })
-        .collect();
-    let mut out = Vec::with_capacity(lines.len());
+    }
+    let mut out: Vec<Cow<str>> = Vec::with_capacity(lines.len());
     let mut changed = false;
     let mut i = 0usize;
     while i < lines.len() {
         let mut j = i + 1;
-        while j < keys.len() && keys[j] == keys[i] {
+        while j < lines.len() && shape(&lines[j]).eq(shape(&lines[i])) {
             j += 1;
         }
-        // A key with no letter left is a column of numbers (`seq 400`, ids, sizes): the numbers are the content.
-        if j - i >= 8 && keys[i].contains('#') && keys[i].chars().any(char::is_alphabetic) && !interesting(&lines[i]) && !names_a_file(&lines[i]) {
+        // A shape with no letter left is a column of numbers (`seq 400`, ids, sizes): the numbers are the content.
+        if j - i >= 8
+            && shape(&lines[i]).any(|c| c == '#')
+            && shape(&lines[i]).any(char::is_alphabetic)
+            && !interesting(&lines[i])
+            && !names_a_file(&lines[i])
+        {
             out.push(lines[i].clone());
-            out.push(format!("[qx] ... {} similar lines (only digits differ) ...", j - i - 2));
+            out.push(Cow::Owned(format!("[qx] ... {} similar lines (only digits differ) ...", j - i - 2)));
             out.push(lines[j - 1].clone());
             changed = true;
         } else {
@@ -187,36 +190,56 @@ fn collapse_similar(lines: Vec<String>) -> (Vec<String>, bool) {
 
 /// Drop the working directory from located paths (`C:\proj\src\a.rs:3` ->
 /// `src\a.rs:3`); the caller already knows it. Returns how many were shortened.
+#[cfg(test)] // the product code calls `shorten`; tests and the fuzzer want the in-place form
 pub fn relative_paths(text: &mut String, cwd: &str) -> usize {
+    let (shorter, total) = shorten(text, cwd);
+    if let Some(s) = shorter {
+        *text = s;
+    }
+    total
+}
+
+/// `relative_paths` without touching its input: the shortened text (`None` when nothing matched, so
+/// the common case allocates no second copy) and how many paths were shortened.
+fn shorten(text: &str, cwd: &str) -> (Option<String>, usize) {
     let dir = cwd.trim_end_matches(['\\', '/']);
     if dir.len() < 3 {
-        return 0;
+        return (None, 0);
     }
+    let mut cur: Option<String> = None;
     let mut total = 0;
     for sep in ['\\', '/'] {
         let pat = format!("{}{sep}", dir.replace(['\\', '/'], &sep.to_string())).to_ascii_lowercase();
-        let hay = text.to_ascii_lowercase(); // same byte offsets as `text`
-        let mut out = String::with_capacity(text.len());
+        let src = cur.as_deref().unwrap_or(text);
+        let hay = src.to_ascii_lowercase(); // same byte offsets as `src`
+        let mut cuts = Vec::new();
         let mut at = 0;
         while let Some(p) = hay[at..].find(&pat) {
             let p = at + p;
             // Mid-word or mid-path means a different (longer) path, not ours.
-            let glued = text[..p]
+            let glued = src[..p]
                 .chars()
                 .next_back()
                 .is_some_and(|c| c.is_alphanumeric() || "_-./\\".contains(c));
-            out.push_str(&text[at..p]);
-            if glued {
-                out.push_str(&text[p..p + pat.len()]);
-            } else {
-                total += 1;
+            if !glued {
+                cuts.push(p);
             }
             at = p + pat.len();
         }
-        out.push_str(&text[at..]);
-        *text = out;
+        if cuts.is_empty() {
+            continue;
+        }
+        let mut out = String::with_capacity(src.len());
+        let mut from = 0;
+        for &p in &cuts {
+            out.push_str(&src[from..p]);
+            from = p + pat.len();
+        }
+        out.push_str(&src[from..]);
+        total += cuts.len();
+        cur = Some(out);
     }
-    total
+    (cur, total)
 }
 
 /// Save the uncut output (already redacted) so a truncation never loses facts:
@@ -224,6 +247,7 @@ pub fn relative_paths(text: &mut String, cwd: &str) -> usize {
 /// shared by every qx process, so one noisy run must not evict another session's `full_output`);
 /// None on any I/O error.
 pub fn spool(stdout: &str, stderr: &str) -> Option<std::path::PathBuf> {
+    use std::io::Write;
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let dir = std::env::temp_dir().join("qx-spool");
@@ -233,12 +257,13 @@ pub fn spool(stdout: &str, stderr: &str) -> Option<std::path::PathBuf> {
         .map_or(0, |d| d.as_millis());
     prune_spool(&dir, ms, 39, 10 * 60 * 1000);
     let path = dir.join(format!("{ms:015}-{}-{}.log", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
-    let mut body = stdout.to_string();
+    // Written piece by piece: joining them first would copy a 16 MiB log once more.
+    let mut f = std::fs::File::create(&path).ok()?;
+    f.write_all(stdout.as_bytes()).ok()?;
     if !stderr.is_empty() {
-        body.push_str("\n[stderr]\n");
-        body.push_str(stderr);
+        f.write_all(b"\n[stderr]\n").ok()?;
+        f.write_all(stderr.as_bytes()).ok()?;
     }
-    std::fs::write(&path, body).ok()?;
     Some(path)
 }
 
@@ -310,17 +335,21 @@ pub fn relative_to_cwd(so: &mut String, se: &mut String, cwd: Option<&std::path:
     };
     let dir = dir.to_string_lossy();
     let dir = dir.trim_start_matches(r"\\?\");
-    let (mut a, mut b) = (so.clone(), se.clone());
-    let (na, nb) = (relative_paths(&mut a, dir), relative_paths(&mut b, dir));
+    let ((a, na), (b, nb)) = (shorten(so, dir), shorten(se, dir));
     if na + nb < 3 {
         return;
     }
-    let t = if na > 0 { &mut a } else { &mut b };
+    if let Some(a) = a {
+        *so = a;
+    }
+    if let Some(b) = b {
+        *se = b;
+    }
+    let t = if na > 0 { so } else { se };
     if !t.is_empty() && !t.ends_with('\n') {
         t.push('\n');
     }
     t.push_str(&format!("[qx] paths relative to {dir}\n"));
-    (*so, *se) = (a, b);
 }
 
 /// A line redrawn with lone `\r` (a progress bar) shows only its last frame on a terminal. Keep that
@@ -454,7 +483,7 @@ pub fn compact(text: &str, max_lines: usize, head: usize, tail: usize) -> (Strin
 /// Each diagnostic line in `middle` with up to `follow` plain lines under it: those carry the
 /// `--> file:line:col` or the panic message that makes the marker line usable. A following marker
 /// line starts its own group, so every group holds exactly one marker.
-fn rescue_groups(middle: &[String], follow: usize) -> Vec<std::ops::Range<usize>> {
+fn rescue_groups(middle: &[Cow<'_, str>], follow: usize) -> Vec<std::ops::Range<usize>> {
     let mut groups = Vec::new();
     let mut i = 0;
     while i < middle.len() {
@@ -589,6 +618,35 @@ mod tests {
         assert_eq!(t, r"src\a.rs:3, b.rs, é D:\x\C:\proj\no, c.rs, C:\ProjX\z");
         let mut root = String::from(r"C:\a");
         assert_eq!(relative_paths(&mut root, "C:\\"), 0);
+    }
+
+    #[test]
+    fn relative_to_cwd_needs_three_hits_and_puts_the_note_on_the_stream_that_had_them() {
+        let cwd = std::path::Path::new(r"C:\proj");
+        let three = "C:\\proj\\a.rs\nC:\\proj\\b.rs\nC:\\proj\\c.rs\n";
+
+        let (mut so, mut se) = (three.to_string(), String::from("clean\n"));
+        relative_to_cwd(&mut so, &mut se, Some(cwd));
+        assert_eq!(so, "a.rs\nb.rs\nc.rs\n[qx] paths relative to C:\\proj\n");
+        assert_eq!(se, "clean\n");
+
+        // Hits split across the streams still count together; the note goes to stdout.
+        let (mut so, mut se) = (String::from("C:\\proj\\a.rs\n"), String::from("C:\\proj\\b.rs\nC:\\proj\\c.rs\n"));
+        relative_to_cwd(&mut so, &mut se, Some(cwd));
+        assert_eq!(so, "a.rs\n[qx] paths relative to C:\\proj\n");
+        assert_eq!(se, "b.rs\nc.rs\n");
+
+        // Only stderr has hits: the note lands there.
+        let (mut so, mut se) = (String::from("plain\n"), three.to_string());
+        relative_to_cwd(&mut so, &mut se, Some(cwd));
+        assert_eq!(so, "plain\n");
+        assert_eq!(se, "a.rs\nb.rs\nc.rs\n[qx] paths relative to C:\\proj\n");
+
+        // Two hits are not worth the note: both streams come back byte for byte.
+        let two = "C:\\proj\\a.rs\nC:\\proj\\b.rs\n";
+        let (mut so, mut se) = (two.to_string(), String::from("x\n"));
+        relative_to_cwd(&mut so, &mut se, Some(cwd));
+        assert_eq!((so.as_str(), se.as_str()), (two, "x\n"));
     }
 
     #[test]

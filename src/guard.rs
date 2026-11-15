@@ -1269,6 +1269,40 @@ fn qx_switch(token: &str) -> bool {
     n == "qx_guard" || n == "qx_redact" || n.starts_with("qx_allow_")
 }
 
+/// Judge the environment a call hands to its command (the `env` object, or `NAME=value` words in
+/// front of the line). The command line is judged whole, but these values reach the child unseen:
+/// an `env` of `QX_GUARD=off` would switch the gate off for a nested `qx`, and `GIT_SSH_COMMAND`
+/// makes an allowed `git fetch` run any program. The switches are denied, the code-running
+/// variables warned about (a deny in strict mode).
+pub fn check_env(envs: &[(String, String)]) -> Decision {
+    let mut d = Decision::allow();
+    for (name, value) in envs {
+        let lower = name.to_ascii_lowercase();
+        if qx_switch(&lower) {
+            d.deny(format!("environment sets {name}: a qx switch only the owner may set"));
+        } else if runs_code_from_env(&lower, value) {
+            d.warn(format!("environment {name} makes a trusted program run other code"));
+        }
+    }
+    finalize(mode(), d)
+}
+
+/// Variables whose value is a program or a script that a well-known tool starts by itself.
+fn runs_code_from_env(name: &str, value: &str) -> bool {
+    match name {
+        "git_ssh_command" | "git_ssh" | "git_external_diff" | "git_askpass" | "ssh_askpass" | "git_proxy_command"
+        | "git_config_parameters" | "git_config_count" | "pythonstartup" | "comspec" | "bash_env"
+        | "npm_config_script_shell" => true,
+        // `--max-old-space-size=4096` is routine; a preloaded module or loader is code.
+        "node_options" => {
+            let v = value.to_ascii_lowercase();
+            ["--require", "--import", "--loader", "--experimental-loader", " -r ", "-r="].iter().any(|f| v.contains(f))
+                || v.starts_with("-r ")
+        }
+        _ => false,
+    }
+}
+
 /// Texts of `$(..)`, `<(..)`, `>(..)` and backtick substitutions, outside single quotes.
 fn substitutions(s: &str) -> Vec<String> {
     let b: Vec<char> = s.chars().collect();
@@ -1322,7 +1356,7 @@ fn finalize(m: Mode, mut d: Decision) -> Decision {
     }
 }
 
-fn merge(dst: &mut Decision, src: Decision) {
+pub(crate) fn merge(dst: &mut Decision, src: Decision) {
     for r in src.reasons {
         match src.level {
             Level::Deny => dst.deny(r),
@@ -3621,6 +3655,28 @@ mod tests {
         assert_eq!(level("rm -rf $SOMEWHERE_QX_UNSET/x"), Level::Warn);
         assert_eq!(level("rd /s /q %QX_UNSET_VAR:~0,3%"), Level::Warn);
         assert_eq!(level("d=build; rm -rf $d"), Level::Allow);
+    }
+
+    fn env_level(pairs: &[(&str, &str)]) -> Level {
+        let v: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        check_env(&v).level
+    }
+
+    #[test]
+    fn the_environment_of_a_call_cannot_switch_qx_off() {
+        for name in ["QX_GUARD", "qx_guard", "QX_REDACT", "QX_ALLOW_OUTSIDE"] {
+            assert_eq!(env_level(&[(name, "off")]), Level::Deny, "{name}");
+        }
+        // Ordinary variables stay open.
+        assert_eq!(env_level(&[("RUST_LOG", "debug"), ("CI", "1")]), Level::Allow);
+    }
+
+    #[test]
+    fn environment_variables_that_run_code_are_warned_about_but_routine_ones_are_not() {
+        assert_eq!(env_level(&[("GIT_SSH_COMMAND", "ssh -i key")]), Level::Warn);
+        assert_eq!(env_level(&[("NODE_OPTIONS", "--require ./x.js")]), Level::Warn);
+        assert_eq!(env_level(&[("NODE_OPTIONS", "-r ./x.js")]), Level::Warn);
+        assert_eq!(env_level(&[("NODE_OPTIONS", "--max-old-space-size=4096")]), Level::Allow);
     }
 
     #[test]

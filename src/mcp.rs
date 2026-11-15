@@ -4,7 +4,7 @@
 //! server speaks correctly to dsh, Claude Code, Codex, OpenCode, Hermes and pi.
 
 use crate::client::{self, Client, Native, Structured};
-use crate::{builtin, compact, digest, exec, guard, npm, redact};
+use crate::{builtin, compact, digest, exec, guard, npm, redact, stats};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,12 +62,16 @@ fn serve_io<R: BufRead, W: Write + Send + 'static>(mut reader: R, out: W, limits
     let mut buf = Vec::new();
     loop {
         buf.clear();
+        // One 16 MiB `fs write` request must not leave 16 MiB held for the rest of the session.
+        if buf.capacity() > 1 << 20 {
+            buf = Vec::new();
+        }
         // Bytes, not `lines()`: one invalid UTF-8 byte must not end the session.
         if !matches!(reader.read_until(b'\n', &mut buf), Ok(n) if n > 0) {
             break;
         }
         let arrived = std::time::Instant::now();
-        let line = String::from_utf8_lossy(&buf).into_owned();
+        let line = String::from_utf8_lossy(&buf);
         if line.trim().is_empty() {
             continue;
         }
@@ -142,6 +146,7 @@ fn serve_io<R: BufRead, W: Write + Send + 'static>(mut reader: R, out: W, limits
     while active.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
+    stats::flush();
     0
 }
 
@@ -424,9 +429,66 @@ fn handle(req: &Value) -> Option<Value> {
             Some(id),
             json!({ "tools": [run_schema(), fs_schema()] }),
         )),
-        "tools/call" => Some(call_tool(req, Some(id))),
+        "tools/call" => Some(call_logged(req, Some(id))),
         _ => Some(rpc_error(id, -32601, "method not found")),
     }
+}
+
+/// `call_tool` plus one ledger line (see `stats`): tool, op or command's first word, time and sizes.
+fn call_logged(req: &Value, id: Option<Value>) -> Value {
+    if !stats::enabled() {
+        return call_tool(req, id);
+    }
+    let started = std::time::Instant::now();
+    stats::take_raw();
+    let reply = call_tool(req, id);
+    let args = req.pointer("/params/arguments").unwrap_or(&Value::Null);
+    let text = |v: &Value| v.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or("").to_string();
+    let reply_text = text(&reply);
+    let (tool, key) = match req.pointer("/params/name").and_then(Value::as_str) {
+        Some("fs") => (
+            "fs",
+            match args.get("op").and_then(Value::as_str) {
+                Some(op) => op.to_string(),
+                None if args.get("ops").is_some() => "batch".to_string(),
+                None if args.get("paths").is_some() => "read".to_string(),
+                None => "?".to_string(),
+            },
+        ),
+        Some("run") => (
+            "run",
+            if args.get("job").is_some() {
+                "job".to_string()
+            } else {
+                stats::first_word(
+                    args.get("program").or_else(|| args.get("command")).and_then(Value::as_str).unwrap_or("?"),
+                )
+            },
+        ),
+        _ => return reply,
+    };
+    let code = reply
+        .pointer("/result/structuredContent/exit_code")
+        .and_then(Value::as_i64)
+        .map_or(i32::from(reply.pointer("/result/isError") == Some(&json!(true))), |c| c as i32);
+    let raw = stats::take_raw();
+    let flags = if reply_text.starts_with("[qx] unchanged since your last read") {
+        "unchanged"
+    } else if reply_text.contains("moved to background job") || reply_text.contains(" started") && args.get("background").is_some() {
+        "job"
+    } else {
+        ""
+    };
+    stats::record(stats::Entry {
+        tool,
+        key,
+        ms: started.elapsed().as_millis() as u64,
+        code,
+        raw: if raw > 0 { raw } else { reply_text.len() },
+        reply: reply_text.len(),
+        flags,
+    });
+    reply
 }
 
 fn ok(id: Option<Value>, result: Value) -> Value {
@@ -513,7 +575,7 @@ fn fs_schema() -> Value {
     let mut schema = json!({
         "name": "fs",
         "title": "qx fs",
-        "description": "In-process files in the workspace. op=read (path, offset?, limit?; also dirs, any path, any size); write (path, content; replacing a file needs a prior read); edit (path, old_string, new_string, replace_all?; unique exact match, no prior read); glob (pattern, path?; newest first); grep (pattern REGEX, path?, include?, ignore_case?, literal?); list; stat. Batch: `ops:[{op,...}]` (max 32, in order, shared cwd), `paths:[..]` reads/stats many, `edits:[{old_string,new_string,replace_all?}]` atomic on one path. Pass `cwd`. Writes stay inside cwd or %TEMP%\\claude; reads can go anywhere. Generated dirs (node_modules, target, build, dist, vendor) are skipped unless named or all=true.",
+        "description": "In-process files in the workspace. op=read (path, offset?, limit?, fresh?; also dirs, any path, any size; a repeat read of an unchanged file returns a one-line stub, fresh=true re-sends); write (path, content; replacing a file needs a prior read); edit (path, old_string, new_string, replace_all?; unique exact match, no prior read); glob (pattern, path?; newest first); grep (pattern REGEX, path?, include?, ignore_case?, literal?); list; stat. Batch: `ops:[{op,...}]` (max 32, in order, shared cwd), `paths:[..]` reads/stats many, `edits:[{old_string,new_string,replace_all?}]` atomic on one path. Pass `cwd`. Writes stay inside cwd or %TEMP%\\claude; reads can go anywhere. Generated dirs (node_modules, target, build, dist, vendor) are skipped unless named or all=true.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -535,6 +597,7 @@ fn fs_schema() -> Value {
                 "max_matches": { "type": "integer", "description": "grep: default 250, cap 1000." },
                 "max_line_chars": { "type": "integer", "description": "read/grep: clip each line (default 2000, cap 8000)." },
                 "ignore_case": { "type": "boolean" },
+                "fresh": { "type": "boolean", "description": "read: send the text even if unchanged since your last read." },
                 "literal": { "type": "boolean", "description": "grep: plain text, not regex." },
                 "all": { "type": "boolean", "description": "glob/grep: include node_modules, target, build, dist, vendor." }
             },
@@ -638,6 +701,9 @@ struct JobRec {
     /// When a poll first reported the result: a second poll (a retry, a parallel call) still gets it until
     /// `JOB_GRACE_MS` later, then the job is forgotten.
     reported: Mutex<Option<std::time::Instant>>,
+    /// The reply the first poll rendered. A repeat poll answers from it, so the raw output (up to
+    /// 32 MiB) is freed after the first report instead of being cloned and rendered again.
+    rendered: Mutex<Option<Value>>,
 }
 
 static JOBS: Mutex<Vec<Arc<JobRec>>> = Mutex::new(Vec::new());
@@ -696,6 +762,7 @@ fn spawn_runner(ctx: RunCtx, work: impl FnOnce() -> RunResult + Send + 'static) 
         result: Mutex::new(None),
         cv: std::sync::Condvar::new(),
         reported: Mutex::new(None),
+        rendered: Mutex::new(None),
     });
     let r = rec.clone();
     let spawned = std::thread::Builder::new().name("qx-run".into()).spawn(move || {
@@ -830,6 +897,11 @@ fn job_call(id: Option<Value>, job: &str, wait_ms: u64, kill: bool) -> Value {
             true,
         );
     };
+    // A second poll of a reported job (a retry, a parallel call) gets the reply the first one rendered.
+    if let Some(mut v) = rec.rendered.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        v["id"] = id.unwrap_or(Value::Null);
+        return v;
+    }
     // A job that was still running when asked to stop was stopped by the caller, not by a timeout.
     let stopping = kill && !rec.done();
     let until = if kill {
@@ -840,6 +912,11 @@ fn job_call(id: Option<Value>, job: &str, wait_ms: u64, kill: bool) -> Value {
     };
     match rec.wait(until, &call, kill) {
         Some(mut res) => {
+            // Lost a race with a parallel poll that rendered and freed the raw output meanwhile.
+            if let Some(mut v) = rec.rendered.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                v["id"] = id.unwrap_or(Value::Null);
+                return v;
+            }
             rec.reported.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(std::time::Instant::now);
             if stopping {
                 if let Ok((o, _)) = &mut res {
@@ -848,7 +925,15 @@ fn job_call(id: Option<Value>, job: &str, wait_ms: u64, kill: bool) -> Value {
             }
             let how = if stopping { "stopped on request" } else { "finished" };
             let prefix = format!("[qx] job {job} {how} after {}\n", human(rec.started.elapsed()));
-            finish(id, res, &rec.ctx, &prefix)
+            let reply = finish(id, res, &rec.ctx, &prefix);
+            // Keep the rendered reply first, then let go of the raw output: a poll that finds the reply
+            // never reads the output, and one that raced past the check above re-checks after `wait`.
+            *rec.rendered.lock().unwrap_or_else(|e| e.into_inner()) = Some(reply.clone());
+            if let Some(Ok((o, _))) = rec.result.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                o.stdout = String::new();
+                o.stderr = String::new();
+            }
+            reply
         }
         None => {
             let headline = if kill {
@@ -964,7 +1049,19 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
         }
         let args = args.clone();
         return match cancellable(&call, move || crate::fsops::call(&args)) {
-            Ok(reply) => tool_result(id, &reply.text, reply.is_error, reply.structured),
+            Ok(reply) => {
+                // A stub stands in for the whole file when it covers every line: the ledger credits those bytes.
+                let s = &reply.structured;
+                if s.get("unchanged") == Some(&json!(true))
+                    && s.get("start_line") == Some(&json!(1))
+                    && s.get("end_line") == s.get("total_lines")
+                {
+                    if let Some(b) = s.get("bytes").and_then(Value::as_u64) {
+                        stats::note_raw(b as usize);
+                    }
+                }
+                tool_result(id, &reply.text, reply.is_error, reply.structured)
+            }
             Err(why) => tool_text(id, &format!("[qx] fs call {why}; it may still finish in the background"), true),
         };
     }
@@ -1061,13 +1158,18 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
             json!({"timed_out": true, "exit_code": 124, "source": "cancelled"}),
         );
     }
-    let decision = if let Some(p) = program {
+    let mut decision = if let Some(p) = program {
         guard::check(p, &list, cwd.as_deref())
     } else if let Some(c) = cmdline {
         guard::check_shell(c, cwd.as_deref())
     } else {
         guard::Decision::allow()
     };
+    // The environment the command receives is judged too: the line alone never shows it.
+    guard::merge(&mut decision, guard::check_env(&user_env));
+    if let Some(c) = cmdline.filter(|_| program.is_none()) {
+        guard::merge(&mut decision, guard::check_env(&exec::peel_env(c).0));
+    }
     if !decision.allowed() {
         guard::record("mcp", guard_cmd, &decision);
         return tool_result(
@@ -1182,6 +1284,7 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
 fn render(id: Option<Value>, outcome: exec::Outcome, source: &str, ctx: &RunCtx, prefix: &str) -> Value {
     let (full, cwd, guard_warning) = (ctx.full, ctx.cwd.as_deref(), ctx.guard_warning.clone());
     let label = ctx.label.as_str();
+    stats::note_raw(outcome.stdout.len() + outcome.stderr.len());
     let strip = |s: String| if s.contains('\x1b') { compact::strip_ansi(&s) } else { s };
     let mut so = strip(outcome.stdout);
     let mut se = strip(outcome.stderr);
@@ -1288,8 +1391,15 @@ fn render(id: Option<Value>, outcome: exec::Outcome, source: &str, ctx: &RunCtx,
         "source": source,
         "exit_code": outcome.code,
         "duration_ms": outcome.elapsed.as_millis() as u64,
-        "stdout": so,
     });
+    // Only the full structured copy carries the streams (`tool_result` strips them for `Meta` and drops
+    // the lot for `Off`), so only then are they moved in rather than copied for nothing.
+    if matches!(client::current().structured(), Structured::Full) {
+        meta["stdout"] = Value::String(so);
+        if !se.is_empty() {
+            meta["stderr"] = Value::String(se);
+        }
+    }
     // A key left out means its default (false, 0, "", null): constants cost tokens on every call.
     for (key, value, present) in [
         ("timed_out", json!(true), outcome.timed_out),
@@ -1298,7 +1408,6 @@ fn render(id: Option<Value>, outcome: exec::Outcome, source: &str, ctx: &RunCtx,
         ("redactions", json!(redactions), redactions > 0),
         ("profile", json!(profile), !profile.is_empty()),
         ("omitted_lines", json!(omitted), omitted > 0),
-        ("stderr", json!(se), !se.is_empty()),
         ("guard_warning", json!(guard_warning), guard_warning.is_some()),
     ] {
         if present {
@@ -2093,6 +2202,29 @@ mod tests {
         let second = run(json!({"job":job,"wait_ms":8000}));
         assert_eq!(second.pointer("/result/structuredContent/exit_code"), Some(&json!(0)), "{second}");
         assert_ne!(second.pointer("/result/isError"), Some(&json!(true)), "{second}");
+    }
+
+    #[test]
+    fn a_reported_job_keeps_its_reply_and_frees_the_raw_output() {
+        let _server = server_lock();
+        let run = |args: Value| client::scoped(Client::Dsh, || call(args));
+        let r = run(json!({"command":"sleep 1 && echo qx-job-text","background":true}));
+        let job = r
+            .pointer("/result/structuredContent/job")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("a job handle, got {r}"))
+            .to_string();
+        let first = run(json!({"job":job,"wait_ms":8000}));
+        let text = |v: &Value| v.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or("").to_string();
+        assert!(text(&first).contains("qx-job-text"), "{first}");
+        let rec = find_job(&job).expect("the job is kept for the grace period");
+        let held = match rec.result.lock().unwrap().as_ref() {
+            Some(Ok((o, _))) => o.stdout.len() + o.stderr.len(),
+            _ => panic!("a finished command"),
+        };
+        assert_eq!(held, 0, "the raw output should be freed once reported");
+        let second = run(json!({"job":job,"wait_ms":8000}));
+        assert_eq!(text(&second), text(&first));
     }
 
     #[test]

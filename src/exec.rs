@@ -383,21 +383,14 @@ pub(crate) fn apply_child_defaults(cmd: &mut Command, npm: bool) {
     }
 }
 
-fn prepend_path(cmd: &mut Command, dir: &std::path::Path) {
-    let key = dir
-        .to_string_lossy()
-        .trim_end_matches(['\\', '/'])
-        .to_ascii_lowercase();
-    let mut dirs = vec![dir.to_path_buf()];
-    for d in resolve::path_dirs() {
-        let k = d
-            .to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .to_ascii_lowercase();
-        if k != key {
-            dirs.push(d);
-        }
-    }
+/// Put `front` at the head of the child's PATH, in that order, ahead of the inherited folders (a
+/// folder already on PATH moves up instead of repeating). One call for all folders: PATH is rebuilt
+/// from the inherited one each time, so a second call would drop the first call's folders.
+fn prepend_paths(cmd: &mut Command, front: &[std::path::PathBuf]) {
+    let key = |d: &std::path::Path| d.to_string_lossy().trim_end_matches(['\\', '/']).to_ascii_lowercase();
+    let keys: Vec<String> = front.iter().map(|d| key(d)).collect();
+    let mut dirs = front.to_vec();
+    dirs.extend(resolve::path_dirs().into_iter().filter(|d| !keys.contains(&key(d))));
     if let Ok(path) = std::env::join_paths(dirs) {
         cmd.env("PATH", path);
     }
@@ -450,7 +443,7 @@ pub fn build_command_env(
         let mut c = Command::new(r.exe);
         c.args(args);
         prepare(&mut c);
-        prepend_path(&mut c, &r.bin);
+        prepend_paths(&mut c, std::slice::from_ref(&r.bin));
         c.env("RUSTUP_TOOLCHAIN", &r.toolchain);
         apply_child_defaults(&mut c, npmish);
         return Ok(c);
@@ -563,8 +556,7 @@ pub fn command_for(program: &str, target: Target, args: &[String]) -> Result<Com
             }
             if let Some(git) = git_root(&c) {
                 // The mingw64 binary was reached past Git\cmd, which would have set this PATH.
-                prepend_path(&mut c, &git.join("mingw64").join("bin"));
-                prepend_path(&mut c, &git.join("usr").join("bin"));
+                prepend_paths(&mut c, &[git.join("mingw64").join("bin"), git.join("usr").join("bin")]);
             }
             apply_child_defaults(&mut c, npmish);
             Ok(c)
@@ -1271,6 +1263,12 @@ pub(crate) fn set_progress_slot(slot: Option<std::sync::Arc<std::sync::Mutex<Opt
     PROGRESS_SLOT.with(|p| *p.borrow_mut() = slot);
 }
 
+/// Closing line of a stream the capture limit cut. The end is kept (`Buf`), so say the middle is
+/// what is missing: "truncated" read as "the final lines are gone".
+fn cut_note(stream: &str) -> String {
+    format!("\n[qx] {stream} over the 16 MiB capture limit: start and end kept, middle omitted\n")
+}
+
 fn snapshot(c: &Capture) -> (Vec<u8>, bool) {
     let mut data = match c.data.lock() {
         Ok(mut b) => {
@@ -1741,10 +1739,10 @@ fn collect(
     let mut stdout = decode_output(so);
     let mut stderr = decode_output(se);
     if so_cut {
-        stdout.push_str("\n[qx] stdout truncated at 16 MiB\n");
+        stdout.push_str(&cut_note("stdout"));
     }
     if se_cut {
-        stderr.push_str("\n[qx] stderr truncated at 16 MiB\n");
+        stderr.push_str(&cut_note("stderr"));
     }
 
     Ok(Outcome {
@@ -2010,6 +2008,23 @@ pub(crate) fn decode(bytes: &[u8]) -> String {
     if s.contains('\0') { s.replace('\0', "") } else { s.into_owned() }
 }
 
+/// `decode` for bytes the caller no longer needs: valid UTF-8 (nearly every file) becomes the string
+/// without a second copy.
+pub(crate) fn decode_owned(bytes: Vec<u8>) -> String {
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return decode(&bytes);
+    }
+    match String::from_utf8(bytes) {
+        Ok(mut s) => {
+            if s.contains('\0') {
+                s.retain(|c| c != '\0');
+            }
+            s
+        }
+        Err(e) => decode(e.as_bytes()),
+    }
+}
+
 /// Give a child the `NAME=value` prefix of its command line. qx's own environment is never touched.
 pub fn apply_envs(cmd: &mut Command, envs: &[(String, String)]) {
     cmd.envs(envs.iter().map(|(k, v)| (k, v)));
@@ -2191,6 +2206,19 @@ pub fn split_simple(s: &str) -> Option<(String, Vec<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_folder_given_to_prepend_paths_reaches_the_front_in_order() {
+        // Two separate calls used to rebuild PATH from the inherited one, so the first folder was lost.
+        let mut c = Command::new("x");
+        let (a, b) = (std::path::PathBuf::from(r"C:\qx-test\mingw64\bin"), std::path::PathBuf::from(r"C:\qx-test\usr\bin"));
+        prepend_paths(&mut c, &[a.clone(), b.clone()]);
+        let path = c.get_envs().find(|(k, _)| *k == "PATH").and_then(|(_, v)| v).expect("PATH set");
+        let dirs: Vec<_> = std::env::split_paths(path).collect();
+        assert_eq!(dirs[..2], [a.clone(), b.clone()]);
+        // A folder that is also on the inherited PATH appears once, at the front.
+        assert_eq!(dirs.iter().filter(|d| **d == a).count(), 1);
+    }
 
     #[test]
     fn splits_plain_commands() {
@@ -2781,6 +2809,9 @@ mod tests {
         // The kept tail starts on a whole line.
         let after = text.split("(capture limit)\n").nth(1).unwrap();
         assert!(after.starts_with("line "), "{after}");
+        // The closing note names what is missing; the old "truncated" wording implied the end.
+        let note = cut_note("stdout");
+        assert!(note.contains("middle omitted") && !note.contains("truncated"), "{note}");
     }
 
     #[test]

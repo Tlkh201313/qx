@@ -136,7 +136,7 @@ fn cloud_placeholder(md: &fs::Metadata) -> bool {
 #[cfg_attr(test, allow(dead_code))] // only the warm-up thread calls it, and tests do not start that
 pub(crate) fn prime(dir: &Path) {
     // A drive root or the home folder is not a workspace: reading it would walk the whole disk.
-    if dir.parent().is_none() || crate::resolve::home_dir().is_some_and(|h| h == dir) {
+    if crate::warmup::off() || dir.parent().is_none() || crate::resolve::home_dir().is_some_and(|h| h == dir) {
         return;
     }
     static SEEN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
@@ -254,7 +254,7 @@ pub fn call(args: &Value) -> Reply {
 const KNOWN_KEYS: &[&str] = &[
     "op", "cwd", "path", "file_path", "content", "old_string", "new_string", "replace_all", "ops", "paths", "edits",
     "pattern", "include", "offset", "limit", "max_results", "max_matches", "max_line_chars", "ignore_case", "literal",
-    "all", "context", "-C", "-A", "-B",
+    "all", "context", "-C", "-A", "-B", "fresh",
 ];
 
 /// The keys of the call (and of each `ops` item) that no operation reads, in first-seen order.
@@ -804,6 +804,69 @@ fn remember(path: &Path, version: Version) {
     observations().lock().unwrap_or_else(|e| e.into_inner()).insert(path.to_path_buf(), version);
 }
 
+/// What `read` already sent for one file: which lines, of which content. A repeat read of lines the
+/// agent already holds, from a file that has not changed, answers with one line instead of the text.
+struct Served {
+    version: Version,
+    lo: usize,
+    hi: usize,
+    max_line_chars: usize,
+    at: std::time::Instant,
+}
+
+const SERVED_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const SERVED_MAX: usize = 256;
+
+fn served() -> &'static Mutex<HashMap<PathBuf, Served>> {
+    static MAP: OnceLock<Mutex<HashMap<PathBuf, Served>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `QX_READ_MEMORY=off` turns the stubs off for the whole server.
+fn read_memory_on() -> bool {
+    std::env::var("QX_READ_MEMORY").map(|v| !v.eq_ignore_ascii_case("off")).unwrap_or(true)
+}
+
+/// True when lines `lo..=hi` of this exact content were already sent, at least as wide, within the idle limit.
+fn already_served(path: &Path, version: Version, lo: usize, hi: usize, max_line_chars: usize) -> bool {
+    let map = served().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(path).is_some_and(|s| {
+        s.version.len == version.len
+            && s.version.hash == version.hash
+            && s.at.elapsed() < SERVED_IDLE
+            && s.lo <= lo
+            && hi <= s.hi
+            && s.max_line_chars >= max_line_chars
+    })
+}
+
+/// Note that lines `lo..=hi` reached the agent. Adjacent or overlapping windows of the same content merge.
+fn note_served(path: &Path, version: Version, lo: usize, hi: usize, max_line_chars: usize) {
+    if hi < lo {
+        return;
+    }
+    let mut map = served().lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= SERVED_MAX && !map.contains_key(path) {
+        map.retain(|_, s| s.at.elapsed() < SERVED_IDLE);
+        if map.len() >= SERVED_MAX {
+            map.clear();
+        }
+    }
+    let same = |s: &Served| {
+        s.version.len == version.len
+            && s.version.hash == version.hash
+            && s.at.elapsed() < SERVED_IDLE
+            && s.max_line_chars == max_line_chars
+            && lo <= s.hi + 1
+            && s.lo <= hi + 1
+    };
+    let (lo, hi) = match map.get(path) {
+        Some(s) if same(s) => (lo.min(s.lo), hi.max(s.hi)),
+        _ => (lo, hi),
+    };
+    map.insert(path.to_path_buf(), Served { version, lo, hi, max_line_chars, at: std::time::Instant::now() });
+}
+
 fn check_observed(path: &Path, current: Version, display: &str) -> Result<(), FsError> {
     let map = observations().lock().unwrap_or_else(|e| e.into_inner());
     match map.get(path) {
@@ -1166,6 +1229,31 @@ fn read(root: &Root, args: &Value) -> Result<Reply, FsError> {
     }
     let text = decode_text(&bytes);
     let display = root.display(&path);
+    // Memory of what this server already sent: an unchanged file and a window the agent holds get a stub.
+    let total = count_lines(text.as_bytes());
+    let want_hi = offset.saturating_add(limit - 1).min(total);
+    if read_memory_on() && !bool_arg(args, "fresh", false) && total > 0 && offset <= total
+        && already_served(&path, version, offset, want_hi, max_line_chars)
+    {
+        remember(&path, version);
+        return Ok(Reply {
+            text: format!(
+                "[qx] unchanged since your last read (lines {offset}-{want_hi} of {total}); fresh=true sends it again"
+            ),
+            structured: json!({
+                "op": "read",
+                "path": display,
+                "lines": 0,
+                "total_lines": total,
+                "end_line": want_hi,
+                "truncated": false,
+                "unchanged": true,
+                "start_line": offset,
+                "bytes": bytes.len(),
+            }),
+            is_error: false,
+        });
+    }
     let out = render_read(
         &display,
         &text,
@@ -1175,6 +1263,9 @@ fn read(root: &Root, args: &Value) -> Result<Reply, FsError> {
         DEFAULT_READ_BYTES,
     )?;
     remember(&path, version);
+    if out.lines > 0 {
+        note_served(&path, version, offset, out.end_line, max_line_chars);
+    }
     Ok(Reply {
         text: out.text,
         structured: json!({
@@ -1920,7 +2011,9 @@ fn glob_once(root: &Root, args: &Value, pattern: &str) -> Result<Reply, FsError>
     if scan_capped {
         out.push_str("[qx] scan stopped at the file budget; results may be incomplete.\n");
     }
-    if !skipped.is_empty() {
+    // Said only when nothing was found: with hits the line is ~45 tokens on every call, and the
+    // `all` option is in the tool's description.
+    if count == 0 && !skipped.is_empty() {
         out.push_str(&skip_note(&skipped));
     }
     Ok(Reply {
@@ -2208,7 +2301,7 @@ fn grep(root: &Root, args: &Value) -> Result<Reply, FsError> {
     if !left_out.is_empty() {
         out.push_str(&format!("[qx] skipped {} file(s).\n", left_out.join(", ")));
     }
-    if !skipped_dirs.is_empty() {
+    if total == 0 && !skipped_dirs.is_empty() {
         out.push_str(&skip_note(&skipped_dirs));
     }
     if scan_capped {
@@ -2260,7 +2353,7 @@ enum Cached {
 
 static CONTENT: std::sync::RwLock<Option<HashMap<PathBuf, (SystemTime, Cached)>>> = std::sync::RwLock::new(None);
 static CONTENT_BYTES: AtomicUsize = AtomicUsize::new(0);
-const MAX_CONTENT_BYTES: usize = 128 << 20;
+const MAX_CONTENT_BYTES: usize = 32 << 20;
 const MAX_CACHED_FILE: usize = 256 << 10;
 /// A file written less than this long ago is read fresh: its writer may still be going.
 const SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
@@ -2285,11 +2378,15 @@ fn content_put(path: &Path, mtime: SystemTime, what: Cached) {
         Cached::Text(t) => t.len() + 128,
         Cached::Binary => 128,
     };
-    if CONTENT_BYTES.load(Ordering::Relaxed) + size > MAX_CONTENT_BYTES {
-        return;
-    }
     if let Ok(mut guard) = CONTENT.write() {
         let map = guard.get_or_insert_with(HashMap::new);
+        // Full: start over. Refusing new files would keep the oldest ones (and deleted ones) for the whole
+        // session and stop the cache helping; a cleared one refills with what is searched now.
+        if CONTENT_BYTES.load(Ordering::Relaxed) + size > MAX_CONTENT_BYTES {
+            map.clear();
+            map.shrink_to_fit();
+            CONTENT_BYTES.store(0, Ordering::Relaxed);
+        }
         if let Some((_, old)) = map.insert(path.to_path_buf(), (mtime, what)) {
             let old_size = match old {
                 Cached::Text(t) => t.len() + 128,
@@ -2355,11 +2452,10 @@ fn scan_file(path: &Path, indexed: Option<SystemTime>, matcher: &Matcher, fast: 
             return sf;
         }
     };
-    let text = crate::exec::decode(&bytes);
-    if let Some(m) = indexed {
-        if bytes.len() <= MAX_CACHED_FILE {
-            content_put(path, m, Cached::Text(std::sync::Arc::from(&*text)));
-        }
+    let cacheable = indexed.filter(|_| bytes.len() <= MAX_CACHED_FILE);
+    let text = crate::exec::decode_owned(bytes);
+    if let Some(m) = cacheable {
+        content_put(path, m, Cached::Text(std::sync::Arc::from(text.as_str())));
     }
     scan_text(&text, matcher, fast, max_line_chars, max_store, &mut sf);
     sf
@@ -3594,6 +3690,44 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn a_repeat_read_of_an_unchanged_file_is_a_stub_until_the_file_changes() {
+        let dir = tmp("read-memory");
+        let f = dir.join("a.txt");
+        fs::write(&f, "one\ntwo\nthree\nfour\n").unwrap();
+        let first = invoke(&dir, "read", json!({"path": "a.txt"}));
+        assert!(first.text.contains("four"), "{}", first.text);
+        // Same window again: one line, no content.
+        let again = invoke(&dir, "read", json!({"path": "a.txt"}));
+        assert!(again.text.starts_with("[qx] unchanged since your last read"), "{}", again.text);
+        assert!(!again.text.contains("four"));
+        assert_eq!(again.structured["unchanged"], json!(true));
+        // A window inside what was sent is covered too.
+        let inner = invoke(&dir, "read", json!({"path": "a.txt", "offset": 2, "limit": 2}));
+        assert!(inner.text.starts_with("[qx] unchanged"), "{}", inner.text);
+        // fresh=true always sends the text.
+        let fresh = invoke(&dir, "read", json!({"path": "a.txt", "fresh": true}));
+        assert!(fresh.text.contains("four"), "{}", fresh.text);
+        // A change of content (same size) is sent in full again.
+        fs::write(&f, "one\ntwo\nthree\nFOUR\n").unwrap();
+        let changed = invoke(&dir, "read", json!({"path": "a.txt"}));
+        assert!(changed.text.contains("FOUR"), "{}", changed.text);
+    }
+
+    #[test]
+    fn read_memory_never_stubs_lines_that_were_not_sent() {
+        let dir = tmp("read-memory-range");
+        let body: String = (1..=10).map(|i| format!("line{i}\n")).collect();
+        fs::write(dir.join("b.txt"), body).unwrap();
+        let head = invoke(&dir, "read", json!({"path": "b.txt", "limit": 3}));
+        assert!(head.text.contains("line3") && !head.text.contains("line4"), "{}", head.text);
+        // The rest of the file was never sent: it must come through, and then everything is covered.
+        let rest = invoke(&dir, "read", json!({"path": "b.txt", "offset": 4}));
+        assert!(rest.text.contains("line10"), "{}", rest.text);
+        let all = invoke(&dir, "read", json!({"path": "b.txt"}));
+        assert!(all.text.starts_with("[qx] unchanged"), "{}", all.text);
+    }
+
     fn invoke(dir: &Path, op: &str, extra: Value) -> Reply {
         let mut args = json!({
             "op": op,
@@ -3671,7 +3805,11 @@ mod tests {
         fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
         fs::write(dir.join("empty.txt"), "").unwrap();
         for c in [Client::ClaudeCode, Client::Codex] {
-            let t = |args: Value| scoped(c, || invoke(&dir, "read", args)).text;
+            // `fresh`: this test checks the framing of a reply, not the read memory.
+            let t = |mut args: Value| {
+                args["fresh"] = json!(true);
+                scoped(c, || invoke(&dir, "read", args)).text
+            };
             // Whole file from line 1: the lines and nothing else.
             assert_eq!(t(json!({"path": "a.txt"})), "1: one\n2: two\n3: three");
             // A window says where it is and how to go on; the end of a later window says it is the end.
@@ -3685,11 +3823,11 @@ mod tests {
             );
             fs::remove_file(dir.join("w.txt")).unwrap();
             // A batch keeps one header per item and no tags inside it.
-            let b = scoped(c, || invoke(&dir, "read", json!({"paths": ["a.txt", "empty.txt"]}))).text;
+            let b = scoped(c, || invoke(&dir, "read", json!({"paths": ["a.txt", "empty.txt"], "fresh": true}))).text;
             assert_eq!(b, "== 1/2 read a.txt ==\n1: one\n2: two\n3: three\n\n== 2/2 read empty.txt ==\n(empty file)");
         }
         // Everyone else keeps the tag frame.
-        let r = scoped(Client::OpenCode, || invoke(&dir, "read", json!({"path": "a.txt"})));
+        let r = scoped(Client::OpenCode, || invoke(&dir, "read", json!({"path": "a.txt", "fresh": true})));
         assert!(r.text.starts_with("<path>a.txt</path>\n<type>file</type>\n<content>\n1: one"), "{}", r.text);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4236,7 +4374,9 @@ mod tests {
         assert!(r.text.contains("src/a.rs"));
         assert!(r.text.contains("src/b.txt"));
         assert!(!r.text.contains("node_modules/x.rs"));
-        assert!(r.text.contains("not searched: node_modules"), "{}", r.text);
+        assert!(!r.text.contains("not searched"), "a search with hits does not repeat the note: {}", r.text);
+        let r = invoke(&dir, "glob", json!({"pattern":"**/*.nothing"}));
+        assert!(r.text.contains("not searched: node_modules"), "an empty result says what was left out: {}", r.text);
         // Naming the directory, or asking for all, looks inside it.
         let r = invoke(&dir, "glob", json!({"pattern":"node_modules/**/*.rs"}));
         assert!(r.text.contains("node_modules/x.rs"), "{}", r.text);
@@ -4265,6 +4405,8 @@ mod tests {
 
         let r = invoke(&dir, "grep", json!({"pattern":"needle"}));
         assert!(r.text.contains("src/a.rs") && !r.text.contains("out/deep/x.rs"), "{}", r.text);
+        assert!(!r.text.contains("not searched:"), "{}", r.text);
+        let r = invoke(&dir, "grep", json!({"pattern":"absent-word"}));
         assert!(r.text.contains("not searched:") && r.text.contains("out"), "{}", r.text);
         let r = invoke(&dir, "glob", json!({"pattern":"**/*.rs"}));
         assert!(r.text.contains("src/a.rs") && !r.text.contains("out/deep/x.rs"), "{}", r.text);
@@ -4591,8 +4733,8 @@ mod tests {
         fs::remove_file(dir.join("src/a.rs")).unwrap();
         fs::remove_dir_all(dir.join("lib")).unwrap();
         assert_eq!(names("**/*.rs"), ["moved/b.rs", "src/c.rs"]);
-        // A generated directory stays out, and the reply says so.
-        assert!(glob("**/*.rs").contains("node_modules"), "{}", glob("**/*.rs"));
+        // A generated directory stays out, and an empty reply says so.
+        assert!(glob("**/*.nothing").contains("node_modules"), "{}", glob("**/*.nothing"));
         assert!(!glob("**/*.rs").contains("node_modules/pkg"));
         // Grep reads what the files hold now, including a rewrite of a file it has already searched.
         let g = |pat: &str| invoke(&dir, "grep", json!({"pattern": pat})).text;
@@ -5196,5 +5338,20 @@ mod tests {
         assert!(!r.is_error, "{}", r.text);
         assert_eq!(fs::read_to_string(dir.join("src/ok.txt")).unwrap(), "fine\n");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A full content cache starts over instead of refusing every new file for the rest of the session.
+    #[test]
+    fn a_full_content_cache_clears_and_caches_new_files_again() {
+        let old = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let chunk: std::sync::Arc<str> = std::sync::Arc::from("x".repeat(200 << 10).as_str());
+        let puts = MAX_CONTENT_BYTES / (200 << 10) + 8;
+        for i in 0..puts {
+            content_put(Path::new(&format!("full-cache-test-{i}")), old, Cached::Text(chunk.clone()));
+        }
+        let last = Path::new("full-cache-test-last");
+        content_put(last, old, Cached::Text(chunk.clone()));
+        assert!(content_get(last, old).is_some(), "a new file is cached after the cache filled");
+        assert!(CONTENT_BYTES.load(Ordering::Relaxed) <= MAX_CONTENT_BYTES, "the cache stays within its cap");
     }
 }

@@ -13,17 +13,19 @@ qx = Rust 2021, single binary `qx.exe`, deps only `regex` + `serde_json`. Window
 | `qx setup [client]` | `setup/` |
 | `qx deploy` | `deploy.rs` |
 | `qx doctor` / `bench` | `doctor.rs` |
+| Call ledger: every MCP `run`/`fs` call and CLI run → `%LOCALAPPDATA%\qx\stats.jsonl` (tool, op or first word only, ms, bytes; background writer, 8 MiB rotation, `QX_STATS=off`); `qx gain [--since 7d]` reads it; `call_logged` in mcp.rs | `stats.rs` |
+| Read memory: `fs read` of an unchanged file and an already-sent window returns a one-line stub (`Served`, `already_served`; `fresh=true` / `QX_READ_MEMORY=off` opt out) | `fsops.rs` |
 | `qx check "<cmd>"` / `policy` | guard dry run (`check_cmd` in main.rs → `guard.rs`) |
 | `qx audit`, `gain`, `which` | main.rs |
 
 ## Features → files (src/)
 | Feature | File |
 |---|---|
-| Safety gate: deny/warn rules, path expansion (8.3 names, `~user`, admin shares, cygdrive, braces, streams), launcher peeling, `for`/`forfiles` bodies per item, shell functions per call (`function_calls`), PowerShell autostart/scheduled-task cmdlets, inline perl/ruby/php/python/node code, home data folders | `guard.rs` |
+| Safety gate: deny/warn rules, path expansion (8.3 names, `~user`, admin shares, cygdrive, braces, streams), launcher peeling, `for`/`forfiles` bodies per item, shell functions per call (`function_calls`), the call's `env` and `X=Y` prefix values (`check_env`: qx switches denied, code-running vars like `GIT_SSH_COMMAND` warned), PowerShell autostart/scheduled-task cmdlets, inline perl/ruby/php/python/node code, home data folders | `guard.rs` |
 | Secret redaction of command output (key=value, tokens, Authorization schemes, .netrc, cookies, URL users); `fs` returns files unredacted | `redact.rs` |
 | Output compaction (ANSI, dedupe, head+tail, rescue buried errors) | `compact.rs` |
 | Command-aware digests (git status/diff, tests, builds, grep, JSON) — runs before compact; a red run keeps unknown column-0 and failure-word lines in the room left; long grep hits keep head+tail and spool | `digest.rs` |
-| In-process built-ins (ls cat grep sed rm cp …, decline → real exe; `sed -n A,Bp` streams files past `READ_CAP`) | `builtin.rs` |
+| In-process built-ins (ls cat grep sed rm cp …, decline → real exe; `sed -n A,Bp` streams files past `READ_CAP`; `cat` past it keeps start + last 2 MiB, `read_text_ends`) | `builtin.rs` |
 | Process spawn, shell fallback, capture, timeout, job window; Windows paths sent to bash get `/` (`slash_windows_paths`), and a POSIX tool given a `*` glob goes to bash (`posix_tool_backslash_glob`); env prefix per chain step (`chain_starts`, `assignment_word`); `PATH=` prefix resolves over that PATH (`resolve::resolve_in`); `timeout N`/`rmdir /s`/`find dir` routing (`posix_flags`); `.cmd` shim refuses a newline argument | `exec.rs` |
 | Find real exe, skip shims (Git cmd, npm.cmd, pip launchers) | `resolve.rs` |
 | `npm run/test/start` without npm CLI | `npm.rs` |

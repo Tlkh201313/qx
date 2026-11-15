@@ -19,6 +19,7 @@ mod python;
 mod redact;
 mod resolve;
 mod setup;
+mod stats;
 #[cfg_attr(test, allow(dead_code))] // `mcp::serve` starts it outside tests only
 mod warmup;
 
@@ -90,7 +91,7 @@ fn dispatch(args: &[String]) -> i32 {
         "deploy" => deploy::run(&args[1..]),
         "setup" => setup::run(&args[1..]),
         "hook" => hook::run(&args[1..]),
-        "gain" => gain(),
+        "gain" => gain(&args[1..]),
         "mcp" | "serve" => mcp::serve(),
         "which" => which(&args[1..]),
         "check" | "policy" => check_cmd(&args[1..]),
@@ -509,84 +510,32 @@ fn claude_shows_whole(bytes: usize) -> bool {
         && bytes <= std::env::var("BASH_MAX_OUTPUT_LENGTH").ok().and_then(|v| v.parse().ok()).unwrap_or(30_000)
 }
 
-fn stats_path() -> Option<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")?;
-    Some(PathBuf::from(base).join("qx").join("stats.jsonl"))
-}
-
+/// One CLI run into the ledger. Only the command's first word is kept, never its arguments.
 fn record_stat(label: &str, ms: u64, code: i32, bytes_in: usize, bytes_out: usize) {
-    // Opt-in: the whole point of qx is to avoid per-command overhead.
-    if std::env::var("QX_STATS").map(|v| v != "1").unwrap_or(true) {
-        return;
-    }
-    let Some(path) = stats_path() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let line = serde_json::json!({
-        "ts": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-        "cmd": label.chars().take(80).collect::<String>(),
-        "ms": ms,
-        "code": code,
-        "in": bytes_in,
-        "out": bytes_out,
+    stats::record_now(stats::Entry {
+        tool: "cli",
+        key: stats::first_word(label),
+        ms,
+        code,
+        raw: bytes_in,
+        reply: bytes_out,
+        flags: "",
     });
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{line}");
-    }
 }
 
-fn gain() -> i32 {
-    let Some(path) = stats_path() else {
-        println!("stats path unavailable");
-        return 0;
+/// `qx gain [--since 7d]`: what the ledger holds, per tool and command.
+fn gain(rest: &[String]) -> i32 {
+    let since = match rest.iter().position(|a| a == "--since") {
+        Some(i) => match rest.get(i + 1).and_then(|s| stats::parse_since(s)) {
+            Some(s) => s,
+            None => {
+                eprintln!("usage: qx gain [--since 7d|12h|30m]");
+                return 2;
+            }
+        },
+        None => 0,
     };
-    let data = match std::fs::read_to_string(&path) {
-        Ok(d) => d,
-        Err(_) => {
-            println!("no stats yet — run commands with QX_STATS=1, then `qx gain`");
-            return 0;
-        }
-    };
-
-    let mut calls = 0u64;
-    let mut ms = 0u128;
-    let mut bin = 0u64;
-    let mut bout = 0u64;
-    let mut per: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-
-    for line in data.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        calls += 1;
-        ms += v.get("ms").and_then(|x| x.as_u64()).unwrap_or(0) as u128;
-        bin += v.get("in").and_then(|x| x.as_u64()).unwrap_or(0);
-        bout += v.get("out").and_then(|x| x.as_u64()).unwrap_or(0);
-        if let Some(c) = v.get("cmd").and_then(|x| x.as_str()) {
-            let head = c.split_whitespace().next().unwrap_or("?").to_string();
-            *per.entry(head).or_insert(0) += 1;
-        }
-    }
-
-    let saved = bin.saturating_sub(bout);
-    let pct = (saved * 100).checked_div(bin).unwrap_or(0);
-    println!("qx gain");
-    println!("  calls      : {calls}");
-    println!("  exec time  : {:.1}s", ms as f64 / 1000.0);
-    println!("  output     : {} KiB -> {} KiB ({}% saved)", bin / 1024, bout / 1024, pct);
-    if !per.is_empty() {
-        let mut rows: Vec<_> = per.into_iter().collect();
-        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
-        println!("  top:");
-        for (name, n) in rows.into_iter().take(8) {
-            println!("    {n:>5}  {name}");
-        }
-    }
-    0
+    stats::report(since)
 }
 
 fn check_cmd(rest: &[String]) -> i32 {
@@ -725,7 +674,7 @@ USAGE
                                      register qx in each agent CLI's config
   qx hook claude                     Claude Code PreToolUse hook (`qx setup` registers it)
   qx which <command>...              show the real binary that will run
-  qx gain                            output savings (needs QX_STATS=1)
+  qx gain [--since 7d]               calls, timings and output savings per tool (QX_STATS=off stops recording)
   qx check <program|command>         dry-run the safety gate
   qx audit [N]                       review recent warnings/blocks
 

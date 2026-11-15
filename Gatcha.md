@@ -3,7 +3,7 @@
 Not-obvious things that bite. Each line: trap → what to do. Read before build/test/bench/deploy. Add a line when something wastes >10 min. A trap fixed in code (and tested) gets deleted here. Agent behaviour errors go in Mistake.md, not here.
 
 ## Build / test
-- Test exe in `target\` gets a Low Mandatory Level label (seen 2026-10-24, still true 2026-11-02) → every file create fails `os error 5`, ~92 false test failures. Copy it out and run from repo root: `cp target/release/deps/qx-<hash>.exe <scratch>/probe/qxt.exe && <scratch>/probe/qxt.exe --test-threads=4`. Don't create test files named `nul.*`/`con.*` (Windows device names).
+- Test exe in `target\` gets a Low Mandatory Level label (seen 2026-10-24, still true 2026-11-02) → every file create fails `os error 5`, ~92 false test failures. Copy it out and run from repo root: `cp target/release/deps/qx-<hash>.exe <scratch>/probe/qxt.exe && <scratch>/probe/qxt.exe --test-threads=4`. Same label hits `target\release\qx.exe` itself: a bash pipeline through it dies `msys-2.0 ... NtCreateDirectoryObject ... 0xC0000022`, exit 127 (seen 2026-11-14), so copy the exe out before benching or timing `run` lines. Don't create test files named `nul.*`/`con.*` (Windows device names).
 - `cargo test --release` does NOT relink `target\release\qx.exe` → e2e checks after it run a stale exe. `cargo build --release` first.
 - Free RAM ~1 GB: full `cargo test` in background gets killed. Use `-j 1`; run single tests from the built exe.
 - Last full run from a copied exe (2026-11-11, dev profile): 535 passed, 0 failed, 2 ignored, ~22 s. Run it with cwd = repo root (the `builtin` tests read repo files). More failures than that on a clean tree = the `target\` label above or a stuck warm-PowerShell test, not your change. CI sets `QX_REQUIRE_ORACLE=1` (GNU grep/sed parity tests must run, not skip).
@@ -33,7 +33,7 @@ Not-obvious things that bite. Each line: trap → what to do. Read before build/
 - Writes/edits outside cwd refused (`FS_OUTSIDE_WORKSPACE`), e.g. `~\.claude` → use native Write/Edit. Exception: `%TEMP%\claude\...` (the session scratchpad) is allowed (`scratch_root`). `write` over an existing file needs a prior qx `read`; `edit` does not (its unique exact match is the check).
 - Reader can briefly see an edited file missing (ENOENT ~9% under a hammer loop): `ReplaceFileW` kept to preserve ADS/ACLs.
 - Walk stops at `MAX_WALK_DEPTH` (64) with no notice. Names with unpaired surrogates created after server start are missing from glob/grep. `read` of invalid UTF-8 shows U+FFFD silently (edit/write refuse `FS_ENCODING`).
-- fs grep is a regex (invalid regex falls back to text with a note; `literal:true` forces text), skips `node_modules target dist build vendor .git …` and, in a git repo, every folder git ignores (named in the "not searched" note; `all=true` includes them); shell `grep` built-in does not skip them.
+- fs grep is a regex (invalid regex falls back to text with a note; `literal:true` forces text), skips `node_modules target dist build vendor .git …` and, in a git repo, every folder git ignores (named in the "not searched" note, which is printed only when nothing matched; `all=true` includes them); shell `grep` built-in does not skip them.
 
 ## Guard
 - Probe with `qx check "<cmd>"` only. Never run a destructive command at a real path (see Mistake.md 2026-10-19). Don't set `QX_GUARD=off`; report `[qx guard] BLOCKED` to the user.

@@ -78,14 +78,14 @@ pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Dige
         let (o, n, c) = grep(stdout)?;
         ("search", o, None, n, c)
     } else if is_test(&l) {
-        if verbatim(&l, code) {
+        if verbatim(&l) {
             return None;
         }
         let merged = merge(stdout, stderr);
         let (o, n, c) = diagnostic(&merged, code, false)?;
         ("test", o, Some(String::new()), n, c)
     } else if is_build(&l) {
-        if verbatim(&l, code) {
+        if verbatim(&l) {
             return None;
         }
         let merged = merge(stdout, stderr);
@@ -137,7 +137,7 @@ fn bound(text: String, cap: usize) -> (String, bool) {
 
 /// The caller asked for the output itself: `--nocapture` and `-s` print what the tests print, and
 /// `--json` output is for a parser. A passing run's summary-only digest would drop all of it.
-fn verbatim(l: &str, code: i32) -> bool {
+fn verbatim(l: &str) -> bool {
     let machine = |w: &str| w.starts_with('-') && ["json", "junit", "tap", "xml"].iter().any(|k| w.contains(k));
     let shows = |w: &str| {
         matches!(
@@ -155,7 +155,6 @@ fn verbatim(l: &str, code: i32) -> bool {
     };
     let w: Vec<&str> = words(l).collect();
     // A failing run that asked for its output (`--nocapture`, `-v`) wants the prints most of all.
-    let _ = code;
     w.iter().any(|x| machine(x))
         || w.iter().any(|x| shows(x))
         || w.windows(2).any(|p| p[0] == "--reporter" && p[1] == "verbose")
@@ -1373,8 +1372,9 @@ fn json_min(label: &str, text: &str) -> Option<(String, usize)> {
     if matches!(reader, "cat" | "type" | "jq" | "get-content" | "gc" | "bat" | "head" | "tail" | "less" | "more") {
         return None;
     }
-    // Validate, then strip whitespace only: numbers and key order stay byte-exact.
-    serde_json::from_str::<serde_json::Value>(t).ok()?;
+    // Validate, then strip whitespace only: numbers and key order stay byte-exact. A raw value is
+    // checked without building the tree, which for a 16 MiB reply would be ten times its size.
+    serde_json::from_str::<&serde_json::value::RawValue>(t).ok()?;
     let mut out = String::with_capacity(t.len());
     let mut in_str = false;
     let mut esc = false;
@@ -1547,6 +1547,17 @@ mod tests {
         let raw = "{\n  \"a\": 1,\n  \"b\": [1, 2]\n}\n";
         let (out, _) = json_min("curl http://x", raw).unwrap();
         assert_eq!(out.trim(), "{\"a\":1,\"b\":[1,2]}");
+    }
+
+    #[test]
+    fn json_min_refuses_text_that_is_not_json() {
+        // Padded so the whitespace saving is large: only the validity check can say no.
+        let hole = format!("{{\"a\":{}}}", " ".repeat(200));
+        let trailing = format!("{{\"a\":1{}}} x", " ".repeat(200));
+        let truncated = format!("[1,{}2,", " ".repeat(200));
+        for bad in [hole, trailing, truncated] {
+            assert!(json_min("curl http://x", &bad).is_none(), "{bad:?}");
+        }
     }
 
     #[test]

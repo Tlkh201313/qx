@@ -115,6 +115,15 @@ const PREFIXES: &[(&str, usize, Body)] = &[
     ("ya29.", 30, Body::Wide),
     ("GOCSPX-", 20, Body::Word),
     ("glpat-", 20, Body::Word),
+    // GitLab runner, deploy and pipeline-trigger tokens.
+    ("glrt-", 20, Body::Word),
+    ("gldt-", 20, Body::Word),
+    ("glptt-", 20, Body::Word),
+    // Groq, xAI, Replicate, Linear: long plain bodies, so `r8_foo` or `lin_api_client` stay readable.
+    ("gsk_", 40, Body::Alnum),
+    ("xai-", 50, Body::WordDigit),
+    ("r8_", 30, Body::Alnum),
+    ("lin_api_", 30, Body::Alnum),
     // Real Hugging Face tokens are plain alphanumerics: `hf_hub_download_with_retries` is a name.
     ("hf_", 20, Body::Alnum),
     ("npm_", 20, Body::Alnum),
@@ -675,7 +684,7 @@ fn mask_ranges(line: &str, mut ranges: Vec<(usize, usize)>) -> (Cow<'_, str>, us
 /// First byte of every entry in `PREFIXES` (a test keeps the two in sync), so
 /// most bytes skip the prefix table entirely.
 fn is_prefix_start(b: u8) -> bool {
-    matches!(b, b's' | b'p' | b'r' | b'g' | b'A' | b'x' | b'y' | b'h' | b'n' | b'd' | b'S' | b'e' | b'L' | b'w' | b'G')
+    matches!(b, b's' | b'p' | b'r' | b'g' | b'A' | b'x' | b'y' | b'h' | b'n' | b'd' | b'S' | b'e' | b'L' | b'w' | b'G' | b'l')
 }
 
 fn mask_tokens(line: &str) -> (Cow<'_, str>, usize) {
@@ -1234,6 +1243,28 @@ mod tests {
         // A token ends where its alphabet ends: the path after it stays readable.
         let (s, _) = redact("ghp_0123456789abcdefghijklmnopqrstuvwxyz.json");
         assert_eq!(s, "ghp_***.json");
+    }
+
+    #[test]
+    fn newer_provider_tokens_are_masked_but_names_that_share_the_prefix_are_not() {
+        assert_masked(&[
+            (concat!("key gsk_", "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIjKlMn"), "AbCdEfGhIjKlMnOpQrSt"),
+            (concat!("key xai-", "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIjKlMnOpQrStUvWxYz"), "AbCdEfGhIjKlMnOpQrSt"),
+            (concat!("key r8_", "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Ab"), "AbCdEfGhIjKlMnOpQrSt"),
+            (concat!("key lin_api_", "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCd"), "AbCdEfGhIjKlMnOpQrSt"),
+            (concat!("key glrt-", "AbCdEfGhIjKlMnOpQrStUvWxYz"), "AbCdEfGhIjKlMnOpQrSt"),
+            (concat!("key gldt-", "AbCdEfGhIjKlMnOpQrStUvWxYz"), "AbCdEfGhIjKlMnOpQrSt"),
+            (concat!("key glptt-", "0123456789abcdef0123456789abcdef01234567"), "0123456789abcdef0123"),
+        ]);
+        // Names and paths that only start the same way stay readable.
+        assert_untouched(&[
+            "r8_foo_bar_baz",
+            "lin_api_client_config",
+            "src/gsk_utils.rs",
+            "xai-grok-model-name-without-a-long-key-body",
+            "glrt-short",
+            "use gsk_client::Builder;",
+        ]);
     }
 
     #[test]

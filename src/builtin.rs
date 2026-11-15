@@ -785,7 +785,45 @@ fn read_text_capped(path: &Path) -> std::io::Result<(String, bool)> {
     if cut {
         buf.truncate(READ_CAP as usize);
     }
-    Ok((crate::exec::decode(&buf), cut))
+    Ok((crate::exec::decode_owned(buf), cut))
+}
+
+/// A whole file for `cat`. Past the cap it keeps the start and the last 2 MiB (a log's failure is at its
+/// end) with a marker for the middle, as a command's captured output does; the flag says it did.
+fn read_text_ends(path: &Path) -> std::io::Result<(String, bool)> {
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    let mut bom = [0u8; 2];
+    let got = f.read(&mut bom)?;
+    f.seek(SeekFrom::Start(0))?;
+    // UTF-16 has to be decoded from its start, so it keeps the plain cap.
+    if len <= READ_CAP || (got == 2 && (bom == [0xFF, 0xFE] || bom == [0xFE, 0xFF])) {
+        drop(f);
+        let (mut text, cut) = read_text_capped(path)?;
+        if cut {
+            text.push_str("\n[qx] cat truncated at 32 MiB\n");
+        }
+        return Ok((text, cut));
+    }
+    let tail_len = READ_CAP / 16;
+    let mut head = Vec::new();
+    // 256 bytes of room for the marker line, so the joined text always fits under the cap `cat` enforces
+    // afterwards (that cut would otherwise take the end this function exists to keep).
+    f.by_ref().take(READ_CAP - tail_len - 256).read_to_end(&mut head)?;
+    let mut tail = Vec::new();
+    f.seek(SeekFrom::Start(len - tail_len))?;
+    f.take(tail_len).read_to_end(&mut tail)?;
+    // Whole lines on both sides of the gap.
+    if let Some(i) = head.iter().rposition(|&b| b == b'\n') {
+        head.truncate(i + 1);
+    }
+    if let Some(i) = tail.iter().position(|&b| b == b'\n') {
+        tail.drain(..=i);
+    }
+    let omitted = len - head.len() as u64 - tail.len() as u64;
+    head.extend_from_slice(format!("[qx] ... {omitted} bytes omitted (cat reads at most 32 MiB) ...\n").as_bytes());
+    head.extend_from_slice(&tail);
+    Ok((crate::exec::decode_owned(head), true))
 }
 
 fn cmd_cat(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
@@ -810,20 +848,22 @@ fn cmd_cat(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut n = 0usize;
     for f in files {
         let path = path_of(cwd, f);
-        match read_text_capped(&path) {
-            Ok((text, cut)) => {
+        match read_text_ends(&path) {
+            Ok((text, _cut)) => {
                 if number {
                     for line in text.lines() {
                         n += 1;
                         out.push_str(&format!("{n:>6}\t{line}\n"));
                     }
+                } else if out.is_empty() {
+                    out = text; // the common case: one file, no second copy
                 } else {
                     out.push_str(&text);
-                    if !text.ends_with('\n') && !text.is_empty() {
-                        out.push('\n');
-                    }
                 }
-                if cut || out.len() > READ_CAP as usize {
+                if !out.ends_with('\n') && !out.is_empty() && !number {
+                    out.push('\n');
+                }
+                if out.len() > READ_CAP as usize {
                     let mut end = READ_CAP as usize;
                     while end > 0 && !out.is_char_boundary(end) {
                         end -= 1;
@@ -2938,6 +2978,29 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
         // A range that needs more than the cap of one line is still the real tool's.
         assert!(run("sed", &["-n", "5p", "large.txt"], &d).is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A file past the cap keeps its start and its end: a log's failure is the last line.
+    #[test]
+    fn cat_of_a_file_past_the_read_cap_keeps_both_ends() {
+        let d = scratch("cat-large");
+        // Different line lengths put the two cut points at different offsets inside a line.
+        for width in [79usize, 97, 1013] {
+            let mut big = String::from("first line\n");
+            let filler = "x".repeat(width) + "\n";
+            while big.len() < READ_CAP as usize + (1 << 20) {
+                big.push_str(&filler);
+            }
+            big.push_str("FAILED: the last line\n");
+            fs::write(d.join("large.log"), &big).unwrap();
+            let out = run("cat", &["large.log"], &d).expect("cat is a built-in");
+            assert_eq!(out.code, 0);
+            assert!(out.stdout.starts_with("first line\n"), "start kept (width {width})");
+            assert!(out.stdout.ends_with("FAILED: the last line\n"), "end kept (width {width})");
+            assert!(out.stdout.contains("bytes omitted"), "the gap is marked (width {width})");
+            assert!(out.stdout.len() <= READ_CAP as usize, "{} (width {width})", out.stdout.len());
+        }
         let _ = fs::remove_dir_all(&d);
     }
 

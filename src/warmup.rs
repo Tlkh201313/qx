@@ -10,8 +10,13 @@ use std::time::Duration;
 const TOOLS: &[&str] = &["git", "node", "cargo", "rg"];
 const IDLE_TICK: Duration = Duration::from_secs(10);
 
+/// `QX_WARM=off`: no warm-up of any kind, including the workspace read a call's `cwd` would start.
+pub fn off() -> bool {
+    std::env::var("QX_WARM").ok().as_deref() == Some("off")
+}
+
 pub fn start() {
-    if std::env::var("QX_WARM").ok().as_deref() == Some("off") {
+    if off() {
         return;
     }
     #[cfg(windows)]
