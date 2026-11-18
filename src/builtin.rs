@@ -455,23 +455,43 @@ fn cmd_ls(args: &[String], cwd: Option<&Path>, full: bool) -> Option<BuiltinOut>
         return Some(BuiltinOut { code: i32::from(!walk.err.is_empty()), stdout: out, stderr: walk.err, elapsed: Duration::ZERO });
     }
 
-    // One bad operand does not hide the others: its error goes to stderr and the exit code is 1.
+    // Like ls: the file operands first, as one listing, then each directory under a `name:` header, so a
+    // file named after a directory is never read as one of its entries. One bad operand does not hide
+    // the others: its error goes to stderr and the exit code is 1.
     let multiple = paths.len() > 1;
     let mut err = String::new();
+    let mut files: Vec<(&str, fs::Metadata)> = Vec::new();
+    let mut dirs: Vec<(&str, PathBuf)> = Vec::new();
     for p in paths {
         let path = path_of(cwd, p);
-        let listed = fs::metadata(&path).and_then(|md| {
-            let mut head = String::new();
-            // Only a directory gets a `name:` header; a file is shown as typed.
-            if multiple && md.is_dir() {
-                if !out.is_empty() {
-                    head.push('\n');
-                }
-                let _ = writeln!(head, "{p}:");
+        match fs::metadata(&path) {
+            Ok(md) if md.is_dir() => dirs.push((p, path)),
+            Ok(md) => files.push((p, md)),
+            Err(e) => {
+                let _ = writeln!(err, "ls: {}: {e}", path.display());
             }
-            list_one(&path, p, &md, &opts).map(|body| head + &body)
-        });
-        match listed {
+        }
+    }
+    if opts.long && !files.is_empty() {
+        let style = LongStyle::new(opts.full, files.iter().map(|(_, md)| (md.len(), md.modified().ok(), false)));
+        out.push_str(&style.header());
+        for (p, md) in &files {
+            write_entry(&mut out, p, false, md.len(), md.modified().ok(), md.permissions().readonly(), true, &style);
+        }
+    } else {
+        for (p, _) in &files {
+            out.push_str(p);
+            out.push('\n');
+        }
+    }
+    for (p, path) in dirs {
+        if multiple {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            let _ = writeln!(out, "{p}:");
+        }
+        match list_dir(&path, &opts) {
             Ok(s) => out.push_str(&s),
             // A symlink in a long listing (see `collect_entries`): the real ls answers.
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => return None,
@@ -483,18 +503,7 @@ fn cmd_ls(args: &[String], cwd: Option<&Path>, full: bool) -> Option<BuiltinOut>
     Some(BuiltinOut { code: i32::from(!err.is_empty()), stdout: out, stderr: err, elapsed: Duration::ZERO })
 }
 
-fn list_one(path: &Path, display: &str, md: &fs::Metadata, opts: &LsOpts) -> std::io::Result<String> {
-    if !md.is_dir() {
-        let mut out = String::new();
-        let modified = md.modified().ok();
-        let style = LongStyle::new(opts.full, [(md.len(), modified, false)]);
-        if opts.long {
-            out.push_str(&style.header());
-        }
-        write_entry(&mut out, display, false, md.len(), modified, md.permissions().readonly(), opts.long, &style);
-        return Ok(out);
-    }
-
+fn list_dir(path: &Path, opts: &LsOpts) -> std::io::Result<String> {
     let (mut entries, total, dirs, files, capped) = collect_entries(path, opts)?;
     sort_entries(&mut entries, opts);
     let mut walk = LsWalk {
@@ -821,8 +830,11 @@ fn write_entry(
         out.push('\n');
         return;
     }
-    // A directory's size is always 0 on Windows: it carries nothing, so the column skips it.
-    if !is_dir {
+    // A directory's size is always 0 on Windows: it carries nothing, so the column shows `-`. Never empty:
+    // with the time hoisted into the header, `2024 notes/` would read as a 2024-byte entry `notes/`.
+    if is_dir {
+        let _ = write!(out, "{:>w$} ", "-", w = style.width);
+    } else {
         let _ = write!(out, "{len:>w$} ", w = style.width);
     }
     if style.minute.is_none() {
@@ -2452,6 +2464,14 @@ mod tests {
         assert_eq!(out.code, 1);
         assert!(out.stderr.contains("nope"), "{}", out.stderr);
         assert_eq!(out.stdout, "a/x.txt\ny.txt\n\na:\nx.txt\n");
+        // A file after a directory still comes first, so it never reads as one of the directory's entries.
+        let dir_first: Vec<String> = ["a", "y.txt", "ro.txt"].map(String::from).to_vec();
+        assert_eq!(cmd_ls(&dir_first, Some(&d), false).unwrap().stdout, "y.txt\nro.txt\n\na:\nx.txt\n");
+        let long: Vec<String> = ["-l", "a", "y.txt", "ro.txt"].map(String::from).to_vec();
+        let long = cmd_ls(&long, Some(&d), false).unwrap().stdout;
+        assert_eq!(long.matches("(UTC ").count() + long.matches("(times UTC)").count(), 2, "one header per listing: {long}");
+        let (files, dir) = long.split_once("\na:\n").unwrap();
+        assert!(files.contains("y.txt\n") && files.contains("ro.txt [ro]") && dir.contains("x.txt"), "{long}");
 
         let long = cmd_ls(&["-l".to_string(), "ro.txt".to_string()], Some(&d), false).unwrap().stdout;
         assert!(long.starts_with("(UTC ") && long.trim_end().ends_with("ro.txt [ro]"), "{long}");
@@ -2504,7 +2524,7 @@ mod tests {
             ("t.exe", false, 2, 1_609_459_200, false),
         ];
         let out = rendered(&rows, false);
-        assert_eq!(out, "(UTC 2021-01-01 00:00)\nd/\n1 r.txt [ro]\n2 t.exe*\n");
+        assert_eq!(out, "(UTC 2021-01-01 00:00)\n- d/\n1 r.txt [ro]\n2 t.exe*\n");
         let full = rendered(&rows, true);
         assert_eq!(
             full,
@@ -2513,12 +2533,15 @@ mod tests {
     }
 
     #[test]
-    fn long_listing_dir_rows_carry_no_size_and_do_not_widen_the_column() {
+    fn long_listing_dir_rows_show_a_dash_and_do_not_widen_the_column() {
         let out = rendered(
             &[("d", true, 4096, 1_609_459_200, false), ("f", false, 10, 1_609_459_200 + 60, false)],
             false,
         );
-        assert_eq!(out, "(UTC 2021-01-01)\n00:00 d/\n10 00:01 f\n");
+        assert_eq!(out, "(UTC 2021-01-01)\n - 00:00 d/\n10 00:01 f\n");
+        // With the time in the header too, a name that starts with a number still cannot read as a size.
+        let out = rendered(&[("2024 notes", true, 0, 1_609_459_200, false), ("f", false, 3, 1_609_459_200, false)], false);
+        assert_eq!(out, "(UTC 2021-01-01 00:00)\n- 2024 notes/\n3 f\n");
     }
 
     #[test]

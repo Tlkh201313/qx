@@ -1369,26 +1369,21 @@ fn render(id: Option<Value>, outcome: exec::Outcome, source: &str, ctx: &RunCtx,
         let original: (String, String);
         compact::drop_build_noise(&mut se);
         compact::drop_build_noise(&mut so);
+        digest::drop_git_eol_warnings(label, &mut se);
         if let Some(d) = digest::digest(label, &so, &se, outcome.code) {
             lossy = d.lossy();
             original = (std::mem::replace(&mut so, d.stdout), std::mem::replace(&mut se, d.stderr));
             profile = d.profile;
             omitted = d.omitted;
             truncated |= d.clipped;
-            if matches!(profile, "build" | "test" | "traceback") {
-                compact::relative_to_cwd(&mut so, &mut se, cwd);
-            }
         } else {
-            // A traceback too short to digest still repeats the absolute script path on every frame.
-            if digest::is_runtime_label(label) {
-                compact::relative_to_cwd(&mut so, &mut se, cwd);
-            }
             let (max, head, tail) = digest::plain_budget(label, (200, 80, 60));
             let (a, cut) = compact::compact(&so, max, head, tail);
             let (b, cut_err) = compact::compact(&se, 120, 50, 40);
             original = (std::mem::replace(&mut so, a), std::mem::replace(&mut se, b));
             truncated |= cut | cut_err;
         }
+        digest::shorten_paths(profile, label, &mut so, &mut se, cwd);
         // Long lines (minified code, a JSON blob) pass the line budget yet not the client's reply cap.
         let (cap_so, cap_se) = stream_caps(so.len(), se.len());
         truncated |= cap_text(&mut so, cap_so);
@@ -1815,9 +1810,12 @@ mod tests {
             "Traceback (most recent call last):\n  File \"{0}\", line 13, in <module>\n    f()\n  File \"{0}\", line 9, in f\n    g()\n  File \"{0}\", line 5, in g\n    1/0\nZeroDivisionError: division by zero\n",
             script.display()
         );
-        let t = render_text("python app.py", &d, 1, "", &err);
+        // The script's own output names absolute paths on purpose: only the traceback is shortened.
+        let printed: String = ["a.txt", "b.txt", "c.txt"].iter().map(|f| format!("{}\n", d.join(f).display())).collect();
+        let t = render_text("python app.py", &d, 1, &printed, &err);
         assert!(t.contains("File \"app.py\", line 13"), "{t}");
         assert!(!t.contains(&format!("File \"{}", d.display())), "{t}");
+        assert!(t.contains(&printed), "{t}");
     }
 
     #[test]

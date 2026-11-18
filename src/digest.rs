@@ -31,7 +31,7 @@ impl Digest {
     }
 }
 
-/// A diff up to this many lines is shown as git printed it (see `digest`).
+/// A diff up to this many lines keeps every line; only its file headers fold (see `digest`).
 const DIFF_WHOLE: usize = 400;
 
 /// Line budget `(max, head, tail)` for the plain compaction of a command that `digest` declined: a diff that
@@ -44,47 +44,34 @@ pub fn plain_budget(label: &str, usual: (usize, usize, usize)) -> (usize, usize,
     }
 }
 
-/// Git's Windows line-ending warnings are noise on stderr, not content. Filtered here for every git
-/// command; when no digest fits, the cleaned stderr still goes out with the plainly compacted stdout.
+/// Git's Windows line-ending warnings are noise, not content: the callers drop them from a git command's
+/// stderr before it is digested or compacted, so each path keeps its own budget (the CLI's `--max-lines`,
+/// the MCP reply cap).
+pub fn drop_git_eol_warnings(label: &str, stderr: &mut String) {
+    if git_sub(&core_label(&label.to_ascii_lowercase())).is_some() && stderr.lines().any(eol_warning) {
+        *stderr = stderr.lines().filter(|l| !eol_warning(l)).fold(String::new(), |mut s, l| {
+            s.push_str(l);
+            s.push('\n');
+            s
+        });
+    }
+}
+
+/// git >= 2.37: `warning: in the working copy of 'X', LF will be replaced by CRLF the next time Git
+/// touches it`; older: `warning: LF will be replaced by CRLF in X.` plus an explanatory line.
+fn eol_warning(l: &str) -> bool {
+    (l.starts_with("warning: in the working copy of '")
+        && (l.contains(", LF will be replaced by CRLF the next time Git touches it")
+            || l.contains(", CRLF will be replaced by LF the next time Git touches it")))
+        || l.starts_with("warning: LF will be replaced by CRLF in ")
+        || l.starts_with("warning: CRLF will be replaced by LF in ")
+        || l.starts_with("The file will have its original line endings in your working directory")
+}
+
 pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Digest> {
     if std::env::var("QX_DIGEST").ok().as_deref() == Some("off") {
         return None;
     }
-    if git_sub(&core_label(&label.to_ascii_lowercase())).is_none() {
-        return digest_core(label, stdout, stderr, code);
-    }
-    let clean = strip_eol_warnings(stderr);
-    let d = digest_core(label, stdout, &clean, code);
-    if d.is_some() || clean.len() == stderr.len() {
-        return d;
-    }
-    let (max, head, tail) = plain_budget(label, (200, 80, 60));
-    let (o, cut_o) = compact::compact(stdout, max, head, tail);
-    let (e, cut_e) = keep_stderr(&clean);
-    Some(Digest { stdout: o, stderr: e, profile: "git", omitted: 0, clipped: cut_o || cut_e, passed: code == 0 })
-}
-
-fn strip_eol_warnings(stderr: &str) -> String {
-    // git >= 2.37: `warning: in the working copy of 'X', LF will be replaced by CRLF the next time Git
-    // touches it`; older: `warning: LF will be replaced by CRLF in X.` plus an explanatory line.
-    let noise = |l: &str| {
-        (l.starts_with("warning: in the working copy of '")
-            && (l.contains(", LF will be replaced by CRLF the next time Git touches it")
-                || l.contains(", CRLF will be replaced by LF the next time Git touches it")))
-            || (l.starts_with("warning: LF will be replaced by CRLF in ") || l.starts_with("warning: CRLF will be replaced by LF in "))
-            || l.starts_with("The file will have its original line endings in your working directory")
-    };
-    if !stderr.lines().any(noise) {
-        return stderr.to_string();
-    }
-    stderr.lines().filter(|l| !noise(l)).fold(String::new(), |mut s, l| {
-        s.push_str(l);
-        s.push('\n');
-        s
-    })
-}
-
-fn digest_core(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Digest> {
     let l = core_label(&label.to_ascii_lowercase());
     // Progress bars redrawn with `\r` (tqdm, curl, downloaders) reach the digests as their last frame.
     let ((so, sd), (se, ed)) = (compact::settle_frames(stdout), compact::settle_frames(stderr));
@@ -99,11 +86,12 @@ fn digest_core(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Dig
     } else if is_diff(&l) {
         // A diff that fits is shown with every hunk header, context, `+` and `-` line: without them the
         // hunk offsets no longer match what is shown. Only its file headers fold, which loses nothing,
-        // so it skips the saving gate below and is never spooled. Only a long one is condensed.
+        // so it skips the saving gate below; only a minified line past the per-line cap is cut (and
+        // spooled). Only a long diff is condensed.
         if stdout.lines().count() <= DIFF_WHOLE {
-            let o = trim_diff_headers(stdout)?;
+            let (o, cut_o) = bound(trim_diff_headers(stdout)?, DIFF_WHOLE);
             let (err, cut) = keep_stderr(stderr);
-            return Some(Digest { stdout: o, stderr: err, profile: "git-diff", omitted: 0, clipped: sd || ed || cut, passed: code == 0 });
+            return Some(Digest { stdout: o, stderr: err, profile: "git-diff", omitted: 0, clipped: sd || ed || cut || cut_o, passed: code == 0 });
         }
         let (o, n, c) = git_diff(stdout)?;
         ("git-diff", o, None, n, c)
@@ -492,9 +480,15 @@ fn is_build(l: &str) -> bool {
         .any(|p| l.strip_prefix(p).is_some_and(|r| r.is_empty() || r.starts_with(' ')))
 }
 
-/// True when the command (after the same lowercase + core-label step `digest` takes) runs a script runtime.
-pub fn is_runtime_label(label: &str) -> bool {
-    is_runtime(&core_label(&label.to_ascii_lowercase()))
+/// Paths under the cwd in the text a reply shows (the spool keeps the original). A build or test shortens
+/// both streams; a script's traceback, digested or too short to be, sits on stderr, so the program's own
+/// output stays as printed.
+pub fn shorten_paths(profile: &str, label: &str, so: &mut String, se: &mut String, cwd: Option<&std::path::Path>) {
+    match profile {
+        "build" | "test" => compact::relative_to_cwd(so, se, cwd),
+        "traceback" | "" if is_runtime(&core_label(&label.to_ascii_lowercase())) => compact::relative_to_cwd(&mut String::new(), se, cwd),
+        _ => {}
+    }
 }
 
 fn is_runtime(l: &str) -> bool {
@@ -857,8 +851,10 @@ fn git_status(text: &str) -> Option<(String, usize)> {
             omitted += 1;
             continue;
         }
-        if t.starts_with("Your stash currently has ") {
-            state.push(t.to_string()); // `--show-stash`; a note, not a file of the section above
+        // `--show-stash`, and the merge notices: state, not a file of the section above. A merge in
+        // progress must stay visible even once its `UU` lines are gone.
+        if t.starts_with("Your stash currently has ") || t == "You have unmerged paths." || t.starts_with("All conflicts fixed but you are still merging") {
+            state.push(t.to_string());
             continue;
         }
         // git indents a listed path with one TAB; any other line here is a note this digest does not know.
@@ -1459,7 +1455,8 @@ fn fold_cargo_test(lines: &[&str], noise: &mut [bool]) {
             // With several test binaries it is the only clue which one failed.
             noise[i] = true;
         } else if let Some(n) = t.strip_prefix("test ").and_then(|r| r.strip_suffix(" ... FAILED")) {
-            noise[i] = blocks.contains(n);
+            // `#[should_panic]` tests read `test x - should panic ... FAILED`; their block is `---- x stdout ----`.
+            noise[i] = blocks.contains(n.strip_suffix(" - should panic").unwrap_or(n));
         } else if t == "failures:" {
             let mut k = i + 1;
             while lines.get(k).is_some_and(|v| v.trim().is_empty()) {
@@ -1547,7 +1544,7 @@ fn fold_pytest(lines: &[&str], keep: &mut [bool], noise: &mut [bool], over: &mut
                 // --tb=native/short frames, captured stdout/log text: content.
                 keep[i] = true;
             }
-            if t.starts_with("> ") || t.starts_with("E   ") {
+            if t.starts_with("> ") || t.starts_with("E   ") || t == "E" {
                 run.push(i);
             } else if !noise[i] {
                 dedent_run(lines, &mut run, over);
@@ -1570,6 +1567,14 @@ fn fold_pytest(lines: &[&str], keep: &mut [bool], noise: &mut [bool], over: &mut
             used[h] = true;
             over[heads[h].0] = Some(format!("{id}:"));
             noise[f] = true;
+            // The message's further lines (indented under it) repeat the block's `E` lines too.
+            for k in f + 1..lines.len() {
+                let l = lines[k];
+                if !l.trim().is_empty() && !l.starts_with(char::is_whitespace) {
+                    break;
+                }
+                noise[k] = true;
+            }
         }
     }
 }
@@ -1589,14 +1594,19 @@ fn pytest_key_of_node(id: &str) -> String {
 }
 
 /// Remove the indent shared by a run of `>`/`E` lines so `>       assert` reads `> assert`, keeping each
-/// line's indent relative to the others (pytest's diffs depend on it).
+/// line's indent relative to the others (pytest's diffs depend on it). A bare `E` (a blank line of the
+/// message) has no indent to share and prints as `E`.
 fn dedent_run(lines: &[&str], run: &mut Vec<usize>, over: &mut [Option<String>]) {
     let gap = |l: &str| l[1..].len() - l[1..].trim_start_matches(' ').len();
-    let min = run.iter().map(|&i| gap(lines[i].trim_end())).min();
+    let min = run.iter().map(|&i| lines[i].trim_end()).filter(|l| l.len() > 1).map(gap).min();
     if let Some(m) = min.filter(|&m| m > 1) {
         for &i in run.iter() {
             let l = lines[i].trim_end();
-            over[i] = Some(format!("{}{}{}", &l[..1], " ".repeat(gap(l) - m + 1), l[1..].trim_start_matches(' ')));
+            over[i] = Some(if l.len() > 1 {
+                format!("{}{}{}", &l[..1], " ".repeat(gap(l) - m + 1), l[1..].trim_start_matches(' '))
+            } else {
+                l.to_string()
+            });
         }
     }
     run.clear();
@@ -2050,13 +2060,20 @@ mod tests {
     #[test]
     fn a_short_diff_folds_headers_and_keeps_every_hunk_line() {
         let raw = short_diff();
-        let d = digest("git diff", &raw, CRLF_WARN, 0).expect("short diff trims");
+        let d = digest("git diff", &raw, "", 0).expect("short diff trims");
         let out = &d.stdout;
-        assert!(!d.lossy() && d.stderr.is_empty(), "{d:?}", d = (out, &d.stderr));
+        assert!(!d.lossy(), "{out}");
         assert!(out.starts_with("diff README.md\n@@ -3,7 +3,7 @@\n # README line 3\n-retries = 3\n+retries = 5\n # README line 7\n"), "{out}");
         assert!(out.contains("diff old.txt (deleted 100644)\n@@ -1,2 +0,0 @@\n-# old line 1\n-# old line 2\n"), "{out}");
         assert!(out.contains("diff new.txt (new 100755)\n@@ -0,0 +1 @@\n+hello\n"), "{out}");
         assert!(!out.contains("index ") && !out.contains("--- ") && !out.contains("+++ ") && !out.contains("diff --git"), "{out}");
+    }
+
+    #[test]
+    fn a_short_diff_of_a_minified_line_is_still_held_to_the_line_cap() {
+        let raw = format!("diff --git a/m.js b/m.js\nindex 1..2 100644\n--- a/m.js\n+++ b/m.js\n@@ -1 +1 @@\n-{}\n+{}\n", "x".repeat(50_000), "y".repeat(50_000));
+        let d = digest("git diff", &raw, "", 0).unwrap();
+        assert!(d.stdout.len() < 10_000 && d.lossy() && d.stdout.starts_with("diff m.js\n@@ -1 +1 @@\n"), "{}", d.stdout.len());
     }
 
     #[test]
@@ -2079,14 +2096,14 @@ mod tests {
     }
 
     #[test]
-    fn git_line_ending_warnings_are_dropped_even_when_no_digest_fits() {
-        let d = digest("git add -A", "", CRLF_WARN, 0).expect("cleaned stderr still goes out");
-        assert!(d.stderr.is_empty() && !d.lossy(), "{}", d.stderr);
-        let kept = format!("{CRLF_WARN}fatal: pathspec 'x' did not match\n");
-        let d = digest("git add x", "", &kept, 1).unwrap();
-        assert!(d.stderr.contains("fatal: pathspec 'x' did not match") && !d.stderr.contains("working copy"), "{}", d.stderr);
+    fn git_line_ending_warnings_are_dropped_from_git_commands_only() {
+        let mut err = format!("{CRLF_WARN}fatal: pathspec 'x' did not match\n");
+        drop_git_eol_warnings("git add x", &mut err);
+        assert_eq!(err, "fatal: pathspec 'x' did not match\n");
         // Other commands keep their stderr as is.
-        assert!(digest("echo hi", "hi\n", CRLF_WARN, 0).is_none());
+        let mut other = CRLF_WARN.to_string();
+        drop_git_eol_warnings("echo hi", &mut other);
+        assert_eq!(other, CRLF_WARN);
     }
 
     #[test]
@@ -2119,11 +2136,12 @@ mod tests {
 
     #[test]
     fn status_maps_conflicts_to_their_two_letter_codes() {
-        let raw = "On branch main\nYou have unmerged paths.\n";
+        let raw = "On branch main\ninteractive rebase in progress; onto abc1234\n";
         assert!(git_status(raw).is_none(), "an unknown notice declines");
-        let raw = "On branch main\nUnmerged paths:\n  (use \"git add <file>...\" to mark resolution)\n\tboth modified:   a.rs\n\tboth added:      b.rs\n\tboth deleted:    c.rs\n\tadded by us:     d.rs\n\tadded by them:   e.rs\n\tdeleted by us:   f.rs\n\tdeleted by them: g.rs\n\tboth modified:   h.rs\n";
+        // As git prints a merge with conflicts: the notice stays, its hints go.
+        let raw = "On branch main\nYou have unmerged paths.\n  (fix conflicts and run \"git commit\")\n  (use \"git merge --abort\" to abort the merge)\n\nUnmerged paths:\n  (use \"git add <file>...\" to mark resolution)\n\tboth modified:   a.rs\n\tboth added:      b.rs\n\tboth deleted:    c.rs\n\tadded by us:     d.rs\n\tadded by them:   e.rs\n\tdeleted by us:   f.rs\n\tdeleted by them: g.rs\n\tboth modified:   h.rs\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n";
         let (out, _) = git_status(raw).unwrap();
-        assert_eq!(out, "## main\nUU a.rs h.rs\nAA b.rs\nDD c.rs\nAU d.rs\nUA e.rs\nDU f.rs\nUD g.rs\n");
+        assert_eq!(out, "## main\nYou have unmerged paths.\nUU a.rs h.rs\nAA b.rs\nDD c.rs\nAU d.rs\nUA e.rs\nDU f.rs\nUD g.rs\n");
     }
 
     #[test]
@@ -2150,7 +2168,9 @@ mod tests {
     #[test]
     fn old_git_line_ending_warnings_are_filtered_too() {
         let old = "warning: CRLF will be replaced by LF in a.txt.\nThe file will have its original line endings in your working directory\nwarning: LF will be replaced by CRLF in b.txt.\nThe file will have its original line endings in your working directory\nfatal: boom\n";
-        assert_eq!(strip_eol_warnings(old), "fatal: boom\n");
+        let mut old = old.to_string();
+        drop_git_eol_warnings("git add .", &mut old);
+        assert_eq!(old, "fatal: boom\n");
     }
 
     #[test]
@@ -2307,7 +2327,6 @@ mod tests {
             "E  +  where 6 = total([1, 2, 3])",
             "test_calc.py:75: AssertionError",
             "1 failed, 23 passed in 0.30s",
-            "1 failed, 23 passed in 0.30s",
         ]);
         assert_eq!(out.matches("where 6 = total").count(), 1, "{out}");
         for gone in ["platform", "rootdir", "plugins", "asyncio", "collected", "====", "____", "[100%]", "short test summary"] {
@@ -2333,6 +2352,19 @@ mod tests {
         let (out, _, _) = diagnostic(raw, 1, false).unwrap();
         assert_has(&out, &["test_c.py::TestC::test_a[1-2]:", "> assert x == y", "E assert 1 == 2", "E   + extra", "E - more", "FAILED test_c.py::test_other - boom"]);
         assert!(!out.contains("FAILED test_c.py::TestC"), "{out}");
+    }
+
+    #[test]
+    fn should_panic_and_multiline_summary_failures_show_once() {
+        let cargo = "test boom - should panic ... FAILED\n\nfailures:\n\n---- boom stdout ----\n\nthread 'boom' panicked at src/lib.rs:3:5:\nwrong\nnote: panic did not contain expected string\n\nfailures:\n    boom\n\ntest result: FAILED. 0 passed; 1 failed\n";
+        let (out, _, _) = diagnostic(cargo, 101, false).unwrap();
+        assert!(!out.contains("should panic ... FAILED") && out.contains("---- boom stdout ----"), "{out}");
+        let py = "=== FAILURES ===\n____ test_d ____\n>       assert a == b\nE       AssertionError: assert {'b': 2} == {'b': 3}\nE         \nE         Differing items:\nE           {'b': 2} != {'b': 3}\n\ntest_d.py:6: AssertionError\n=== short test summary info ===\nFAILED test_d.py::test_d - AssertionError: assert {'b': 2} == {'b': 3}\n  \n  Differing items:\n    {'b': 2} != {'b': 3}\nSKIPPED [1] test_d.py:9: later\n=== 1 failed, 1 skipped in 0.1s ===\n";
+        let (out, omitted, _) = diagnostic(py, 1, false).unwrap();
+        assert_eq!(out.matches("Differing items").count(), 1, "{out}");
+        // A blank `E` line stays in the run, so the explanation keeps its indent under the message.
+        assert_has(&out, &["E AssertionError: assert {'b': 2} == {'b': 3}\nE\nE   Differing items:\nE     {'b': 2} != {'b': 3}\n", "SKIPPED [1] test_d.py:9: later"]);
+        assert_eq!(omitted, 0, "{out}");
     }
 
     #[test]

@@ -472,6 +472,7 @@ fn emit(out: exec::Outcome, o: &RunOpts, label: &str) -> i32 {
         if se.contains('\x1b') {
             se = compact::strip_ansi(&se);
         }
+        digest::drop_git_eol_warnings(label, &mut se);
         let (kept_so, kept_se, lossy, profile) = match digest::digest(label, &so, &se, out.code) {
             Some(d) => {
                 let lossy = d.lossy();
@@ -493,9 +494,7 @@ fn emit(out: exec::Outcome, o: &RunOpts, label: &str) -> i32 {
         }
         so = kept_so;
         se = kept_se;
-        if matches!(profile, "build" | "test" | "traceback") {
-            compact::relative_to_cwd(&mut so, &mut se, o.cwd.as_deref());
-        }
+        digest::shorten_paths(profile, label, &mut so, &mut se, o.cwd.as_deref());
     }
 
     let bytes_out = so.len() + se.len();

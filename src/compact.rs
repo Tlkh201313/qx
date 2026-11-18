@@ -323,7 +323,7 @@ pub fn drop_build_noise(text: &mut String) -> usize {
     dropped
 }
 
-/// `relative_paths` on both streams of a digested build/test/traceback, with a
+/// `relative_paths` on the two streams a reply shows (see `digest::shorten_paths`), with a
 /// note saying what the paths are relative to. Under 3 hits the note costs more
 /// than it saves, so nothing changes.
 pub fn relative_to_cwd(so: &mut String, se: &mut String, cwd: Option<&std::path::Path>) {
