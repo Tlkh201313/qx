@@ -1632,7 +1632,7 @@ mod tests {
         };
         let claude = list(Client::ClaudeCode);
         assert!(always_loaded(&claude, 0) && always_loaded(&claude, 1));
-        for c in [Client::Dsh, Client::Codex, Client::OpenCode, Client::Hermes, Client::Pi, Client::Generic] {
+        for c in [Client::Dsh, Client::Codex, Client::OpenCode, Client::Hermes, Client::Pi, Client::Cursor, Client::Omp, Client::Generic] {
             assert!(list(c).pointer("/result/tools/0/_meta").is_none(), "{c:?}");
         }
 

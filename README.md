@@ -54,6 +54,8 @@ to see what would change first.
 | DeepSeek Harness (dsh) | `qx setup dsh` | |
 | Hermes | `qx setup hermes` | |
 | pi | `qx setup pi` | Uses a small bridge extension. |
+| Cursor | `qx setup cursor` | Adds qx to `~\.cursor\mcp.json`. Cursor has no command hook, so its own terminal tool is not redirected: the agent uses qx because of the server instructions. |
+| oh-my-pi (omp) | `qx setup omp` | Adds qx to `~\.omp\agent\mcp.json` (or `PI_CODING_AGENT_DIR`) with a 10-minute timeout; this entry wins over the one omp imports from `~\.claude.json`. Tools show as `mcp__qx_run` and `mcp__qx_fs`. |
 | Anything that speaks MCP | add `qx mcp` as a stdio server | [Details](#mcp-setup) |
 
 ## Use it from the command line too

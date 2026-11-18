@@ -189,6 +189,7 @@ mod tests {
             hermes_home: root.join("hermes"),
             codex_home: root.join("codex"),
             claude_config_dir: None,
+            omp_agent_dir: root.join(".omp").join("agent"),
         }
     }
 

@@ -16,6 +16,8 @@ pub enum Client {
     OpenCode,
     Hermes,
     Pi,
+    Cursor,
+    Omp,
     Generic,
 }
 
@@ -69,13 +71,15 @@ impl Native {
 
 impl Client {
     // Used by `qx setup` to walk every client it can register.
-    pub const ALL: [Client; 6] = [
+    pub const ALL: [Client; 8] = [
         Client::Dsh,
         Client::ClaudeCode,
         Client::Codex,
         Client::OpenCode,
         Client::Hermes,
         Client::Pi,
+        Client::Cursor,
+        Client::Omp,
     ];
 
     // Used by `qx setup` to name each client in its own config.
@@ -87,6 +91,8 @@ impl Client {
             Client::OpenCode => "opencode",
             Client::Hermes => "hermes",
             Client::Pi => "pi",
+            Client::Cursor => "cursor",
+            Client::Omp => "omp",
             Client::Generic => "generic",
         }
     }
@@ -99,6 +105,8 @@ impl Client {
             "opencode" | "open-code" => Client::OpenCode,
             "hermes" => Client::Hermes,
             "pi" => Client::Pi,
+            "cursor" => Client::Cursor,
+            "omp" | "oh-my-pi" => Client::Omp,
             "generic" => Client::Generic,
             _ => return None,
         })
@@ -117,6 +125,8 @@ impl Client {
                 "codex-mcp-client" => Some(Client::Codex),
                 "opencode" => Some(Client::OpenCode),
                 "pi" => Some(Client::Pi),
+                "cursor-vscode" => Some(Client::Cursor),
+                "omp-coding-agent" => Some(Client::Omp),
                 _ => None,
             };
             if let Some(c) = named {
@@ -134,7 +144,9 @@ impl Client {
     pub fn tool_id(self, tool: &str) -> String {
         match self {
             Client::OpenCode => format!("qx_{tool}"),
-            Client::Generic => format!("the qx `{tool}` tool"),
+            // omp joins server and tool with one underscore (`mcp/tool-bridge.ts`).
+            Client::Omp => format!("mcp__qx_{tool}"),
+            Client::Cursor | Client::Generic => format!("the qx `{tool}` tool"),
             _ => format!("mcp__qx__{tool}"),
         }
     }
@@ -164,6 +176,15 @@ impl Client {
                 "`search_files`",
             ],
             Client::Pi => ["`bash`", "`read`", "`write`", "`edit`", "`bash`", "`bash`"],
+            Client::Omp => ["`bash`", "`read`", "`write`", "`edit`", "`glob`", "`grep`"],
+            Client::Cursor => [
+                "`run_terminal_cmd`",
+                "`read_file`",
+                "`edit_file`",
+                "`edit_file`",
+                "`file_search`",
+                "`grep_search`",
+            ],
             Client::Generic => ["shell", "read", "write", "edit", "glob", "grep"],
         };
         named[n.index() as usize]
@@ -181,7 +202,8 @@ impl Client {
 
     pub fn structured(self) -> Structured {
         match self {
-            Client::ClaudeCode | Client::Codex => Structured::Off,
+            // omp appends `structuredContent` to the text as JSON, so the model would read it twice.
+            Client::ClaudeCode | Client::Codex | Client::Cursor | Client::Omp => Structured::Off,
             Client::Hermes => Structured::Meta,
             Client::Dsh | Client::OpenCode | Client::Pi | Client::Generic => Structured::Full,
         }
@@ -221,7 +243,9 @@ impl Client {
             Client::OpenCode => 3,
             Client::Hermes => 4,
             Client::Pi => 5,
-            Client::Generic => 6,
+            Client::Cursor => 6,
+            Client::Omp => 7,
+            Client::Generic => 8,
         }
     }
 
@@ -233,6 +257,8 @@ impl Client {
             3 => Client::OpenCode,
             4 => Client::Hermes,
             5 => Client::Pi,
+            6 => Client::Cursor,
+            7 => Client::Omp,
             _ => Client::Generic,
         }
     }
@@ -240,7 +266,7 @@ impl Client {
 
 /// The current session's client. Set from `QX_CLIENT` at startup and from
 /// `clientInfo.name` on `initialize`; one process serves one session.
-static CURRENT: AtomicU8 = AtomicU8::new(6);
+static CURRENT: AtomicU8 = AtomicU8::new(8);
 
 thread_local! {
     /// A per-thread override for tests: the global is process-wide and tests run in parallel.
@@ -286,6 +312,9 @@ mod tests {
         let none = |_: &str| None;
         assert_eq!(Client::detect(Some("codex-mcp-client"), none), Client::Codex);
         assert_eq!(Client::detect(Some("dsh-mcp-client"), none), Client::Dsh);
+        assert_eq!(Client::detect(Some("cursor-vscode"), none), Client::Cursor);
+        assert_eq!(Client::detect(Some("omp-coding-agent"), none), Client::Omp);
+        assert_eq!(Client::Omp.tool_id("run"), "mcp__qx_run");
         assert_eq!(Client::detect(Some("mcp"), none), Client::Generic);
         assert_eq!(
             Client::detect(Some("mcp"), |k| (k == "QX_CLIENT").then(|| "hermes".into())),

@@ -21,6 +21,9 @@ pub struct Paths {
     pub codex_home: PathBuf,
     /// `CLAUDE_CONFIG_DIR`: Claude Code then keeps both its files there instead of under the home.
     pub claude_config_dir: Option<PathBuf>,
+    /// omp's agent dir: `PI_CODING_AGENT_DIR`, else `~/<PI_CONFIG_DIR or .omp>/agent`.
+    /// shortcut: an `OMP_PROFILE` profile is not followed; add it if someone runs omp profiles.
+    pub omp_agent_dir: PathBuf,
 }
 
 impl Paths {
@@ -42,6 +45,10 @@ impl Paths {
             hermes_home: pick("HERMES_HOME", local_app_data.join("hermes")),
             codex_home: pick("CODEX_HOME", home.join(".codex")),
             claude_config_dir: var("CLAUDE_CONFIG_DIR").map(PathBuf::from),
+            omp_agent_dir: pick(
+                "PI_CODING_AGENT_DIR",
+                home.join(var("PI_CONFIG_DIR").unwrap_or_else(|| ".omp".into())).join("agent"),
+            ),
             home,
         }
     }
@@ -132,8 +139,48 @@ pub fn plan(c: Client, p: &Paths, exe: &Path, a: Action) -> Result<Vec<Change>, 
             .into_iter()
             .map(|(file, edit)| Change { client: c, file, edit })
             .collect()),
+        Client::Cursor => {
+            let file = cursor_file(p);
+            Ok(vec![Change {
+                client: c,
+                file: file.clone(),
+                edit: edit_json_file(&file, &["mcpServers", "qx"], |existing| cursor_entry(exe, existing), a),
+            }])
+        }
+        Client::Omp => {
+            let file = p.omp_agent_dir.join("mcp.json");
+            Ok(vec![Change {
+                client: c,
+                file: file.clone(),
+                edit: edit_json_file(&file, &["mcpServers", "qx"], |existing| omp_entry(exe, existing), a),
+            }])
+        }
         Client::Generic => Err("generic is not a client that can be configured".into()),
     }
+}
+
+/// omp's own `mcp.json` outranks the `~/.claude.json` entry it also imports. `timeout` is in ms:
+/// omp's 30 s default would cut a `run` that waits its full ~100 s.
+fn omp_entry(exe: &Path, existing: Option<&Value>) -> Value {
+    overlay(existing, json!({
+        "command": exe.to_string_lossy(),
+        "args": ["mcp"],
+        "env": merge_env(existing, "omp", &[]),
+        "timeout": 600000,
+    }))
+}
+
+/// Cursor's global MCP config; it reads `mcpServers` like Claude Code.
+fn cursor_file(p: &Paths) -> PathBuf {
+    p.home.join(".cursor").join("mcp.json")
+}
+
+fn cursor_entry(exe: &Path, existing: Option<&Value>) -> Value {
+    overlay(existing, json!({
+        "command": exe.to_string_lossy(),
+        "args": ["mcp"],
+        "env": merge_env(existing, "cursor", &[]),
+    }))
 }
 
 fn claude_file(p: &Paths) -> PathBuf {
@@ -500,7 +547,7 @@ fn leaves_nothing_of_the_users(client: Client, text: &str, existing: &[u8]) -> b
     let bare = text.trim_start_matches('\u{feff}').trim();
     (bare.is_empty() || bare == "{}")
         && match client {
-            Client::ClaudeCode | Client::OpenCode | Client::Pi => parse_strict(existing).is_some_and(|doc| only_qx_wrote(&doc)),
+            Client::ClaudeCode | Client::OpenCode | Client::Pi | Client::Cursor | Client::Omp => parse_strict(existing).is_some_and(|doc| only_qx_wrote(&doc)),
             _ => only_qx_lines(client, existing),
         }
 }
@@ -553,7 +600,7 @@ fn is_pristine_entry(entry: &Value) -> bool {
         "env" | "environment" => only_client(v),
         "enabled" => *v == json!(true),
         "codemode" => *v == json!(false),
-        "timeout" => *v == json!({ "execution": 600000 }) || *v == json!(600),
+        "timeout" => *v == json!({ "execution": 600000 }) || *v == json!(600) || *v == json!(600000),
         "exposure" => *v == json!("direct"),
         _ => false,
     })
@@ -677,6 +724,16 @@ pub fn status(c: Client, p: &Paths) -> Status {
             }
             (Some(file), command)
         }
+        Client::Cursor => {
+            let file = cursor_file(p);
+            let command = read_json_command(&file, &["mcpServers", "qx", "command"]);
+            (Some(file), command)
+        }
+        Client::Omp => {
+            let file = p.omp_agent_dir.join("mcp.json");
+            let command = read_json_command(&file, &["mcpServers", "qx", "command"]);
+            (Some(file), command)
+        }
         Client::Generic => (None, None),
     };
     Status {
@@ -712,6 +769,8 @@ fn installed(c: Client, p: &Paths) -> bool {
         Client::Dsh => p.dsh_home.is_dir(),
         Client::Hermes => p.hermes_home.is_dir(),
         Client::Pi => pi::pi_version().is_some(),
+        Client::Cursor => p.home.join(".cursor").is_dir(),
+        Client::Omp => p.omp_agent_dir.is_dir(),
         Client::Generic => false,
     }
 }
@@ -852,6 +911,7 @@ mod tests {
             hermes_home: root.join("hermes"),
             codex_home: root.join("codex"),
             claude_config_dir: None,
+            omp_agent_dir: root.join(".omp").join("agent"),
         }
     }
 
@@ -1507,6 +1567,43 @@ ew\qx.exe");
             |p| vec![(f(p), "{\n  \"mcp\": {\n    \"servers\": {\n      \"other\": {\n        \"command\": [\"x\"]\n      }\n    }\n  }\n}\n")],
             real_plan(Client::OpenCode),
         );
+    }
+
+    #[test]
+    fn e2e_cursor_roundtrip() {
+        let f = |p: &Paths| p.home.join(".cursor").join("mcp.json");
+        roundtrip("e2e-cursor-fresh", |_| vec![], real_plan(Client::Cursor));
+        roundtrip(
+            "e2e-cursor-other",
+            |p| vec![(f(p), "{
+  \"mcpServers\": {
+    \"other\": {
+      \"command\": \"x\"
+    }
+  }
+}
+")],
+            real_plan(Client::Cursor),
+        );
+    }
+
+    #[test]
+    fn e2e_omp_roundtrip() {
+        let f = |p: &Paths| p.omp_agent_dir.join("mcp.json");
+        roundtrip("e2e-omp-fresh", |_| vec![], real_plan(Client::Omp));
+        roundtrip(
+            "e2e-omp-other",
+            |p| vec![(f(p), "{\n  \"mcpServers\": {\n    \"other\": {\n      \"command\": \"x\"\n    }\n  }\n}\n")],
+            real_plan(Client::Omp),
+        );
+        let p = Paths::from_lookup(|k| match k {
+            "USERPROFILE" => Some(r"C:\h".into()),
+            "PI_CONFIG_DIR" => Some(".pix".into()),
+            _ => None,
+        });
+        assert_eq!(p.omp_agent_dir, Path::new(r"C:\h\.pix\agent"));
+        let p = Paths::from_lookup(|k| (k == "PI_CODING_AGENT_DIR").then(|| r"D:\a".into()));
+        assert_eq!(p.omp_agent_dir, Path::new(r"D:\a"));
     }
 
     #[test]
