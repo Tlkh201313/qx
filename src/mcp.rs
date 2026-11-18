@@ -1379,6 +1379,10 @@ fn render(id: Option<Value>, outcome: exec::Outcome, source: &str, ctx: &RunCtx,
                 compact::relative_to_cwd(&mut so, &mut se, cwd);
             }
         } else {
+            // A traceback too short to digest still repeats the absolute script path on every frame.
+            if digest::is_runtime_label(label) {
+                compact::relative_to_cwd(&mut so, &mut se, cwd);
+            }
             let (max, head, tail) = digest::plain_budget(label, (200, 80, 60));
             let (a, cut) = compact::compact(&so, max, head, tail);
             let (b, cut_err) = compact::compact(&se, 120, 50, 40);
@@ -1425,11 +1429,10 @@ fn render(id: Option<Value>, outcome: exec::Outcome, source: &str, ctx: &RunCtx,
     if outcome.timed_out {
         text.push_str("timed_out: true\n");
     }
-    // A clean run says nothing but its output: the section header is ~4 tokens on every call.
-    let plain = outcome.code == 0 && !outcome.timed_out && se.is_empty();
     if !so.is_empty() {
-        if !plain {
-            text.push_str("\n[stdout]\n");
+        // The lone-stdout header says nothing; it only separates streams when stderr is shown too.
+        if !se.is_empty() {
+            text.push_str("[stdout]\n");
         }
         text.push_str(&so);
         if !so.ends_with('\n') {
@@ -1437,22 +1440,22 @@ fn render(id: Option<Value>, outcome: exec::Outcome, source: &str, ctx: &RunCtx,
         }
     }
     if !se.is_empty() {
-        text.push_str("\n[stderr]\n");
+        text.push_str("[stderr]\n");
         text.push_str(&se);
         if !se.ends_with('\n') {
             text.push('\n');
         }
     }
     if so.is_empty() && se.is_empty() {
-        text.push_str("\n(no output)\n");
+        text.push_str("(no output)\n");
     }
     if let Some(p) = &spool {
-        text.push_str(&format!("\n[qx] full output: {}\n", p.display()));
+        text.push_str(&format!("[qx] full output: {}\n", p.display()));
     } else if (truncated || lossy) && !full {
-        text.push_str("\n[qx] output was cut and could not be saved; re-run with mode:\"full\" for all of it\n");
+        text.push_str("[qx] output was cut and could not be saved; re-run with mode:\"full\" for all of it\n");
     }
     if redactions > 0 {
-        text.push_str(&format!("\n[qx] redacted {redactions} secret(s)\n"));
+        text.push_str(&format!("[qx] redacted {redactions} secret(s)\n"));
     }
     let mut meta = json!({
         "source": source,
@@ -1786,6 +1789,35 @@ mod tests {
     fn call_id(id: u64, args: Value) -> Value {
         respond(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"run","arguments":args}}).to_string())
             .expect("a call is always answered")
+    }
+
+    fn render_text(label: &str, cwd: &std::path::Path, code: i32, so: &str, se: &str) -> String {
+        let ctx = RunCtx { label: label.into(), cwd: Some(cwd.to_path_buf()), full: false, guard_warning: None, cwd_note: None };
+        let out = exec::Outcome { code, stdout: so.into(), stderr: se.into(), elapsed: Duration::ZERO, timed_out: false, cut: false };
+        let r = render(Some(json!(1)), out, "", &ctx, "");
+        r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap().to_string()
+    }
+
+    #[test]
+    fn failing_stdout_only_has_no_stream_header() {
+        let d = std::env::temp_dir();
+        let t = render_text("somecmd --render-hdr-a", &d, 1, "only out a\n", "");
+        assert_eq!(t, "exit_code: 1\nonly out a\n");
+        let t = render_text("somecmd --render-hdr-b", &d, 1, "out b\n", "err b\n");
+        assert_eq!(t, "exit_code: 1\n[stdout]\nout b\n[stderr]\nerr b\n");
+    }
+
+    #[test]
+    fn short_runtime_traceback_gets_relative_paths() {
+        let d = std::env::temp_dir().join("qx-render-rel");
+        let script = d.join("app.py");
+        let err = format!(
+            "Traceback (most recent call last):\n  File \"{0}\", line 13, in <module>\n    f()\n  File \"{0}\", line 9, in f\n    g()\n  File \"{0}\", line 5, in g\n    1/0\nZeroDivisionError: division by zero\n",
+            script.display()
+        );
+        let t = render_text("python app.py", &d, 1, "", &err);
+        assert!(t.contains("File \"app.py\", line 13"), "{t}");
+        assert!(!t.contains(&format!("File \"{}", d.display())), "{t}");
     }
 
     #[test]

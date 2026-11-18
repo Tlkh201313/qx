@@ -464,6 +464,7 @@ fn emit(out: exec::Outcome, o: &RunOpts, label: &str) -> i32 {
     // Compaction or a digest that dropped content leaves the full text on disk, as the MCP path does,
     // so a slow or non-repeatable command never has to be re-run to see what was cut.
     let mut spool = None;
+    let mut was_lossy = false;
     if o.compact {
         if so.contains('\x1b') {
             so = compact::strip_ansi(&so);
@@ -487,6 +488,7 @@ fn emit(out: exec::Outcome, o: &RunOpts, label: &str) -> i32 {
             }
         };
         if lossy {
+            was_lossy = true;
             spool = compact::spool(&so, &se);
         }
         so = kept_so;
@@ -500,6 +502,8 @@ fn emit(out: exec::Outcome, o: &RunOpts, label: &str) -> i32 {
     write_out(&so, &se);
     if let Some(p) = &spool {
         eprintln!("[qx] full output: {}", p.display());
+    } else if was_lossy {
+        eprintln!("[qx] output was cut and could not be saved; re-run with --raw for all of it");
     }
     if out.timed_out {
         eprintln!(

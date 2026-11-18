@@ -7,9 +7,6 @@
 
 use crate::compact;
 
-/// How to get the uncut text: the CLI has `--raw`, an MCP call has `mode:"full"`.
-const FULL: &str = "--raw (CLI) or mode:\"full\" (MCP)";
-
 pub struct Digest {
     pub stdout: String,
     pub stderr: String,
@@ -47,10 +44,47 @@ pub fn plain_budget(label: &str, usual: (usize, usize, usize)) -> (usize, usize,
     }
 }
 
+/// Git's Windows line-ending warnings are noise on stderr, not content. Filtered here for every git
+/// command; when no digest fits, the cleaned stderr still goes out with the plainly compacted stdout.
 pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Digest> {
     if std::env::var("QX_DIGEST").ok().as_deref() == Some("off") {
         return None;
     }
+    if git_sub(&core_label(&label.to_ascii_lowercase())).is_none() {
+        return digest_core(label, stdout, stderr, code);
+    }
+    let clean = strip_eol_warnings(stderr);
+    let d = digest_core(label, stdout, &clean, code);
+    if d.is_some() || clean.len() == stderr.len() {
+        return d;
+    }
+    let (max, head, tail) = plain_budget(label, (200, 80, 60));
+    let (o, cut_o) = compact::compact(stdout, max, head, tail);
+    let (e, cut_e) = keep_stderr(&clean);
+    Some(Digest { stdout: o, stderr: e, profile: "git", omitted: 0, clipped: cut_o || cut_e, passed: code == 0 })
+}
+
+fn strip_eol_warnings(stderr: &str) -> String {
+    // git >= 2.37: `warning: in the working copy of 'X', LF will be replaced by CRLF the next time Git
+    // touches it`; older: `warning: LF will be replaced by CRLF in X.` plus an explanatory line.
+    let noise = |l: &str| {
+        (l.starts_with("warning: in the working copy of '")
+            && (l.contains(", LF will be replaced by CRLF the next time Git touches it")
+                || l.contains(", CRLF will be replaced by LF the next time Git touches it")))
+            || (l.starts_with("warning: LF will be replaced by CRLF in ") || l.starts_with("warning: CRLF will be replaced by LF in "))
+            || l.starts_with("The file will have its original line endings in your working directory")
+    };
+    if !stderr.lines().any(noise) {
+        return stderr.to_string();
+    }
+    stderr.lines().filter(|l| !noise(l)).fold(String::new(), |mut s, l| {
+        s.push_str(l);
+        s.push('\n');
+        s
+    })
+}
+
+fn digest_core(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Digest> {
     let l = core_label(&label.to_ascii_lowercase());
     // Progress bars redrawn with `\r` (tqdm, curl, downloaders) reach the digests as their last frame.
     let ((so, sd), (se, ed)) = (compact::settle_frames(stdout), compact::settle_frames(stderr));
@@ -63,16 +97,21 @@ pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Dige
         let (o, n) = git_log(stdout)?;
         ("git-log", o, None, n, false)
     } else if is_diff(&l) {
-        // A diff that fits is shown as git printed it: without its context lines and headers the hunk
-        // offsets no longer match what is shown. Only a long one is condensed (and spooled).
+        // A diff that fits is shown with every hunk header, context, `+` and `-` line: without them the
+        // hunk offsets no longer match what is shown. Only its file headers fold, which loses nothing,
+        // so it skips the saving gate below and is never spooled. Only a long one is condensed.
         if stdout.lines().count() <= DIFF_WHOLE {
-            return None;
+            let o = trim_diff_headers(stdout)?;
+            let (err, cut) = keep_stderr(stderr);
+            return Some(Digest { stdout: o, stderr: err, profile: "git-diff", omitted: 0, clipped: sd || ed || cut, passed: code == 0 });
         }
         let (o, n, c) = git_diff(stdout)?;
         ("git-diff", o, None, n, c)
     } else if is_pathlist(&l) {
         // Searches and listings first: `rg -n jest` is a search, whatever word it searches for.
-        let (o, n) = paths(stdout)?;
+        // Sorted output (`rg --files --sort modified`, `dir /b /o:d`, a pipe into `sort`): the order is the answer.
+        let sorted = label.contains('|') || words(&l).any(|w| w.starts_with("--sort") || w.to_ascii_lowercase().starts_with("/o"));
+        let (o, n) = paths(stdout, !sorted)?;
         ("paths", o, None, n, false)
     } else if is_search(&l) {
         let (o, n, c) = grep(stdout)?;
@@ -365,7 +404,7 @@ fn git_log(text: &str) -> Option<(String, usize)> {
         }
         out.push('\n');
     }
-    out.push_str(&format!("[qx] git log condensed (7-char hashes, bodies dropped); full text: {FULL}\n"));
+    out.push_str("[qx] git log condensed (7-char hashes, bodies dropped)\n");
     let omitted = text.lines().count().saturating_sub(commits.len());
     Some((out, omitted))
 }
@@ -451,6 +490,11 @@ fn is_build(l: &str) -> bool {
     BUILDS
         .iter()
         .any(|p| l.strip_prefix(p).is_some_and(|r| r.is_empty() || r.starts_with(' ')))
+}
+
+/// True when the command (after the same lowercase + core-label step `digest` takes) runs a script runtime.
+pub fn is_runtime_label(label: &str) -> bool {
+    is_runtime(&core_label(&label.to_ascii_lowercase()))
 }
 
 fn is_runtime(l: &str) -> bool {
@@ -594,38 +638,64 @@ fn is_pathlist(l: &str) -> bool {
     }
 }
 
-/// Lossless: consecutive paths in one directory become `dir/{a,b,c}`. Names that
-/// hold `,{}` (or end a directory path) stay as plain lines.
-fn paths(text: &str) -> Option<(String, usize)> {
+/// Lossless as a set: every path of one directory goes on ONE line `dir/{a,b,c}` (directories in order
+/// of first appearance, names in their original order), so the order across directories is regrouped.
+/// When the order is the answer (`rg --files --sort modified`, a pipe into `sort`), `regroup` is false
+/// and only consecutive paths of one directory share a line. When 3+ names of a line share one
+/// extension it is factored out: `dir/{a,b,c}.rs`. Names or dirs that hold `,{}`, a name without an
+/// extension, or a directory path itself stay as plain lines.
+fn paths(text: &str, regroup: bool) -> Option<(String, usize)> {
     let sep = |c: char| c == '/' || c == '\\';
     let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
     if lines.len() < 12 || lines.iter().filter(|l| l.contains(sep)).count() * 10 < lines.len() * 9 {
         return None;
     }
     let cut = |l: &str| l.rfind(sep).map_or(0, |k| k + 1);
+    // A line that ends in a separator is a directory entry: it never joins the files of that directory.
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut index: std::collections::HashMap<(&str, bool), usize> = std::collections::HashMap::new();
+    for l in &lines {
+        let dir = &l[..cut(l)];
+        let key = (dir, dir.len() == l.len());
+        let g = match index.get(&key) {
+            Some(&g) if regroup || g + 1 == groups.len() => g,
+            _ => {
+                groups.push((dir, Vec::new()));
+                index.insert(key, groups.len() - 1);
+                groups.len() - 1
+            }
+        };
+        groups[g].1.push(&l[dir.len()..]);
+    }
+    // `.rs` of `a.rs`; none for `Makefile` or a dotfile (`.gitignore`).
+    fn ext(n: &str) -> Option<&str> {
+        n.rfind('.').filter(|&k| k > 0 && k + 1 < n.len()).map(|k| &n[k..])
+    }
     let mut out = String::new();
     let mut shown = 0usize;
-    let mut i = 0;
-    while i < lines.len() {
-        let dir = &lines[i][..cut(lines[i])];
-        let mut j = i + 1;
-        while j < lines.len() && lines[j].starts_with(dir) && cut(lines[j]) == dir.len() {
-            j += 1;
-        }
-        let names: Vec<&str> = lines[i..j].iter().map(|l| &l[dir.len()..]).collect();
+    for (dir, names) in &groups {
         if names.len() < 2 || dir.contains([',', '{', '}']) || names.iter().any(|n| n.is_empty() || n.contains([',', '{', '}'])) {
-            for l in &lines[i..j] {
-                out.push_str(l);
+            for n in names {
+                out.push_str(dir);
+                out.push_str(n);
                 out.push('\n');
                 shown += 1;
             }
-        } else {
-            for chunk in names.chunks(60) {
-                out.push_str(&format!("{dir}{{{}}}\n", chunk.join(",")));
-                shown += 1;
-            }
+            continue;
         }
-        i = j;
+        for chunk in names.chunks(60) {
+            let common = ext(chunk[0]).filter(|e| chunk.len() >= 3 && chunk.iter().all(|n| ext(n) == Some(*e)));
+            match (chunk.len(), common) {
+                (1, _) => out.push_str(&format!("{dir}{}", chunk[0])),
+                (_, Some(e)) => {
+                    let stems: Vec<&str> = chunk.iter().map(|n| &n[..n.len() - e.len()]).collect();
+                    out.push_str(&format!("{dir}{{{}}}{e}", stems.join(",")));
+                }
+                _ => out.push_str(&format!("{dir}{{{}}}", chunk.join(","))),
+            }
+            out.push('\n');
+            shown += 1;
+        }
     }
     Some((out, lines.len().saturating_sub(shown)))
 }
@@ -644,37 +714,85 @@ fn is_search(l: &str) -> bool {
     })
 }
 
-/// The entry as listed: a bare path for the common `modified:`, the kind kept for the rest
-/// (`deleted: old.rs`, `renamed: a -> b`), which a path alone would pass off as an edit.
-fn status_path(t: &str) -> Option<String> {
+/// The entry of a long-format status as `(code, path)`. The code is one letter (`M A D R C T`) whose
+/// column (index or worktree) the section decides, or a full two-letter code that does not depend on
+/// it: a conflict, or `??` for `?? path`. For a rename or copy the path reads `old -> new`.
+fn status_path(t: &str) -> Option<(&'static str, String)> {
     if let Some(p) = t.strip_prefix("?? ") {
-        return Some(format!("untracked: {}", p.trim()));
+        return Some(("??", p.trim().to_string()));
     }
-    for k in [
-        "both modified:",
-        "both deleted:",
-        "both added:",
-        "modified:",
-        "new file:",
-        "deleted:",
-        "renamed:",
-        "copied:",
-        "typechange:",
-        "unmerged:",
+    for (k, code) in [
+        ("both modified:", "UU"),
+        ("both deleted:", "DD"),
+        ("both added:", "AA"),
+        ("added by us:", "AU"),
+        ("added by them:", "UA"),
+        ("deleted by us:", "DU"),
+        ("deleted by them:", "UD"),
+        ("modified:", "M"),
+        ("new file:", "A"),
+        ("deleted:", "D"),
+        ("renamed:", "R"),
+        ("copied:", "C"),
+        ("typechange:", "T"),
+        ("unmerged:", "UU"),
     ] {
         if let Some(p) = t.strip_prefix(k) {
-            let p = p.trim();
-            return Some(if k == "modified:" { p.to_string() } else { format!("{k} {p}") });
+            return Some((code, p.trim().to_string()));
         }
     }
     None
 }
 
+/// `'origin/main'` out of a branch sentence.
+fn quoted(s: &str) -> Option<&str> {
+    let a = s.find('\'')? + 1;
+    let b = a + s[a..].find('\'')?;
+    Some(&s[a..b])
+}
+
+/// `Your branch is ahead of 'origin/main' by 2 commits.` -> `("origin/main", Some("ahead 2"))`; `None` for
+/// a sentence this reader does not know. A diverged branch gets its counts from the following line.
+fn branch_line(t: &str) -> Option<(String, Option<String>)> {
+    let rest = t.strip_prefix("Your branch ")?;
+    let up = quoted(rest)?.to_string();
+    let by = || rest.split(" by ").nth(1)?.split_whitespace().next()?.parse::<usize>().ok();
+    let track = if rest.starts_with("is up to date") {
+        None
+    } else if rest.starts_with("is ahead of ") {
+        Some(format!("ahead {}", by()?))
+    } else if rest.starts_with("is behind ") {
+        Some(format!("behind {}", by()?))
+    } else if rest.starts_with("is based on ") && rest.contains("upstream is gone") {
+        Some("gone".to_string())
+    } else if rest.contains("have diverged") {
+        Some("diverged".to_string())
+    } else {
+        return None;
+    };
+    Some((up, track))
+}
+
+/// Lossless rewrite of the long `git status` into the short `-sb` encoding every agent reads: a `## branch`
+/// header, then one line per `XY` code (index column, worktree column) listing its paths.
 fn git_status(text: &str) -> Option<(String, usize)> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Sec {
+        Staged,
+        Unstaged,
+        Untracked,
+        Ignored,
+        Unmerged,
+    }
     let mut branch: Option<String> = None;
+    let mut detached: Option<String> = None;
+    let mut no_commits = false;
+    let mut upstream: Option<(String, Option<String>)> = None;
     let mut state: Vec<String> = Vec::new();
-    let mut sections: Vec<(&'static str, Vec<String>)> = Vec::new();
-    let mut cur: Option<usize> = None;
+    // `(code, path)` in order of first appearance; a path staged and also modified is one entry (`MM`).
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut staged: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut cur: Option<Sec> = None;
     let mut omitted = 0usize;
 
     for raw in text.lines() {
@@ -687,46 +805,52 @@ fn git_status(text: &str) -> Option<(String, usize)> {
             branch = Some(b.to_string());
             continue;
         }
-        if t.starts_with("HEAD detached at ") {
-            branch = Some(t.to_string());
+        if let Some(d) = t.strip_prefix("HEAD detached ") {
+            detached = Some(format!("detached {d}")); // `at abc123` or `from abc123`
             continue;
         }
-        if let Some(b) = t.strip_prefix("Your branch is ") {
-            state.push(b.trim_end_matches('.').to_string());
+        if t == "No commits yet" || t == "Initial commit" {
+            no_commits = true;
             continue;
+        }
+        if t.starts_with("Your branch ") {
+            match branch_line(t) {
+                Some(u) => upstream = Some(u),
+                None => state.push(t.trim_end_matches('.').to_string()),
+            }
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("and have ") {
+            if let Some((_, track)) = upstream.as_mut() {
+                let mut w = rest.split_whitespace();
+                if let (true, Some(a), Some("and"), Some(b)) = (track.as_deref() == Some("diverged"), w.next(), w.next(), w.next()) {
+                    if a.parse::<usize>().is_ok() && b.parse::<usize>().is_ok() {
+                        *track = Some(format!("ahead {a}, behind {b}"));
+                        continue;
+                    }
+                }
+            }
         }
         let section = match t {
-            "Changes to be committed:" => Some("staged"),
-            "Changes not staged for commit:" => Some("modified"),
-            "Untracked files:" => Some("untracked"),
-            "Ignored files:" => Some("ignored"), // `git status --ignored`
-            "Unmerged paths:" => Some("conflicted"),
+            "Changes to be committed:" => Some(Sec::Staged),
+            "Changes not staged for commit:" => Some(Sec::Unstaged),
+            "Untracked files:" => Some(Sec::Untracked),
+            "Ignored files:" => Some(Sec::Ignored), // `git status --ignored`
+            "Unmerged paths:" => Some(Sec::Unmerged),
             _ => None,
         };
-        if let Some(name) = section {
-            let idx = match sections.iter().position(|(n, _)| *n == name) {
-                Some(i) => i,
-                None => {
-                    sections.push((name, Vec::new()));
-                    sections.len() - 1
-                }
-            };
-            cur = Some(idx);
+        if section.is_some() {
+            cur = section;
             continue;
         }
         if t.starts_with("nothing to commit") {
             state.push("clean".to_string());
             continue;
         }
-        if t.starts_with("nothing added to commit") {
-            state.push("nothing added to commit (untracked files present)".to_string());
-            continue;
-        }
-        if t.starts_with("no changes added to commit") {
-            state.push("no changes added to commit".to_string());
-            continue;
-        }
-        if t.starts_with("(use \"")
+        // Both say what the `??` lines or the absent `A`/`M` lines already show.
+        if t.starts_with("nothing added to commit")
+            || t.starts_with("no changes added to commit")
+            || t.starts_with("(use \"")
             || t.starts_with("(commit or discard")
             || t.starts_with("(fix conflicts")
         {
@@ -737,51 +861,103 @@ fn git_status(text: &str) -> Option<(String, usize)> {
             state.push(t.to_string()); // `--show-stash`; a note, not a file of the section above
             continue;
         }
-        if let Some(i) = cur {
-            // git indents a listed path with one TAB; any other line here is a note this digest does not know.
-            if matches!(sections[i].0, "untracked" | "ignored") && raw.starts_with('\t') {
-                sections[i].1.push(t.to_string());
-                continue;
-            }
-        }
-        if let Some(path) = status_path(t) {
-            let idx = match cur {
-                Some(i) => i,
-                None => {
-                    sections.push(("changed", Vec::new()));
-                    sections.len() - 1
-                }
-            };
-            sections[idx].1.push(path);
+        // git indents a listed path with one TAB; any other line here is a note this digest does not know.
+        if matches!(cur, Some(Sec::Untracked | Sec::Ignored)) && raw.starts_with('\t') {
+            let code = if cur == Some(Sec::Ignored) { "!!" } else { "??" };
+            entries.push((code.to_string(), t.to_string()));
             continue;
         }
-        // A line this digest does not know (`deleted by us:`, ` M file`, a rebase notice) is not ours to drop.
+        if let Some((code, path)) = status_path(t) {
+            let letter = code.as_bytes()[0] as char;
+            let code = match (code.len(), cur) {
+                (2, _) => code.to_string(),
+                (_, Some(Sec::Staged)) => format!("{letter} "),
+                (_, Some(Sec::Unstaged)) => format!(" {letter}"),
+                // A bare entry outside any section: the column is unknown, so do not guess.
+                _ => return None,
+            };
+            // A change made after staging belongs on the line of its staged entry (`MM`).
+            if cur == Some(Sec::Unstaged) {
+                if let Some(&i) = staged.get(&path) {
+                    if entries[i].0.ends_with(' ') {
+                        entries[i].0 = format!("{}{letter}", &entries[i].0[..1]);
+                        continue;
+                    }
+                }
+            }
+            if cur == Some(Sec::Staged) {
+                // The worktree side names the renamed file by its new path.
+                let key = path.rsplit_once(" -> ").map_or(path.as_str(), |(_, n)| n).to_string();
+                staged.insert(key, entries.len());
+            }
+            entries.push((code, path));
+            continue;
+        }
+        // A line this digest does not know (a rebase notice, ` M file`) is not ours to drop.
         return None;
     }
 
     let mut out = String::new();
-    if let Some(b) = branch {
-        out.push_str("branch ");
-        out.push_str(&b);
+    let head = match (&detached, &branch) {
+        (Some(d), _) => Some(format!("## HEAD ({d})")),
+        (None, Some(b)) if no_commits => Some(format!("## No commits yet on {b}")),
+        (None, Some(b)) => Some(format!("## {b}")),
+        _ => None,
+    };
+    if no_commits && (detached.is_some() || branch.is_none()) {
+        state.push("No commits yet".to_string());
+    }
+    if let Some(mut h) = head {
+        if detached.is_none() {
+            if let Some((up, track)) = &upstream {
+                h.push_str("...");
+                h.push_str(up);
+                if let Some(t) = track {
+                    h.push_str(&format!(" [{t}]"));
+                }
+            }
+        }
+        out.push_str(&h);
         out.push('\n');
     }
     for s in state {
         out.push_str(&s);
         out.push('\n');
     }
-    for (name, files) in sections {
-        if files.is_empty() {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for (code, path) in entries {
+        match groups.iter().position(|(c, _)| *c == code) {
+            Some(i) => groups[i].1.push(path),
+            None => groups.push((code, vec![path])),
+        }
+    }
+    for (code, paths) in groups {
+        // A rename (`old -> new`) or any path with whitespace would not survive a space-joined list.
+        let joinable = paths.iter().all(|p| !p.is_empty() && !p.contains(char::is_whitespace));
+        if !joinable {
+            for p in &paths {
+                out.push_str(&format!("{code} {p}\n"));
+            }
             continue;
         }
-        out.push_str(name);
-        out.push_str(" (");
-        out.push_str(&files.len().to_string());
-        out.push_str("):\n");
-        for f in files {
-            out.push_str("  ");
-            out.push_str(&f);
-            out.push('\n');
+        // Wrapped at ~200 chars so no line reaches the per-line cap, which would cut the list; every
+        // line repeats its code, so each stands on its own.
+        let mut cur = String::new();
+        for p in &paths {
+            if !cur.is_empty() && cur.len() + p.len() + 1 > 200 {
+                out.push_str(&cur);
+                out.push('\n');
+                cur.clear();
+            }
+            if cur.is_empty() {
+                cur = format!("{code} {p}");
+            } else {
+                cur.push(' ');
+                cur.push_str(p);
+            }
         }
+        out.push_str(&cur);
+        out.push('\n');
     }
     if out.is_empty() {
         return None;
@@ -789,9 +965,123 @@ fn git_status(text: &str) -> Option<(String, usize)> {
     Some((out, omitted))
 }
 
+/// The name `diff --git a/X b/X` shows when both sides are the same path. `None` for quoted, prefixed
+/// differently (`--no-prefix`, `i/`, `w/`) or differing names: those are kept as git printed them.
+fn same_diff_path(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("diff --git a/")?;
+    let n = rest.len().checked_sub(3)? / 2;
+    (rest.len() == 2 * n + 3 && rest.get(n..n + 3) == Some(" b/") && rest.get(..n) == rest.get(n + 3..)).then(|| &rest[..n])
+}
+
+/// Fold the header block that starts at `lines[i]` (a `diff --git` line) into compact lines and return
+/// them with the index of the first line after the block. Nothing is lost: the `index` line is a blob
+/// hash, `---`/`+++` repeat the path, and mode, rename and similarity info move into the title line:
+/// `diff X`, `diff X (deleted 100644)`, `diff A -> B (renamed 95%)`. Lines it cannot place (mode
+/// change, copy, odd prefixes) stay as git printed them.
+fn fold_diff_header(lines: &[&str], i: usize) -> (Vec<String>, usize) {
+    let mut j = i + 1;
+    let (mut new_mode, mut del_mode, mut sim) = (None, None, None);
+    let (mut from, mut to) = (None, None);
+    let (mut minus, mut plus) = (None, None);
+    let mut others: Vec<&str> = Vec::new();
+    while let Some(&l) = lines.get(j) {
+        if let Some(m) = l.strip_prefix("new file mode ") {
+            new_mode = Some(m);
+        } else if let Some(m) = l.strip_prefix("deleted file mode ") {
+            del_mode = Some(m);
+        } else if let Some(s) = l.strip_prefix("similarity index ") {
+            sim = Some(s);
+        } else if let Some(f) = l.strip_prefix("rename from ") {
+            from = Some(f);
+        } else if let Some(t) = l.strip_prefix("rename to ") {
+            to = Some(t);
+        } else if l.starts_with("--- ") {
+            minus = Some(l);
+        } else if l.starts_with("+++ ") {
+            plus = Some(l);
+        } else if l.starts_with("old mode ")
+            || l.starts_with("new mode ")
+            || l.starts_with("dissimilarity index ")
+            || l.starts_with("copy from ")
+            || l.starts_with("copy to ")
+        {
+            others.push(l);
+        } else if !l.starts_with("index ") {
+            break;
+        }
+        j += 1;
+    }
+    let line = lines[i];
+    let renamed = from.zip(to);
+    let (a, b) = match (same_diff_path(line), renamed) {
+        (Some(p), None) => (p, p),
+        (_, Some((f, t))) if new_mode.is_none() && del_mode.is_none() => (f, t),
+        _ => {
+            // Unplaceable names: only the blob-hash line goes.
+            let mut out = vec![line.to_string()];
+            out.extend(lines[i + 1..j].iter().filter(|l| !l.starts_with("index ")).map(|l| l.to_string()));
+            return (out, j);
+        }
+    };
+    let mut title = if a == b { format!("diff {a}") } else { format!("diff {a} -> {b}") };
+    let mut tags: Vec<String> = Vec::new();
+    if let Some(m) = new_mode {
+        tags.push(format!("new {m}"));
+    }
+    if let Some(m) = del_mode {
+        tags.push(format!("deleted {m}"));
+    }
+    if renamed.is_some() {
+        tags.push(format!("renamed {}", sim.unwrap_or("")).trim_end().to_string());
+    }
+    if !tags.is_empty() {
+        title.push_str(&format!(" ({})", tags.join(", ")));
+    }
+    let mut out = vec![title];
+    out.extend(others.iter().map(|l| l.to_string()));
+    let want_minus = if new_mode.is_some() { "--- /dev/null".to_string() } else { format!("--- a/{a}") };
+    let want_plus = if del_mode.is_some() { "+++ /dev/null".to_string() } else { format!("+++ b/{b}") };
+    for (got, want) in [(minus, want_minus), (plus, want_plus)] {
+        if let Some(g) = got.filter(|g| *g != want) {
+            out.push(g.to_string());
+        }
+    }
+    (out, j)
+}
+
+/// A diff short enough to show whole: only its headers are folded, every hunk header, context, `+` and
+/// `-` line stays. `None` when there is nothing to fold or the diff has merge-conflict columns.
+fn trim_diff_headers(text: &str) -> Option<String> {
+    if diff_is_combined(text) {
+        return None;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].starts_with("diff --git ") {
+            let (folded, next) = fold_diff_header(&lines, i);
+            for l in folded {
+                out.push_str(&l);
+                out.push('\n');
+            }
+            i = next;
+        } else {
+            out.push_str(lines[i]);
+            out.push('\n');
+            i += 1;
+        }
+    }
+    (out.len() < text.len()).then_some(out)
+}
+
+/// A merge-conflict diff marks each side with a column of its own; this reader knows one.
+fn diff_is_combined(text: &str) -> bool {
+    text.starts_with("diff --cc") || text.contains("\ndiff --cc ") || text.contains("\n@@@ ") || text.starts_with("@@@ ")
+}
+
 fn git_diff(text: &str) -> Option<(String, usize, bool)> {
-    // A merge-conflict diff marks each side with a column of its own; this reader knows one.
-    if text.starts_with("diff --cc") || text.contains("\ndiff --cc ") || text.contains("\n@@@ ") || text.starts_with("@@@ ") {
+    if diff_is_combined(text) {
         return None;
     }
     let mut out = String::new();
@@ -800,11 +1090,20 @@ fn git_diff(text: &str) -> Option<(String, usize, bool)> {
     let mut in_hunk = false;
     let mut changed = 0usize;
     let mut kept = 0usize;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
 
-    for line in text.lines() {
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
         if line.starts_with("diff --git ") {
-            out.push_str(line);
-            out.push('\n');
+            let (folded, next) = fold_diff_header(&lines, i - 1);
+            omitted += (next - (i - 1)).saturating_sub(folded.len());
+            for l in folded {
+                out.push_str(&l);
+                out.push('\n');
+            }
+            i = next;
             in_hunk = false;
             continue;
         }
@@ -881,9 +1180,7 @@ fn git_diff(text: &str) -> Option<(String, usize, bool)> {
         return None;
     }
     if clipped {
-        out.push_str(&format!(
-            "[qx] {omitted} diff lines omitted; full text: {FULL}\n"
-        ));
+        out.push_str(&format!("[qx] {omitted} diff lines omitted\n"));
     }
     Some((out, omitted, clipped))
 }
@@ -1010,7 +1307,7 @@ fn summary_line(t: &str) -> bool {
         || t.starts_with("ok  ")
         || t.starts_with("failures:")
         || t.starts_with("error: test failed")
-        || t.starts_with("Finished ")
+        // `Finished` is routine: `diagnostic` keeps it only when nothing else survives.
         || t.starts_with("Compiled ")
         || t.starts_with("built in")
         || t.starts_with("Build complete")
@@ -1038,7 +1335,7 @@ fn routine_line(t: &str) -> bool {
     const STARTS: &[&str] = &[
         "Compiling ", "Checking ", "Finished ", "Running ", "Fresh ", "Downloaded ", "Downloading ", "Updating ",
         "Locking ", "Adding ", "Blocking ", "Installing ", "Installed ", "Replacing ", "Replaced ", "Doc-tests ",
-        "running ", "collecting ", "collected ", "platform ", "rootdir:", "cachedir:", "plugins:", "configfile:",
+        "running ", "collecting ", "collected ", "platform ", "rootdir:", "cachedir:", "plugins:", "configfile:", "asyncio: mode=",
         "Collecting ", "Using cached ", "Requirement already satisfied", "Building wheel", "Created wheel",
         "Stored in directory", "Preparing metadata", "Getting requirements", "Determining projects to restore",
         "All projects are up-to-date", "Restored ", "Time Elapsed", "Ran all test suites", "Test Suites:", "Tests",
@@ -1069,12 +1366,264 @@ fn failure_word(t: &str) -> bool {
     ["error", "panic", "exception", "fatal"].iter().any(|w| t.contains(w)) || t.split_whitespace().any(|w| w.starts_with("fail"))
 }
 
+/// Lint name in rustc's `= note: `#[warn(clippy::x)]` on by default` or `= note: `-D clippy::x` implied by ...`.
+fn lint_name(t: &str) -> Option<&str> {
+    let t = t.strip_prefix("= note: `")?;
+    if let Some(r) = t.strip_prefix("#[") {
+        return r.split_once('(')?.1.split_once(")]").map(|(n, _)| n);
+    }
+    let n = t.strip_prefix("-D ")?.split('`').next()?;
+    (n != "warnings").then_some(n)
+}
+
+/// `^^^ help: use `is_empty`: `v.is_empty()`` label: the text after `help: `.
+fn inline_help(t: &str) -> Option<&str> {
+    let r = t[t.find('^')?..].trim_start_matches('^').trim_start();
+    r.strip_prefix("help: ")
+}
+
+/// `5 +     v[0]` line of a rustc suggestion diff.
+fn plus_line(t: &str) -> bool {
+    let n = t.bytes().take_while(u8::is_ascii_digit).count();
+    n > 0 && t[n..].starts_with(" + ")
+}
+
+/// rustc/clippy blocks: the lint name moves onto the header line; the `= note`/`= help: ...visit` lines it
+/// came from, the source snippet and the suggestion diff are noise. A warning keeps its header, `-->`, and one
+/// fix (the inline `help:` label, else the suggestion's `help:` + `+` lines). Errors keep their whole block.
+fn fold_rustc(lines: &[&str], keep: &mut [bool], noise: &mut [bool], over: &mut [Option<String>]) {
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim_end();
+        let header = t.starts_with("warning:") || t.starts_with("error[") || t.starts_with("error:");
+        if !header || !lines.get(i + 1).is_some_and(|n| n.trim_start().starts_with("--> ")) {
+            i += 1;
+            continue;
+        }
+        let warn = t.starts_with("warning");
+        let end = (i + 1..lines.len()).take(200).find(|&k| lines[k].trim().is_empty()).unwrap_or(lines.len().min(i + 201));
+        let mut lint = None;
+        let mut inline = false;
+        let mut fix: Vec<usize> = Vec::new();
+        let pin = |j: usize, keep: &mut [bool], noise: &mut [bool]| {
+            noise[j] = false;
+            keep[j] = true;
+        };
+        for j in i + 1..end {
+            let u = lines[j].trim();
+            if warn {
+                noise[j] = true;
+            }
+            if let Some(n) = lint_name(u) {
+                lint = lint.or(Some(n));
+                noise[j] = true;
+            } else if u.starts_with("= help: for further information visit") || u == "|" {
+                noise[j] = true;
+            } else if warn {
+                if u.starts_with("--> ") || u.starts_with("= note:") || u.starts_with("= help:") {
+                    pin(j, keep, noise);
+                } else if let Some(h) = inline_help(u) {
+                    over[j] = Some(format!("help: {h}"));
+                    inline = true;
+                    pin(j, keep, noise);
+                } else if lines[j].starts_with("help: ") || (!fix.is_empty() && plus_line(u)) {
+                    fix.push(j);
+                }
+            }
+        }
+        if !inline {
+            for j in fix {
+                pin(j, keep, noise);
+            }
+        }
+        if let Some(n) = lint {
+            if !t.ends_with(']') {
+                over[i] = Some(format!("{t} [{n}]"));
+            }
+        }
+        i = end;
+    }
+}
+
+/// cargo test prints a failing test three times: `test x ... FAILED`, its `---- x stdout ----` block, and the
+/// closing `failures:` list. The block carries the facts, so the other two are noise when it exists.
+fn fold_cargo_test(lines: &[&str], noise: &mut [bool]) {
+    let blocks: std::collections::HashSet<&str> =
+        lines.iter().filter_map(|l| l.trim().strip_prefix("---- ")?.strip_suffix(" stdout ----")).collect();
+    let results = lines.iter().filter(|l| l.trim().starts_with("test result:")).count();
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t.starts_with("note: run with `RUST_BACKTRACE") {
+            noise[i] = true;
+        } else if t.starts_with("error: test failed, to rerun pass") && results <= 1 {
+            // With several test binaries it is the only clue which one failed.
+            noise[i] = true;
+        } else if let Some(n) = t.strip_prefix("test ").and_then(|r| r.strip_suffix(" ... FAILED")) {
+            noise[i] = blocks.contains(n);
+        } else if t == "failures:" {
+            let mut k = i + 1;
+            while lines.get(k).is_some_and(|v| v.trim().is_empty()) {
+                k += 1;
+            }
+            if lines.get(k).is_some_and(|v| v.trim().starts_with("---- ")) {
+                noise[i] = true;
+                continue;
+            }
+            let names: Vec<usize> = (i + 1..lines.len()).take_while(|&k| lines[k].starts_with("    ") && !lines[k].trim().is_empty()).collect();
+            if !names.is_empty() && names.iter().all(|&k| blocks.contains(lines[k].trim())) {
+                noise[i] = true;
+                names.iter().for_each(|&k| noise[k] = true);
+            }
+        }
+    }
+}
+
+/// pytest: `=====` banners carry no facts, the failure heading becomes `name:`, the closing counts lose their
+/// padding, long-style source context (indented, before a block's `>` line) is noise, and the short summary's
+/// `+  where` repeats the `E` lines. Native/short frames and captured output are content and stay.
+fn fold_pytest(lines: &[&str], keep: &mut [bool], noise: &mut [bool], over: &mut [Option<String>]) {
+    let where_text: std::collections::HashSet<&str> = lines
+        .iter()
+        .filter(|l| l.starts_with("E   "))
+        .filter_map(|l| l.strip_prefix('E'))
+        .map(str::trim)
+        .filter(|r| r.starts_with('+'))
+        .collect();
+    let mut in_fail = false;
+    // Inside a frame block, before its `>` line: the indented lines there are `def` and source context.
+    let mut context = false;
+    // Failure headings as (line, test key, has an `E` line), and `FAILED nodeid` lines of the short summary.
+    let mut heads: Vec<(usize, String, bool)> = Vec::new();
+    let mut failed: Vec<(usize, &str)> = Vec::new();
+    // Consecutive `>`/`E` lines, re-indented together.
+    let mut run: Vec<usize> = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim_end();
+        if t.starts_with("==") && t.ends_with("==") {
+            dedent_run(lines, &mut run, over);
+            let title = t.trim_matches('=').trim();
+            if ["test session starts", "FAILURES", "ERRORS", "short test summary info"].contains(&title) {
+                noise[i] = true;
+                in_fail = title == "FAILURES" || title == "ERRORS";
+                continue;
+            }
+            in_fail = false;
+            context = false;
+            let counts = ["passed", "failed", "error", "skipped", "no tests ran"].iter().any(|k| title.contains(k));
+            if counts && (title.contains(|c: char| c.is_ascii_digit()) || title == "no tests ran") {
+                over[i] = Some(title.to_string());
+            }
+            continue;
+        }
+        if let Some(id) = t.strip_prefix("FAILED ") {
+            failed.push((i, id.split(" - ").next().unwrap_or(id)));
+        }
+        if in_fail && !t.trim().is_empty() {
+            let u = t.trim();
+            if !l.starts_with(char::is_whitespace) {
+                let rest = t.find(".py:").map(|p| t[p + 4..].trim_start_matches(|c: char| c.is_ascii_digit()));
+                if pytest_heading(t) {
+                    heads.push((i, pytest_key(t.trim_matches('_').trim()), false));
+                }
+                if pytest_heading(t) || t.chars().all(|c| matches!(c, '_' | ' ')) {
+                    context = true;
+                } else if pytest_frame(t) {
+                    // `file.py:5: in f` is a --tb=short frame whose source line follows: content.
+                    context = !rest.is_some_and(|r| r.trim_start_matches(':').trim_start().starts_with("in "));
+                } else if t.starts_with("> ") || t.starts_with("---") || t.starts_with("Traceback") {
+                    context = false;
+                }
+                if t.starts_with("E   ") {
+                    if let Some(h) = heads.last_mut() {
+                        h.2 = true;
+                    }
+                }
+            } else if u.starts_with("File \"") {
+                context = false;
+                keep[i] = true;
+            } else if context || u.chars().all(|c| matches!(c, '^' | '~' | ' ')) {
+                noise[i] = true;
+            } else {
+                // --tb=native/short frames, captured stdout/log text: content.
+                keep[i] = true;
+            }
+            if t.starts_with("> ") || t.starts_with("E   ") {
+                run.push(i);
+            } else if !noise[i] {
+                dedent_run(lines, &mut run, over);
+            }
+        } else {
+            dedent_run(lines, &mut run, over);
+        }
+        if !l.starts_with('E') && t.trim_start().starts_with('+') && where_text.contains(t.trim()) {
+            noise[i] = true;
+        }
+    }
+    dedent_run(lines, &mut run, over);
+
+    // A failure block that was shown carries the node id; its `FAILED` line only repeats the first `E` line.
+    // A `FAILED` line whose test has no block here (summary-only, `-rA`) is the only record and stays.
+    let mut used = vec![false; heads.len()];
+    for (f, id) in failed {
+        let key = pytest_key_of_node(id);
+        if let Some(h) = (0..heads.len()).find(|&h| !used[h] && heads[h].2 && heads[h].1 == key) {
+            used[h] = true;
+            over[heads[h].0] = Some(format!("{id}:"));
+            noise[f] = true;
+        }
+    }
+}
+
+/// `TestX.test_y[1-2]` heading name to `test_y[1-2]`: the part a node id ends with.
+fn pytest_key(name: &str) -> String {
+    let (base, param) = name.split_once('[').map_or((name, String::new()), |(b, p)| (b, format!("[{p}")));
+    format!("{}{param}", base.rsplit('.').next().unwrap_or(base))
+}
+
+/// `a.py::TestX::test_y[1-2]` to `test_y[1-2]`.
+fn pytest_key_of_node(id: &str) -> String {
+    // A parameter id may contain `::`, so cut at the last `::` before any `[`.
+    let head = id.split('[').next().unwrap_or(id);
+    let start = head.rfind("::").map_or(0, |p| p + 2);
+    id[start..].to_string()
+}
+
+/// Remove the indent shared by a run of `>`/`E` lines so `>       assert` reads `> assert`, keeping each
+/// line's indent relative to the others (pytest's diffs depend on it).
+fn dedent_run(lines: &[&str], run: &mut Vec<usize>, over: &mut [Option<String>]) {
+    let gap = |l: &str| l[1..].len() - l[1..].trim_start_matches(' ').len();
+    let min = run.iter().map(|&i| gap(lines[i].trim_end())).min();
+    if let Some(m) = min.filter(|&m| m > 1) {
+        for &i in run.iter() {
+            let l = lines[i].trim_end();
+            over[i] = Some(format!("{}{}{}", &l[..1], " ".repeat(gap(l) - m + 1), l[1..].trim_start_matches(' ')));
+        }
+    }
+    run.clear();
+}
+
 fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool)> {
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
         return None;
     }
     let mut keep = vec![false; lines.len()];
+    // Lines that only repeat or decorate something kept (see `fold_*`): dropping them is not a loss.
+    let mut noise = vec![false; lines.len()];
+    let mut over: Vec<Option<String>> = vec![None; lines.len()];
+    fold_rustc(&lines, &mut keep, &mut noise, &mut over);
+    fold_cargo_test(&lines, &mut noise);
+    fold_pytest(&lines, &mut keep, &mut noise, &mut over);
+    // rustc's closing hints repeat the E-codes already on the `error[E....]` headers.
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t.starts_with("Some errors have detailed explanations:")
+            || t.starts_with("For more information about an error, try `rustc --explain")
+            || t.starts_with("For more information about this error, try `rustc --explain")
+        {
+            noise[i] = true;
+        }
+    }
     let mut hits = 0usize;
     let mut i = 0usize;
     let mut deprecated: Vec<&str> = Vec::new();
@@ -1154,13 +1703,27 @@ fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool
     if !build && lines.iter().any(|l| l.starts_with("E   ")) {
         for (i, l) in lines.iter().enumerate() {
             let t = l.trim_end();
-            if pytest_frame(t) || pytest_heading(t) {
+            if pytest_frame(t) {
                 keep[i] = true;
+            } else if pytest_heading(t) {
+                keep[i] = true;
+                if over[i].is_none() {
+                    over[i] = Some(format!("{}:", t.trim_matches('_').trim()));
+                }
             } else if l.starts_with("E   ") && (i == 0 || !lines[i - 1].starts_with("E   ")) {
                 if let Some(src) = (i.saturating_sub(2)..i).rev().find(|&k| lines[k].starts_with("> ")) {
                     keep[src] = true;
                 }
             }
+        }
+    }
+    for (k, n) in keep.iter_mut().zip(&noise) {
+        *k &= !n;
+    }
+    // A green cargo run with nothing else to say still shows its `Finished` line.
+    if !keep.iter().any(|&k| k) {
+        if let Some(k) = lines.iter().rposition(|l| l.trim().starts_with("Finished ")) {
+            keep[k] = true;
         }
     }
 
@@ -1174,7 +1737,7 @@ fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool
             for (i, l) in lines.iter().enumerate() {
                 let t = l.trim();
                 let want = if words { failure_word(t) } else { !l.starts_with(char::is_whitespace) };
-                if room > 0 && !keep[i] && !routine_line(t) && want {
+                if room > 0 && !keep[i] && !noise[i] && !routine_line(t) && want {
                     keep[i] = true;
                     room -= 1;
                 }
@@ -1188,10 +1751,11 @@ fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool
     }
 
     let mut out = String::new();
-    let mut kept = 0usize;
+    // Lines the output shows, or repeats of ones it shows.
+    let mut shown = vec![false; lines.len()];
     // A green run that drops more than progress (prints, console.log, unknown notes) keeps the
     // full text on disk: the caller sees it was cut and where it went.
-    let mut clipped = lines.iter().zip(&keep).any(|(l, k)| !k && !routine_line(l.trim()));
+    let mut clipped = lines.iter().zip(keep.iter().zip(&noise)).any(|(l, (k, n))| !k && !n && !routine_line(l.trim()));
     // msbuild/tsc print each located error again in their summary; the location
     // makes an exact repeat a true duplicate (rustc headers repeat without one).
     let mut seen = std::collections::HashSet::new();
@@ -1200,13 +1764,13 @@ fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool
             clipped = true;
             continue;
         }
+        shown[idx] = true;
         let t = lines[idx].trim();
         if (t.contains("): error ") || t.contains("): warning ")) && !seen.insert(t) {
             continue;
         }
-        out.push_str(lines[idx]);
+        out.push_str(over[idx].as_deref().unwrap_or(lines[idx]));
         out.push('\n');
-        kept += 1;
     }
     if !deprecated.is_empty() {
         let shown = deprecated.iter().take(12).copied().collect::<Vec<_>>().join(", ");
@@ -1217,13 +1781,12 @@ fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool
         }
         out.push('\n');
     }
+    // Only lines that carry content count as omitted: blank, decoration and folded lines do not.
+    let omitted = (0..lines.len()).filter(|&i| !shown[i] && !noise[i] && !routine_line(lines[i].trim())).count();
     if clipped {
-        out.push_str(&format!(
-            "[qx] {} diagnostic lines omitted; full text: {FULL}\n",
-            lines.len().saturating_sub(kept)
-        ));
+        out.push_str(&format!("[qx] {omitted} diagnostic lines omitted\n"));
     }
-    Some((out, lines.len().saturating_sub(kept), clipped))
+    Some((out, omitted, clipped))
 }
 
 /// `path:line:content`, else bare `path:content` (rg piped without line numbers).
@@ -1330,7 +1893,8 @@ fn grep(text: &str) -> Option<(String, usize, bool)> {
         return None;
     }
 
-    let mut out = String::new();
+    // The per-file counts alone make the agent add them up; one total survives the grouping.
+    let mut out = format!("{parsed} matches in {} files\n", groups.len());
     for (shown, (path, seen, items)) in groups.iter().enumerate() {
         if shown >= 200 && items.is_empty() {
             let rest = groups[shown..].iter().filter(|g| g.2.is_empty()).count();
@@ -1358,7 +1922,7 @@ fn grep(text: &str) -> Option<(String, usize, bool)> {
         out.push_str(&format!("[qx] match cap reached: {hidden} matches not shown\n"));
     }
     if cut_lines > 0 {
-        out.push_str(&format!("[qx] {cut_lines} long lines cut to their first and last 250 bytes; full text: {FULL}\n"));
+        out.push_str(&format!("[qx] {cut_lines} long lines cut to their first and last 250 bytes\n"));
     }
     Some((out, hidden, clipped || cut_lines > 0))
 }
@@ -1446,7 +2010,7 @@ mod tests {
     fn status_drops_hints_keeps_files() {
         let raw = "On branch main\nYour branch is up to date with 'origin/main'.\n\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n\tmodified:   src/main.rs\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tnew.txt\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n";
         let (out, omitted) = git_status(raw).unwrap();
-        assert!(out.contains("branch main"));
+        assert!(out.starts_with("## main...origin/main\n"));
         assert!(out.contains("src/main.rs"));
         assert!(out.contains("new.txt"));
         assert!(!out.contains("use \"git add"));
@@ -1474,6 +2038,128 @@ mod tests {
         assert!(!clipped);
     }
 
+    const CRLF_WARN: &str = "warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'src/util.py', CRLF will be replaced by LF the next time Git touches it\n";
+
+    fn short_diff() -> String {
+        let mut s = String::from("diff --git a/README.md b/README.md\nindex e5ad4d9..7a3f716 100644\n--- a/README.md\n+++ b/README.md\n@@ -3,7 +3,7 @@\n # README line 3\n-retries = 3\n+retries = 5\n # README line 7\n");
+        s.push_str("diff --git a/old.txt b/old.txt\ndeleted file mode 100644\nindex fe33913..0000000\n--- a/old.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-# old line 1\n-# old line 2\n");
+        s.push_str("diff --git a/new.txt b/new.txt\nnew file mode 100755\nindex 0000000..fe33913\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello\n");
+        s
+    }
+
+    #[test]
+    fn a_short_diff_folds_headers_and_keeps_every_hunk_line() {
+        let raw = short_diff();
+        let d = digest("git diff", &raw, CRLF_WARN, 0).expect("short diff trims");
+        let out = &d.stdout;
+        assert!(!d.lossy() && d.stderr.is_empty(), "{d:?}", d = (out, &d.stderr));
+        assert!(out.starts_with("diff README.md\n@@ -3,7 +3,7 @@\n # README line 3\n-retries = 3\n+retries = 5\n # README line 7\n"), "{out}");
+        assert!(out.contains("diff old.txt (deleted 100644)\n@@ -1,2 +0,0 @@\n-# old line 1\n-# old line 2\n"), "{out}");
+        assert!(out.contains("diff new.txt (new 100755)\n@@ -0,0 +1 @@\n+hello\n"), "{out}");
+        assert!(!out.contains("index ") && !out.contains("--- ") && !out.contains("+++ ") && !out.contains("diff --git"), "{out}");
+    }
+
+    #[test]
+    fn diff_folds_rename_and_keeps_mode_change_and_odd_headers() {
+        let raw = "diff --git a/a.rs b/b.rs\nsimilarity index 95%\nrename from a.rs\nrename to b.rs\nindex 111..222 100644\n--- a/a.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\ndiff --git a/img.png b/img.png\nindex 1..2 100644\nBinary files a/img.png and b/img.png differ\ndiff --git i/odd.txt w/odd.txt\nindex 1..2 100644\n--- i/odd.txt\n+++ w/odd.txt\n@@ -1 +1 @@\n-p\n+q\n";
+        let out = trim_diff_headers(raw).unwrap();
+        assert!(out.starts_with("diff a.rs -> b.rs (renamed 95%)\n@@ -1 +1 @@\n-x\n+y\n"), "{out}");
+        assert!(out.contains("diff run.sh\nold mode 100644\nnew mode 100755\n"), "{out}");
+        assert!(out.contains("diff img.png\nBinary files a/img.png and b/img.png differ\n"), "{out}");
+        assert!(out.contains("diff --git i/odd.txt w/odd.txt\n--- i/odd.txt\n+++ w/odd.txt\n@@ -1 +1 @@\n-p\n+q\n"), "{out}");
+    }
+
+    #[test]
+    fn show_keeps_the_commit_header_and_body() {
+        let raw = "commit d1d3fe3f1d7521048c3411ef8fcc3a8aacbbefa1\nAuthor: T <t@example.test>\nDate:   Wed Nov 18 19:35:24 2026 +0000\n\n    fix(core): switch to safe mode\n    \n    Body: fast mode corrupted the cache under load.\n\ndiff --git a/src/core.py b/src/core.py\nindex e350f92..c549c17 100644\n--- a/src/core.py\n+++ b/src/core.py\n@@ -7,7 +7,7 @@\n # core line 9\n-mode = fast\n+mode = safe\n # core line 11\n";
+        let d = digest("git show", raw, "", 0).unwrap();
+        assert!(d.stdout.starts_with(&raw[..raw.find("diff --git").unwrap()]), "{}", d.stdout);
+        assert!(d.stdout.contains("diff src/core.py\n@@ -7,7 +7,7 @@\n # core line 9\n-mode = fast\n+mode = safe\n # core line 11\n"), "{}", d.stdout);
+        assert!(!d.lossy());
+    }
+
+    #[test]
+    fn git_line_ending_warnings_are_dropped_even_when_no_digest_fits() {
+        let d = digest("git add -A", "", CRLF_WARN, 0).expect("cleaned stderr still goes out");
+        assert!(d.stderr.is_empty() && !d.lossy(), "{}", d.stderr);
+        let kept = format!("{CRLF_WARN}fatal: pathspec 'x' did not match\n");
+        let d = digest("git add x", "", &kept, 1).unwrap();
+        assert!(d.stderr.contains("fatal: pathspec 'x' did not match") && !d.stderr.contains("working copy"), "{}", d.stderr);
+        // Other commands keep their stderr as is.
+        assert!(digest("echo hi", "hi\n", CRLF_WARN, 0).is_none());
+    }
+
+    #[test]
+    fn status_uses_the_short_encoding_and_merges_staged_with_modified() {
+        let raw = "On branch main\nChanges to be committed:\n  (use \"git restore --staged <file>...\" to unstage)\n\tmodified:   src/core.py\n\tnew file:   src/new_feature.py\n\trenamed:    src/legacy.py -> src/renamed.py\n\tmodified:   src/util.py\n\nChanges not staged for commit:\n  (use \"git add/rm <file>...\" to update what will be committed)\n  (use \"git restore <file>...\" to discard changes in working directory)\n\tmodified:   README.md\n\tmodified:   docs/guide.md\n\tdeleted:    old.txt\n\tmodified:   src/util.py\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tbuild.log\n\tnotes.tmp\n\tscratch/\n";
+        let (out, _) = git_status(raw).unwrap();
+        assert_eq!(
+            out,
+            "## main\nM  src/core.py\nA  src/new_feature.py\nR  src/legacy.py -> src/renamed.py\nMM src/util.py\n M README.md docs/guide.md\n D old.txt\n?? build.log notes.tmp scratch/\n"
+        );
+    }
+
+    #[test]
+    fn status_header_carries_upstream_ahead_behind_detached_and_no_commits() {
+        let head = |raw: &str| git_status(raw).unwrap().0.lines().next().unwrap().to_string();
+        assert_eq!(head("On branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean\n"), "## main...origin/main");
+        assert_eq!(head("On branch main\nYour branch is ahead of 'origin/main' by 2 commits.\n  (use \"git push\" to publish your local commits)\n\nnothing to commit, working tree clean\n"), "## main...origin/main [ahead 2]");
+        assert_eq!(head("On branch main\nYour branch is behind 'origin/main' by 1 commit, and can be fast-forwarded.\n  (use \"git pull\" to update your local branch)\n\nnothing to commit, working tree clean\n"), "## main...origin/main [behind 1]");
+        assert_eq!(
+            head("On branch main\nYour branch and 'origin/main' have diverged,\nand have 2 and 1 different commits each, respectively.\n  (use \"git pull\" to merge the remote branch into yours)\n\nnothing to commit, working tree clean\n"),
+            "## main...origin/main [ahead 2, behind 1]"
+        );
+        assert_eq!(head("On branch main\nYour branch is based on 'origin/gone', but the upstream is gone.\n\nnothing to commit, working tree clean\n"), "## main...origin/gone [gone]");
+        assert_eq!(head("HEAD detached at abc1234\nnothing to commit, working tree clean\n"), "## HEAD (detached at abc1234)");
+        let (out, _) = git_status("On branch main\n\nNo commits yet\n\nChanges to be committed:\n  (use \"git rm --cached <file>...\" to unstage)\n\tnew file:   a.rs\n").unwrap();
+        assert_eq!(out, "## No commits yet on main\nA  a.rs\n");
+        let (out, _) = git_status("On branch main\nnothing to commit, working tree clean\n").unwrap();
+        assert_eq!(out, "## main\nclean\n");
+    }
+
+    #[test]
+    fn status_maps_conflicts_to_their_two_letter_codes() {
+        let raw = "On branch main\nYou have unmerged paths.\n";
+        assert!(git_status(raw).is_none(), "an unknown notice declines");
+        let raw = "On branch main\nUnmerged paths:\n  (use \"git add <file>...\" to mark resolution)\n\tboth modified:   a.rs\n\tboth added:      b.rs\n\tboth deleted:    c.rs\n\tadded by us:     d.rs\n\tadded by them:   e.rs\n\tdeleted by us:   f.rs\n\tdeleted by them: g.rs\n\tboth modified:   h.rs\n";
+        let (out, _) = git_status(raw).unwrap();
+        assert_eq!(out, "## main\nUU a.rs h.rs\nAA b.rs\nDD c.rs\nAU d.rs\nUA e.rs\nDU f.rs\nUD g.rs\n");
+    }
+
+    #[test]
+    fn a_long_status_group_wraps_with_its_code_repeated_and_loses_no_path() {
+        let paths: Vec<String> = (0..200).map(|i| format!("src/deep/module{i}/file_{i}.rs")).collect();
+        let raw = format!("On branch main\nChanges not staged for commit:\n{}", paths.iter().map(|p| format!("\tmodified:   {p}\n")).collect::<String>());
+        let (out, _) = git_status(&raw).unwrap();
+        assert!(out.lines().all(|l| l.len() <= 260 && l.len() < compact::MAX_LINE_CHARS), "{out}");
+        assert!(out.lines().skip(1).all(|l| l.starts_with(" M src/")), "{out}");
+        assert!(out.lines().count() > 3, "{out}");
+        let tokens: Vec<&str> = out.split_whitespace().filter(|t| t.starts_with("src/")).collect();
+        assert_eq!(tokens, paths.iter().map(String::as_str).collect::<Vec<_>>());
+        let (b, cut) = bound(out, 400);
+        assert!(!cut && b.contains("src/deep/module199/file_199.rs"));
+    }
+
+    #[test]
+    fn status_group_with_a_space_in_a_path_goes_one_path_per_line() {
+        let raw = "On branch main\nChanges not staged for commit:\n\tmodified:   ok.rs\n\tmodified:   a b.txt\n\tdeleted:    gone.rs\n\nUntracked files:\n\tx.txt\n\ty.txt\n";
+        let (out, _) = git_status(raw).unwrap();
+        assert_eq!(out, "## main\n M ok.rs\n M a b.txt\n D gone.rs\n?? x.txt y.txt\n");
+    }
+
+    #[test]
+    fn old_git_line_ending_warnings_are_filtered_too() {
+        let old = "warning: CRLF will be replaced by LF in a.txt.\nThe file will have its original line endings in your working directory\nwarning: LF will be replaced by CRLF in b.txt.\nThe file will have its original line endings in your working directory\nfatal: boom\n";
+        assert_eq!(strip_eol_warnings(old), "fatal: boom\n");
+    }
+
+    #[test]
+    fn grep_states_the_total_match_count() {
+        let raw = "src/a.rs:12:let x = 1;\nsrc/a.rs:40:let y = 2;\nsrc/b.rs:7:fn z() {}\n";
+        let (out, _, _) = grep(raw).unwrap();
+        assert!(out.starts_with("3 matches in 2 files\n"), "{out}");
+    }
+
     #[test]
     fn test_pass_keeps_only_summary() {
         let raw = "running 43 tests\n....................................\ntest result: ok. 43 passed; 0 failed; 0 ignored\n";
@@ -1485,8 +2171,8 @@ mod tests {
     fn pytest_failure_keeps_source_line_and_frames() {
         let raw = "collected 2 items\n\n=== FAILURES ===\n____ test_boom ____\n\n    def test_boom():\n        def inner(x):\n            return 1 / x\n>       inner(0)\n\ntest_fail.py:14: \n_ _ _ _ _\n\nx = 0\n\n    def inner(x):\n>       return 1 / x\n               ^^^^^\nE       ZeroDivisionError: division by zero\n\ntest_fail.py:13: ZeroDivisionError\n=== warnings summary ===\ntest_fail.py::test_warn\n  C:\\p\\test_fail.py:5: DeprecationWarning: old api\n=== short test summary info ===\nFAILED test_fail.py::test_boom - ZeroDivisionError\n=== 1 failed, 1 passed in 0.5s ===\n";
         let (out, _, _) = diagnostic(raw, 1, false).unwrap();
-        assert!(out.contains("____ test_boom ____"), "{out}");
-        assert!(out.contains(">       return 1 / x"), "{out}");
+        assert!(out.contains("test_boom:") && !out.contains("____"), "{out}");
+        assert!(out.contains("> return 1 / x") && out.contains("E ZeroDivisionError"), "{out}");
         assert!(out.contains("test_fail.py:14:") && out.contains("test_fail.py:13: ZeroDivisionError"));
         assert!(!out.contains("DeprecationWarning: old api")); // indented warning path is noise
         assert!(!out.contains("def inner"));
@@ -1529,6 +2215,132 @@ mod tests {
         assert!(out.contains("assertion failed"));
         assert!(out.contains("test result: FAILED"));
         assert!(!out.contains("test a ... ok"));
+    }
+
+    fn assert_has(out: &str, wants: &[&str]) {
+        for w in wants {
+            assert!(out.contains(w), "{w}: {out}");
+        }
+    }
+
+    #[test]
+    fn clippy_warnings_show_the_lint_on_the_header_and_drop_the_rest() {
+        let raw = "    Checking lintcrate v0.1.0 (C:\\x\\lintcrate)\nwarning: unneeded `return` statement\n --> src\\lib.rs:5:5\n  |\n5 |     return v[0];\n  |     ^^^^^^^^^^^\n  |\n  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#needless_return\n  = note: `#[warn(clippy::needless_return)]` on by default\nhelp: remove `return`\n  |\n5 -     return v[0];\n5 +     v[0]\n  |\n\nwarning: writing `&Vec` instead of `&[_]` involves a new object where a slice will do\n --> src\\lib.rs:1:17\n  |\n1 | pub fn first(v: &Vec<i32>) -> i32 {\n  |                 ^^^^^^^^^\n  |\n  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#ptr_arg\n  = note: `#[warn(clippy::ptr_arg)]` on by default\nhelp: change this to\n  |\n1 - pub fn first(v: &Vec<i32>) -> i32 {\n1 + pub fn first(v: &[i32]) -> i32 {\n  |\n\nwarning: length comparison to zero\n --> src\\lib.rs:2:8\n  |\n2 |     if v.len() == 0 {\n  |        ^^^^^^^^^^^^ help: using `is_empty` is clearer and more explicit: `v.is_empty()`\n  |\n  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#len_zero\n  = note: `#[warn(clippy::len_zero)]` on by default\n\nwarning: `lintcrate` (lib) generated 3 warnings (run `cargo clippy --fix --lib -p lintcrate -- ` to apply 2 suggestions)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s\n";
+        let (out, omitted, clipped) = diagnostic(raw, 0, true).unwrap();
+        assert_has(&out, &[
+            "warning: unneeded `return` statement [clippy::needless_return]",
+            "warning: length comparison to zero [clippy::len_zero]",
+            "[clippy::ptr_arg]",
+            "--> src\\lib.rs:5:5",
+            "--> src\\lib.rs:1:17",
+            "--> src\\lib.rs:2:8",
+            "help: using `is_empty` is clearer and more explicit: `v.is_empty()`",
+            "5 +     v[0]",
+            "1 + pub fn first(v: &[i32]) -> i32 {",
+            "generated 3 warnings",
+        ]);
+        for gone in ["for further information", "on by default", "Finished", "Checking", "return v[0]", "5 -", "^^^"] {
+            assert!(!out.contains(gone), "{gone}: {out}");
+        }
+        assert!(!clipped && omitted == 0 && !out.contains("omitted"), "{out}");
+    }
+
+    #[test]
+    fn clippy_implied_lint_note_names_the_lint() {
+        let raw = "error: unneeded `return` statement\n --> a.rs:1:1\n  |\n1 | x\n  |\n  = note: `-D clippy::needless_return` implied by `-D warnings`\n  = help: to override `-D warnings` add `#[allow(clippy::needless_return)]`\n";
+        let (out, _, _) = diagnostic(raw, 1, true).unwrap();
+        assert!(out.contains("[clippy::needless_return]") && out.contains("--> a.rs:1:1"), "{out}");
+        assert!(!out.contains("implied by"), "{out}");
+    }
+
+    #[test]
+    fn rustc_errors_keep_codes_snippets_and_locations() {
+        let raw = "   Compiling errcrate v0.1.0 (C:\\x)\nerror[E0308]: mismatched types\n --> src\\lib.rs:2:18\n  |\n2 |     let n: i32 = s;\n  |            ---   ^ expected `i32`, found `&str`\n  |            |\n  |            expected due to this\n\nerror[E0425]: cannot find function `undefined_fn` in this scope\n --> src\\lib.rs:7:5\n  |\n7 |     undefined_fn(3)\n  |     ^^^^^^^^^^^^ not found in this scope\n\nSome errors have detailed explanations: E0308, E0425.\nFor more information about an error, try `rustc --explain E0308`.\nerror: could not compile `errcrate` (lib) due to 2 previous errors\n";
+        let (out, _, _) = diagnostic(raw, 101, true).unwrap();
+        assert_has(&out, &[
+            "error[E0308]: mismatched types",
+            "error[E0425]: cannot find function `undefined_fn` in this scope",
+            "--> src\\lib.rs:2:18",
+            "--> src\\lib.rs:7:5",
+            "expected `i32`, found `&str`",
+            "expected due to this",
+            "not found in this scope",
+            "could not compile `errcrate` (lib) due to 2 previous errors",
+        ]);
+        assert!(!out.contains("Compiling") && !out.contains("detailed explanations") && !out.contains("--explain"), "{out}");
+    }
+
+    #[test]
+    fn cargo_test_failure_shows_the_stdout_block_and_the_result_once() {
+        let raw = "\nrunning 7 tests\ntest tests::adds_ok_0 ... ok\ntest tests::adds_broken ... FAILED\ntest tests::adds_ok_3 ... ok\n\nfailures:\n\n---- tests::adds_broken stdout ----\n\nthread 'tests::adds_broken' (19364) panicked at src\\lib.rs:41:9:\nassertion `left == right` failed: math is hard\n  left: 4\n right: 5\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    tests::adds_broken\n\ntest result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n   Compiling okcrate v0.1.0 (C:\\x)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s\n     Running unittests src\\lib.rs (C:\\x\\okcrate-3.exe)\nerror: test failed, to rerun pass `--lib`\n";
+        let (out, omitted, clipped) = diagnostic(raw, 101, false).unwrap();
+        assert_has(&out, &[
+            "---- tests::adds_broken stdout ----",
+            "panicked at src\\lib.rs:41:9",
+            "math is hard",
+            "left: 4",
+            "right: 5",
+            "test result: FAILED. 6 passed; 1 failed",
+        ]);
+        assert_eq!(out.matches("adds_broken").count(), 2, "{out}"); // block heading + panic line
+        for gone in ["... FAILED", "RUST_BACKTRACE", "failures:", "error: test failed", "Finished", "Running"] {
+            assert!(!out.contains(gone), "{gone}: {out}");
+        }
+        assert!(!clipped && omitted == 0 && !out.contains("omitted"), "{out}");
+    }
+
+    #[test]
+    fn cargo_test_without_stdout_block_keeps_the_failed_line_and_binary_clue() {
+        let raw = "running 1 test\ntest slow ... FAILED\n\nfailures:\n    slow\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n\ntest result: ok. 3 passed; 0 failed; 0 ignored\nerror: test failed, to rerun pass `--test it`\n";
+        let (out, _, _) = diagnostic(raw, 101, false).unwrap();
+        assert_has(&out, &["test slow ... FAILED", "failures:", "    slow", "error: test failed, to rerun pass `--test it`"]);
+    }
+
+    #[test]
+    fn pytest_failure_drops_banners_and_repeated_where_but_keeps_facts() {
+        let raw = "============================= test session starts =============================\nplatform win32 -- Python 3.12.6, pytest-9.0.2, pluggy-1.6.0\nrootdir: C:\\x\\py\nplugins: anyio-4.12.1, asyncio-1.3.0\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None\ncollected 24 items\n\ntest_calc.py .......................F                                    [100%]\n\n================================== FAILURES ===================================\n_______________________________ test_total_bad ________________________________\n\n    def test_total_bad():\n>       assert total([1, 2, 3]) == 7\nE       assert 6 == 7\nE        +  where 6 = total([1, 2, 3])\n\ntest_calc.py:75: AssertionError\n=========================== short test summary info ===========================\nFAILED test_calc.py::test_total_bad - assert 6 == 7\n +  where 6 = total([1, 2, 3])\n======================== 1 failed, 23 passed in 0.30s =========================\n";
+        let (out, omitted, clipped) = diagnostic(raw, 1, false).unwrap();
+        assert_has(&out, &[
+            "test_calc.py::test_total_bad:",
+            "> assert total([1, 2, 3]) == 7",
+            "E assert 6 == 7",
+            "E  +  where 6 = total([1, 2, 3])",
+            "test_calc.py:75: AssertionError",
+            "1 failed, 23 passed in 0.30s",
+            "1 failed, 23 passed in 0.30s",
+        ]);
+        assert_eq!(out.matches("where 6 = total").count(), 1, "{out}");
+        for gone in ["platform", "rootdir", "plugins", "asyncio", "collected", "====", "____", "[100%]", "short test summary"] {
+            assert!(!out.contains(gone), "{gone}: {out}");
+        }
+        assert!(!clipped && omitted == 0 && !out.contains("omitted"), "{out}");
+    }
+
+    #[test]
+    fn pytest_native_and_short_tracebacks_keep_every_frame_line() {
+        let native = "=== FAILURES ===\n____ test_x ____\nTraceback (most recent call last):\n  File \"C:\\\\p\\\\test_x.py\", line 5, in test_x\n    assert f() == 2\nAssertionError: assert 1 == 2\n=== short test summary info ===\nFAILED test_x.py::test_x - AssertionError: assert 1 == 2\n=== 1 failed in 0.1s ===\n";
+        let (out, omitted, clipped) = diagnostic(native, 1, false).unwrap();
+        assert_has(&out, &["Traceback (most recent call last):", "File \"C:\\\\p\\\\test_x.py\", line 5, in test_x", "    assert f() == 2", "AssertionError: assert 1 == 2"]);
+        assert!(!clipped && omitted == 0, "{out}");
+        let short = "=== FAILURES ===\n____ test_y ____\ntest_y.py:7: in test_y\n    helper(2)\ntest_y.py:3: in helper\n    assert n == 3\nE   assert 2 == 3\n=== 1 failed in 0.1s ===\n";
+        let (out, _, _) = diagnostic(short, 1, false).unwrap();
+        assert_has(&out, &["test_y.py:7: in test_y", "    helper(2)", "test_y.py:3: in helper", "    assert n == 3", "E assert 2 == 3"]);
+    }
+
+    #[test]
+    fn pytest_failed_line_stays_when_its_test_has_no_block_and_e_indent_is_relative() {
+        let raw = "=== FAILURES ===\n____ TestC.test_a[1-2] ____\n\n    def test_a(self):\n>       assert x == y\nE       assert 1 == 2\nE         + extra\nE       - more\n\ntest_c.py:9: AssertionError\n=== short test summary info ===\nFAILED test_c.py::TestC::test_a[1-2] - assert 1 == 2\nFAILED test_c.py::test_other - boom\n=== 2 failed in 0.1s ===\n";
+        let (out, _, _) = diagnostic(raw, 1, false).unwrap();
+        assert_has(&out, &["test_c.py::TestC::test_a[1-2]:", "> assert x == y", "E assert 1 == 2", "E   + extra", "E - more", "FAILED test_c.py::test_other - boom"]);
+        assert!(!out.contains("FAILED test_c.py::TestC"), "{out}");
+    }
+
+    #[test]
+    fn pytest_captured_stdout_stays() {
+        let raw = "=== FAILURES ===\n____ test_p ____\n\n    def test_p():\n        print('hello from test')\n>       assert 0\nE       assert 0\n\ntest_p.py:4: AssertionError\n----- Captured stdout call -----\n  hello from test\n=== 1 failed in 0.1s ===\n";
+        let (out, _, _) = diagnostic(raw, 1, false).unwrap();
+        assert_has(&out, &["----- Captured stdout call -----", "  hello from test", "test_p.py:4: AssertionError"]);
+        assert!(!out.contains("def test_p"), "{out}");
     }
 
     #[test]
@@ -1589,11 +2401,41 @@ mod tests {
         assert!(!is_pathlist("find . -exec rm {} ;") && !is_pathlist("rg fn src") && !is_pathlist("git status"));
         let mut raw: String = (0..20).map(|i| format!("src/mod/f{i}.rs\n")).collect();
         raw.push_str("src/a b.rs\nsrc/c,d.rs\ndocs\\x.md\ndocs\\y.md\nsrc/mod/\nsingle.rs/x\n");
-        let (out, hidden) = paths(&raw).unwrap();
-        assert!(out.starts_with("src/mod/{f0.rs,f1.rs,"), "{out}");
+        let (out, hidden) = paths(&raw, true).unwrap();
+        assert!(out.starts_with("src/mod/{f0,f1,f2,"), "{out}");
+        assert!(out.contains("f19}.rs\n"), "{out}");
         assert!(out.contains("\nsrc/a b.rs\nsrc/c,d.rs\n") && out.contains("docs\\{x.md,y.md}\n"));
         assert!(out.contains("single.rs/x") && out.contains("\nsrc/mod/\n") && hidden == 20);
-        assert!(paths("a/b\nc/d\n").is_none() && paths(&"plain\n".repeat(20)).is_none());
+        assert!(paths("a/b\nc/d\n", true).is_none() && paths(&"plain\n".repeat(20), true).is_none());
+    }
+
+    #[test]
+    fn paths_of_one_directory_share_one_line_even_when_subdirs_interleave() {
+        let mut raw = String::new();
+        for (d, names) in [("src", &["a.rs", "b.rs", "c.rs"][..]), ("src/sub", &["m.rs", "n.rs", "o.rs"][..]), ("src", &["d.rs", "e.rs"][..])] {
+            for n in names {
+                raw.push_str(&format!("{d}/{n}\n"));
+            }
+        }
+        raw.push_str("x/1\nx/2\nx/3\nx/4\nx/5\nx/6\n");
+        let (out, _) = paths(&raw, true).unwrap();
+        assert!(out.starts_with("src/{a,b,c,d,e}.rs\nsrc/sub/{m,n,o}.rs\n"), "{out}");
+        // Sorted output keeps its order: only consecutive paths of one directory share a line.
+        let (out, _) = paths(&raw, false).unwrap();
+        assert!(out.starts_with("src/{a,b,c}.rs\nsrc/sub/{m,n,o}.rs\nsrc/{d.rs,e.rs}\n"), "{out}");
+        let d = digest("rg --files --sort modified", &raw, "", 0).unwrap();
+        assert!(d.stdout.starts_with("src/{a,b,c}.rs\nsrc/sub/"), "{}", d.stdout);
+    }
+
+    #[test]
+    fn paths_do_not_factor_an_extension_that_is_missing_mixed_or_unsafe() {
+        let mut raw = String::from("a/Makefile\na/x.rs\na/y.rs\nb/x.rs\nb/y.rs\nb/z.md\nc/.hidden\nc/.other\nc/{q}.rs\nc/r.rs\nc/s.rs\nd/p.rs\nd/q.rs\nd/r.rs\n");
+        raw.push_str("e/a.b.rs\ne/c.rs\ne/d.rs\n");
+        let (out, _) = paths(&raw, true).unwrap();
+        assert!(out.contains("a/{Makefile,x.rs,y.rs}\n"), "{out}");
+        assert!(out.contains("b/{x.rs,y.rs,z.md}\n"), "{out}");
+        assert!(out.contains("c/.hidden\nc/.other\nc/{q}.rs\nc/r.rs\nc/s.rs\n"), "{out}");
+        assert!(out.contains("d/{p,q,r}.rs\n") && out.contains("e/{a.b,c,d}.rs\n"), "{out}");
     }
 
     #[test]
@@ -1648,8 +2490,8 @@ mod tests {
     fn git_status_keeps_ignored_files_out_of_untracked() {
         let raw = "On branch main\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tnew.txt\n\nIgnored files:\n  (use \"git add -f <file>...\" to include in what will be committed)\n\ttarget/\n";
         let (out, _) = git_status(raw).unwrap();
-        assert!(out.contains("untracked (1):\n  new.txt"), "{out}");
-        assert!(out.contains("ignored (1):\n  target/"), "{out}");
+        assert!(out.contains("?? new.txt"), "{out}");
+        assert!(out.contains("!! target/"), "{out}");
         assert!(!out.contains("Ignored files:"), "{out}");
     }
 
@@ -1657,8 +2499,8 @@ mod tests {
     fn git_status_keeps_the_kind_of_change() {
         let raw = "On branch main\nChanges to be committed:\n\tnew file:   a.rs\n\trenamed:    b.rs -> c.rs\n\nChanges not staged for commit:\n\tmodified:   d.rs\n\tdeleted:    old.rs\n";
         let (out, _) = git_status(raw).unwrap();
-        assert!(out.contains("staged (2):\n  new file: a.rs\n  renamed: b.rs -> c.rs"), "{out}");
-        assert!(out.contains("modified (2):\n  d.rs\n  deleted: old.rs"), "{out}");
+        assert!(out.contains("A  a.rs\nR  b.rs -> c.rs\n"), "{out}");
+        assert!(out.contains(" M d.rs\n D old.rs\n"), "{out}");
     }
 
     #[test]
@@ -1835,14 +2677,16 @@ mod tests {
         }
         assert!(is_git_status("git status") && is_git_status("git status -uno"));
         assert!(git_status(" M src/a.rs\n?? b.txt\n").is_none());
-        assert!(git_status("On branch main\nUnmerged paths:\n\tdeleted by us:   x.rs\n").is_none());
+        assert!(git_status("On branch main\nYou are currently rebasing.\n\tmodified:   x.rs\n").is_none());
+        // A listed path before any section header has no known column.
+        assert!(git_status("On branch main\n\tmodified:   x.rs\n").is_none());
     }
 
     #[test]
     fn status_nothing_added_is_not_an_untracked_file() {
         let raw = "On branch main\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tnew.txt\n\nnothing added to commit but untracked files present (use \"git add\" to track)\n";
         let (out, _) = git_status(raw).unwrap();
-        assert!(out.contains("untracked (1):"), "{out}");
+        assert!(out.contains("?? new.txt"), "{out}");
         assert!(!out.contains("  nothing added"), "{out}");
     }
 
@@ -1878,11 +2722,11 @@ mod tests {
         }
         pass.push_str("test result: ok. 30 passed; 0 failed\n");
         let green = digest("cargo test", &pass, "", 0).unwrap();
-        assert!(green.omitted > 0 && !green.lossy(), "a green run drops only `... ok` noise: no spool file");
+        assert!(!green.lossy(), "a green run drops only `... ok` noise: no spool file");
         let mut red = pass.replace("test t3 ... ok", "test t3 ... FAILED");
         red.push_str("---- t3 stdout ----\nthread 't3' panicked at src/lib.rs:3:5:\nassertion failed: x\n\nfailures:\n    t3\n");
         let d = digest("cargo test", &red, "", 101).unwrap();
-        assert!(d.omitted > 0 && d.lossy(), "a failing run keeps the full text on disk");
+        assert!(!d.lossy() && d.omitted == 0, "the FAILED line and failures list repeat the stdout block: nothing lost");
         for l in ["cargo test -- --nocapture", "pytest -s", "cargo test --message-format=json", "vitest --reporter=json", "go test -v ./..."] {
             assert!(digest(l, &pass, "", 0).is_none(), "{l}");
         }
@@ -1933,7 +2777,7 @@ mod tests {
     #[test]
     fn braces_in_a_directory_name_keep_paths_plain() {
         let raw: String = (0..14).map(|i| format!("a,b/f{i}.txt\n")).collect();
-        let (out, _) = paths(&raw).unwrap();
+        let (out, _) = paths(&raw, true).unwrap();
         assert!(out.contains("a,b/f0.txt") && !out.contains('{'), "{out}");
     }
 
@@ -1943,19 +2787,6 @@ mod tests {
         assert!(json_min("cat package.json", raw).is_none());
         assert!(json_min("jq . x.json", raw).is_none());
         assert!(json_min("curl http://x", raw).is_some());
-    }
-
-    #[test]
-    fn a_condensed_git_log_names_the_way_back_for_both_transports() {
-        let mut raw = String::new();
-        for i in 0..6 {
-            raw.push_str(&format!(
-                "commit {:040x}\nAuthor: A <a@b.c>\nDate:   Mon Oct 19 10:0{i}:00 2026 +0000\n\n    subject {i}\n\n    a long body line one\n    a long body line two\n\n",
-                i + 1
-            ));
-        }
-        let d = digest("git log", &raw, "", 0).unwrap();
-        assert!(d.stdout.contains("--raw (CLI)") && d.stdout.contains("mode:\"full\" (MCP)"), "{}", d.stdout);
     }
 
     /// What the caller sees: the digest's two streams, or `None` (generic compaction keeps the text).
@@ -2048,7 +2879,7 @@ mod tests {
         let (out, _, clipped) = grep(&raw).unwrap();
         assert!(clipped, "a cut hit must make the digest lossy so it is spooled");
         assert!(out.contains(&"x".repeat(200)) && out.contains(&"y".repeat(200)) && out.contains(" … "), "head and tail stay: {out}");
-        assert!(out.contains("full text"), "{out}");
+        assert!(out.contains("long lines cut") && !out.contains("full text"), "{out}");
         let d = digest("rg -n needle_here .", &raw, "", 0).unwrap();
         assert!(d.lossy());
     }
@@ -2077,7 +2908,7 @@ mod tests {
     fn a_status_note_is_not_an_untracked_file() {
         let raw = "On branch main\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n\tmodified:   a.txt\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tnew1.txt\n\tnew2.txt\n\nYour stash currently has 1 entry\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n";
         let (out, _) = git_status(raw).expect("the stash note is state, not a reason to decline");
-        assert!(out.contains("untracked (2):") && !out.contains("untracked (3)"), "{out}");
+        assert!(out.contains("?? new1.txt new2.txt") && !out.contains("new3"), "{out}");
         assert!(out.contains("Your stash currently has 1 entry"), "{out}");
         assert!(!out.contains("  Your stash"), "{out}");
         // A note this digest does not know declines rather than becoming a file.

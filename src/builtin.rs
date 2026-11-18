@@ -412,20 +412,20 @@ fn cmd_ls(args: &[String], cwd: Option<&Path>, full: bool) -> Option<BuiltinOut>
 
     let mut out = String::new();
     if opts.dirs_as_files {
+        let mut rows = Vec::new();
         for p in paths {
             let path = path_of(cwd, p);
             match fs::metadata(&path) {
-                Ok(md) => write_entry(
-                    &mut out,
-                    p,
-                    md.is_dir(),
-                    md.len(),
-                    md.modified().ok(),
-                    md.permissions().readonly(),
-                    opts.long,
-                ),
+                Ok(md) => rows.push((p, md.is_dir(), md.len(), md.modified().ok(), md.permissions().readonly())),
                 Err(e) => return Some(fail(format!("ls: {}: {e}", path.display()))),
             }
+        }
+        let style = LongStyle::new(opts.full, rows.iter().map(|r| (r.2, r.3, r.1)));
+        if opts.long && !rows.is_empty() {
+            out.push_str(&style.header());
+        }
+        for (p, is_dir, len, modified, readonly) in rows {
+            write_entry(&mut out, p, is_dir, len, modified, readonly, opts.long, &style);
         }
         return Some(ok(out));
     }
@@ -486,7 +486,12 @@ fn cmd_ls(args: &[String], cwd: Option<&Path>, full: bool) -> Option<BuiltinOut>
 fn list_one(path: &Path, display: &str, md: &fs::Metadata, opts: &LsOpts) -> std::io::Result<String> {
     if !md.is_dir() {
         let mut out = String::new();
-        write_entry(&mut out, display, false, md.len(), md.modified().ok(), md.permissions().readonly(), opts.long);
+        let modified = md.modified().ok();
+        let style = LongStyle::new(opts.full, [(md.len(), modified, false)]);
+        if opts.long {
+            out.push_str(&style.header());
+        }
+        write_entry(&mut out, display, false, md.len(), modified, md.permissions().readonly(), opts.long, &style);
         return Ok(out);
     }
 
@@ -630,19 +635,23 @@ fn write_listing(
     }
 
     let n = entries.len();
+    let style = LongStyle::new(full, entries.iter().map(|e| (e.len, e.modified, e.is_dir)));
+    if opts.long && n > 0 {
+        out.push_str(&style.header());
+    }
     if full || n <= LS_SAMPLE_HEAD + LS_SAMPLE_TAIL {
         for e in entries {
             if !take_line(walk) {
                 break;
             }
-            write_entry(out, &e.name, e.is_dir, e.len, e.modified, e.readonly, opts.long);
+            write_entry(out, &e.name, e.is_dir, e.len, e.modified, e.readonly, opts.long, &style);
         }
     } else {
         for e in &entries[..LS_SAMPLE_HEAD] {
             if !take_line(walk) {
                 break;
             }
-            write_entry(out, &e.name, e.is_dir, e.len, e.modified, e.readonly, opts.long);
+            write_entry(out, &e.name, e.is_dir, e.len, e.modified, e.readonly, opts.long, &style);
         }
         if !walk.capped {
             // Directories are navigation anchors: never drop one silently.
@@ -666,7 +675,7 @@ fn write_listing(
                 if !take_line(walk) {
                     break;
                 }
-                write_entry(out, &e.name, e.is_dir, e.len, e.modified, e.readonly, opts.long);
+                write_entry(out, &e.name, e.is_dir, e.len, e.modified, e.readonly, opts.long, &style);
             }
         }
     }
@@ -721,6 +730,58 @@ fn write_header(
     out.push('\n');
 }
 
+/// Layout of one long listing. Compact (default): no synthetic mode string, size padded to the
+/// widest file size (directories print none), zone plus any shared date and minute stated once in a
+/// header line. `full` keeps the classic `-rw-r--r-- <size:10> <date time UTC> name` rows.
+struct LongStyle {
+    full: bool,
+    width: usize,
+    /// Date shared by every entry; rows then carry only `HH:MM`.
+    date: Option<String>,
+    /// `HH:MM` shared by every entry (implies a shared date); rows then carry no time at all.
+    minute: Option<String>,
+}
+
+impl LongStyle {
+    fn new<I: IntoIterator<Item = (u64, Option<SystemTime>, bool)>>(full: bool, items: I) -> LongStyle {
+        let mut width = 1;
+        let mut date: Option<String> = None;
+        let mut minute: Option<String> = None;
+        let (mut same_date, mut same_minute) = (true, true);
+        for (len, modified, is_dir) in items {
+            if !is_dir {
+                width = width.max(len.to_string().len());
+            }
+            let t = modified.unwrap_or(UNIX_EPOCH);
+            let (d, m) = (ymd_string(t), hm_string(t));
+            match &date {
+                None => date = Some(d),
+                Some(prev) if *prev != d => same_date = false,
+                _ => {}
+            }
+            match &minute {
+                None => minute = Some(m),
+                Some(prev) if *prev != m => same_minute = false,
+                _ => {}
+            }
+        }
+        let date = if same_date { date } else { None };
+        let minute = if same_date && same_minute { minute } else { None };
+        LongStyle { full, width, date, minute }
+    }
+
+    /// One line stating what the rows omit; empty in full mode.
+    fn header(&self) -> String {
+        match (&self.date, &self.minute, self.full) {
+            (_, _, true) => String::new(),
+            (Some(d), Some(m), false) => format!("(UTC {d} {m})\n"),
+            (Some(d), None, false) => format!("(UTC {d})\n"),
+            (None, _, false) => "(times UTC)\n".to_string(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_entry(
     out: &mut String,
     name: &str,
@@ -729,6 +790,7 @@ fn write_entry(
     modified: Option<SystemTime>,
     readonly: bool,
     long: bool,
+    style: &LongStyle,
 ) {
     if !long {
         out.push_str(name);
@@ -740,19 +802,47 @@ fn write_entry(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    // On Windows a folder's read-only attribute is only a marker; it does not stop writes into it.
-    let w = if readonly && !is_dir { '-' } else { 'w' };
-    let mode = if is_dir {
-        format!("dr{w}xr-xr-x")
-    } else if matches!(ext.as_str(), "exe" | "cmd" | "bat" | "ps1" | "com") {
-        format!("-r{w}xr-xr-x")
-    } else {
-        format!("-r{w}-r--r--")
-    };
-    let _ = write!(out, "{mode} {len:>10} ");
-    write_time(out, modified.unwrap_or(UNIX_EPOCH));
-    out.push(' ');
+    let exec = !is_dir && matches!(ext.as_str(), "exe" | "cmd" | "bat" | "ps1" | "com");
+    let t = modified.unwrap_or(UNIX_EPOCH);
+    if style.full {
+        // On Windows a folder's read-only attribute is only a marker; it does not stop writes into it.
+        let w = if readonly && !is_dir { '-' } else { 'w' };
+        let mode = if is_dir {
+            format!("dr{w}xr-xr-x")
+        } else if exec {
+            format!("-r{w}xr-xr-x")
+        } else {
+            format!("-r{w}-r--r--")
+        };
+        let _ = write!(out, "{mode} {len:>10} ");
+        write_time(out, t);
+        out.push(' ');
+        out.push_str(name);
+        out.push('\n');
+        return;
+    }
+    // A directory's size is always 0 on Windows: it carries nothing, so the column skips it.
+    if !is_dir {
+        let _ = write!(out, "{len:>w$} ", w = style.width);
+    }
+    if style.minute.is_none() {
+        if style.date.is_none() {
+            out.push_str(&ymd_string(t));
+            out.push(' ');
+        }
+        out.push_str(&hm_string(t));
+        out.push(' ');
+    }
     out.push_str(name);
+    // ls -F style markers: `/` directory, `*` executable; ` [ro]` only for a set read-only bit.
+    if is_dir {
+        out.push('/');
+    } else if exec {
+        out.push('*');
+    }
+    if readonly && !is_dir {
+        out.push_str(" [ro]");
+    }
     out.push('\n');
 }
 
@@ -760,19 +850,29 @@ fn write_time(out: &mut String, t: SystemTime) {
     out.push_str(&format_time(t));
 }
 
-pub(crate) fn format_time(t: SystemTime) -> String {
+fn ymd_hm(t: SystemTime) -> (i64, u32, u32, u64, u64) {
     let secs = t
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
+    let rem = secs.rem_euclid(86_400) as u64;
     let (y, m, d) = civil_from_days(days);
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
-        rem / 3600,
-        (rem % 3600) / 60
-    )
+    (y, m, d, rem / 3600, (rem % 3600) / 60)
+}
+
+fn ymd_string(t: SystemTime) -> String {
+    let (y, m, d, _, _) = ymd_hm(t);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn hm_string(t: SystemTime) -> String {
+    let (_, _, _, h, mi) = ymd_hm(t);
+    format!("{h:02}:{mi:02}")
+}
+
+pub(crate) fn format_time(t: SystemTime) -> String {
+    format!("{} {} UTC", ymd_string(t), hm_string(t))
 }
 
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -2354,13 +2454,86 @@ mod tests {
         assert_eq!(out.stdout, "a/x.txt\ny.txt\n\na:\nx.txt\n");
 
         let long = cmd_ls(&["-l".to_string(), "ro.txt".to_string()], Some(&d), false).unwrap().stdout;
-        assert!(long.starts_with("-r-") && long.contains(" UTC "), "{long}");
+        assert!(long.starts_with("(UTC ") && long.trim_end().ends_with("ro.txt [ro]"), "{long}");
+        assert!(!long.contains("-r-"), "{long}");
+
+        let full = cmd_ls(&["-l".to_string(), "ro.txt".to_string()], Some(&d), true).unwrap().stdout;
+        assert!(full.starts_with("-r-") && full.contains(" UTC "), "{full}");
 
         let mut perms = fs::metadata(&ro).unwrap().permissions();
         #[allow(clippy::permissions_set_readonly_false)]
         perms.set_readonly(false);
         let _ = fs::set_permissions(&ro, perms);
         let _ = fs::remove_dir_all(&d);
+    }
+
+    fn rendered(rows: &[(&str, bool, u64, u64, bool)], full: bool) -> String {
+        let at = |s: u64| UNIX_EPOCH + std::time::Duration::from_secs(s);
+        let style = LongStyle::new(full, rows.iter().map(|r| (r.2, Some(at(r.3)), r.1)));
+        let mut out = style.header();
+        for r in rows {
+            write_entry(&mut out, r.0, r.1, r.2, Some(at(r.3)), r.4, true, &style);
+        }
+        out
+    }
+
+    #[test]
+    fn long_listing_states_a_shared_date_once_and_pads_to_the_widest_size() {
+        // 2021-01-01 00:00:00 UTC = 1_609_459_200
+        let out = rendered(
+            &[("a.txt", false, 5, 1_609_459_200, false), ("big.bin", false, 123_456, 1_609_459_200 + 3660, false)],
+            false,
+        );
+        assert_eq!(out, "(UTC 2021-01-01)\n     5 00:00 a.txt\n123456 01:01 big.bin\n");
+    }
+
+    #[test]
+    fn long_listing_keeps_full_dates_when_they_differ() {
+        let out = rendered(
+            &[("a", false, 1, 1_609_459_200, false), ("b", false, 22, 1_609_459_200 + 86_400, false)],
+            false,
+        );
+        assert_eq!(out, "(times UTC)\n 1 2021-01-01 00:00 a\n22 2021-01-02 00:00 b\n");
+    }
+
+    #[test]
+    fn long_listing_marks_dirs_exec_and_read_only_and_full_mode_stays_classic() {
+        let rows = [
+            ("d", true, 0, 1_609_459_200, false),
+            ("r.txt", false, 1, 1_609_459_200, true),
+            ("t.exe", false, 2, 1_609_459_200, false),
+        ];
+        let out = rendered(&rows, false);
+        assert_eq!(out, "(UTC 2021-01-01 00:00)\nd/\n1 r.txt [ro]\n2 t.exe*\n");
+        let full = rendered(&rows, true);
+        assert_eq!(
+            full,
+            "drwxr-xr-x          0 2021-01-01 00:00 UTC d\n-r--r--r--          1 2021-01-01 00:00 UTC r.txt\n-rwxr-xr-x          2 2021-01-01 00:00 UTC t.exe\n"
+        );
+    }
+
+    #[test]
+    fn long_listing_dir_rows_carry_no_size_and_do_not_widen_the_column() {
+        let out = rendered(
+            &[("d", true, 4096, 1_609_459_200, false), ("f", false, 10, 1_609_459_200 + 60, false)],
+            false,
+        );
+        assert_eq!(out, "(UTC 2021-01-01)\n00:00 d/\n10 00:01 f\n");
+    }
+
+    #[test]
+    fn long_listing_hoists_a_shared_minute_into_the_header() {
+        let out = rendered(
+            &[("a", false, 7, 1_609_459_200 + 3660, false), ("b", false, 123, 1_609_459_200 + 3660 + 30, false)],
+            false,
+        );
+        assert_eq!(out, "(UTC 2021-01-01 01:01)\n  7 a\n123 b\n");
+        // Same minute on different days still needs per-row dates.
+        let mixed = rendered(
+            &[("a", false, 1, 1_609_459_200, false), ("b", false, 2, 1_609_459_200 + 86_400, false)],
+            false,
+        );
+        assert!(mixed.starts_with("(times UTC)\n"), "{mixed}");
     }
 
     #[test]

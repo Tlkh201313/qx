@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_mcp_json_is_refused_not_overwritten() {
-        let p = paths("unreadable");
+        let p = paths("utf16");
         let file = mcp_file(&p);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         // UTF-16LE with a BOM: not valid UTF-8, and holds other servers the user cares about.
