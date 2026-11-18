@@ -96,6 +96,13 @@ const FS_PARAMETERS = Type.Object({
   ),
   offset: Type.Optional(Type.Number()),
   limit: Type.Optional(Type.Number()),
+  fresh: Type.Optional(
+    Type.Boolean({ description: "read: send the text even if unchanged since your last read." }),
+  ),
+  context: Type.Optional(Type.Number({ description: "grep: lines of context around each match." })),
+  "-C": Type.Optional(Type.Number({ description: "grep: alias for context." })),
+  "-A": Type.Optional(Type.Number({ description: "grep: lines after each match." })),
+  "-B": Type.Optional(Type.Number({ description: "grep: lines before each match." })),
   max_results: Type.Optional(Type.Number()),
   max_matches: Type.Optional(Type.Number()),
   max_line_chars: Type.Optional(Type.Number()),

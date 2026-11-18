@@ -185,7 +185,7 @@ fn stale_dsh_binaries(p: &crate::setup::Paths) -> Vec<PathBuf> {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_ascii_lowercase())
                 .unwrap_or_default();
-            path.is_file() && name.starts_with("qx") && name.ends_with(".exe")
+            path.is_file() && crate::setup::yaml::is_qx_build(&name)
         })
         .collect()
 }
@@ -575,5 +575,26 @@ mod tests {
         let (cum, chain) = heaviest_chain(&imports).unwrap();
         assert_eq!((cum, chain.last().map(String::as_str)), (5000, Some("json")));
         assert_eq!(pip_uses_system_store("24.2"), Some(true));
+    }
+
+    #[test]
+    fn stale_dsh_binaries_skips_other_qx_named_tools() {
+        let root = std::env::temp_dir().join(format!("qx-doctor-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("dsh").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("qxl-viewer.exe"), "").unwrap();
+        std::fs::write(bin.join("qx-1a2b3c4d5e6f.exe"), "").unwrap();
+        let p = crate::setup::Paths {
+            home: root.clone(),
+            dsh_home: root.join("dsh"),
+            hermes_home: root.join("hermes"),
+            codex_home: root.join("codex"),
+            claude_config_dir: None,
+            omp_agent_dir: root.join("omp"),
+        };
+        let stale = stale_dsh_binaries(&p);
+        assert_eq!(stale, vec![bin.join("qx-1a2b3c4d5e6f.exe")]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

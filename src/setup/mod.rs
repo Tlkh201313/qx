@@ -149,14 +149,48 @@ pub fn plan(c: Client, p: &Paths, exe: &Path, a: Action) -> Result<Vec<Change>, 
         }
         Client::Omp => {
             let file = p.omp_agent_dir.join("mcp.json");
-            Ok(vec![Change {
-                client: c,
-                file: file.clone(),
-                edit: edit_json_file(&file, &["mcpServers", "qx"], |existing| omp_entry(exe, existing), a),
-            }])
+            let hook = omp_extension(p);
+            Ok(vec![
+                Change {
+                    client: c,
+                    file: file.clone(),
+                    edit: edit_json_file(&file, &["mcpServers", "qx"], |existing| omp_entry(exe, existing), a),
+                },
+                Change { client: c, edit: edit_generated(&hook, fill_exe(OMP_EXTENSION, exe), a), file: hook },
+            ])
         }
         Client::Generic => Err("generic is not a client that can be configured".into()),
     }
+}
+
+/// omp's `bash` hook: omp mounts MCP tools under `xd://`, so its own shell is where qx pays off.
+const OMP_EXTENSION: &str = include_str!("../../integrations/omp/qx.js");
+
+fn omp_extension(p: &Paths) -> PathBuf {
+    p.omp_agent_dir.join("extensions").join("qx.js")
+}
+
+/// A file qx owns whole: written as `wanted`, removed as a whole (empty text, see `apply`).
+fn edit_generated(file: &Path, wanted: String, a: Action) -> Edit {
+    match (a, std::fs::read_to_string(file)) {
+        (Action::Install, Ok(current)) if current == wanted => Edit::Unchanged,
+        (Action::Install, _) => Edit::Changed(wanted),
+        (Action::Remove, Ok(_)) => Edit::Changed(String::new()),
+        (Action::Remove, Err(_)) => Edit::Unchanged,
+    }
+}
+
+/// `template` with `__QX_EXE__` replaced by `exe`, escaped for a JS string literal.
+fn fill_exe(template: &str, exe: &Path) -> String {
+    let escaped = serde_json::to_string(&exe.to_string_lossy()).unwrap_or_default();
+    template.replace("__QX_EXE__", escaped.trim_matches('"'))
+}
+
+/// Whether `content` is `template` as `fill_exe` makes it, whatever exe path it names.
+fn generated_from(template: &str, content: &str) -> bool {
+    let parts: Vec<&str> = template.split("__QX_EXE__").collect();
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    content.len() >= first.len() + last.len() && content.starts_with(first) && content.ends_with(last)
 }
 
 /// omp's own `mcp.json` outranks the `~/.claude.json` entry it also imports. `timeout` is in ms:
@@ -544,6 +578,9 @@ fn leaves_nothing_of_the_users(client: Client, text: &str, existing: &[u8]) -> b
     if client == Client::Pi && text.is_empty() {
         return pi::is_generated(existing);
     }
+    if client == Client::Omp && text.is_empty() && generated_from(OMP_EXTENSION, existing) {
+        return true;
+    }
     let bare = text.trim_start_matches('\u{feff}').trim();
     (bare.is_empty() || bare == "{}")
         && match client {
@@ -606,10 +643,10 @@ fn is_pristine_entry(entry: &Value) -> bool {
     })
 }
 
-/// Two spellings of one file: slashes and case do not matter on Windows.
+/// Two spellings of one file: slashes and case do not matter on Windows, nor do `..` or links.
 pub fn same_path(a: &str, b: &Path) -> bool {
     let norm = |s: &str| s.replace('/', "\\").to_ascii_lowercase();
-    norm(a) == norm(&b.to_string_lossy())
+    norm(a) == norm(&b.to_string_lossy()) || crate::deploy::same_path(Path::new(a), b)
 }
 
 pub struct Status {
@@ -732,6 +769,13 @@ pub fn status(c: Client, p: &Paths) -> Status {
         Client::Omp => {
             let file = p.omp_agent_dir.join("mcp.json");
             let command = read_json_command(&file, &["mcpServers", "qx", "command"]);
+            match std::fs::read_to_string(omp_extension(p)).ok().and_then(|t| extension_exe(&t)) {
+                None => notes.push("no qx bash hook in extensions/qx.js: omp's own bash bypasses qx".into()),
+                Some(hook) if command.as_deref().is_some_and(|c| !same_path(&hook, Path::new(c))) => {
+                    notes.push(format!("the bash hook runs {hook}, the MCP entry another qx: run `qx setup omp`"));
+                }
+                Some(_) => {}
+            }
             (Some(file), command)
         }
         Client::Generic => (None, None),
@@ -975,6 +1019,17 @@ mod tests {
         let notes = status(Client::ClaudeCode, &p).notes;
         assert!(notes.iter().any(|n| n.contains("missing binary")), "{notes:?}");
         assert!(same_path("C:/A/qx.EXE", Path::new("c:\\a\\qx.exe")));
+    }
+
+    #[test]
+    fn same_path_sees_through_dot_dot() {
+        let dir = std::env::temp_dir().join(format!("qx-samepath-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let exe = dir.join("bin").join("qx.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let dotted = dir.join("bin").join("..").join("bin").join("qx.exe");
+        assert!(same_path(&dotted.to_string_lossy(), &exe));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1596,6 +1651,17 @@ ew\qx.exe");
             |p| vec![(f(p), "{\n  \"mcpServers\": {\n    \"other\": {\n      \"command\": \"x\"\n    }\n  }\n}\n")],
             real_plan(Client::Omp),
         );
+        // The bash hook names the installed exe, and status reads it back.
+        let p = paths("e2e-omp-hook");
+        apply_all(real_plan(Client::Omp)(&p, Action::Install));
+        let hook = std::fs::read_to_string(omp_extension(&p)).unwrap();
+        assert_eq!(extension_exe(&hook).as_deref(), Some(E2E_EXE), "{hook}");
+        assert!(status(Client::Omp, &p).notes.is_empty(), "{:?}", status(Client::Omp, &p).notes);
+        std::fs::write(omp_extension(&p), "// the user's own\n").unwrap();
+        apply_all(real_plan(Client::Omp)(&p, Action::Remove));
+        assert!(!omp_extension(&p).exists());
+        assert!(p.omp_agent_dir.join("extensions").join("qx.js.qx-bak").is_file(), "an edited hook is kept");
+        let _ = std::fs::remove_dir_all(&p.home);
         let p = Paths::from_lookup(|k| match k {
             "USERPROFILE" => Some(r"C:\h".into()),
             "PI_CONFIG_DIR" => Some(".pix".into()),

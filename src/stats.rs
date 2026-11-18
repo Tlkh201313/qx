@@ -8,7 +8,7 @@
 use std::cell::Cell;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Mutex, OnceLock};
 
 const ROTATE_AT: u64 = 8 * 1024 * 1024;
@@ -57,7 +57,7 @@ pub fn first_word(line: &str) -> String {
     // `NAME=value` words in front hold values (a token, a password) and are never the key.
     loop {
         let word = rest.split_whitespace().next().unwrap_or("");
-        if word.contains('=') && !word.starts_with(['"', '\'']) {
+        if crate::exec::assignment_word(word) {
             rest = rest[word.len()..].trim_start();
         } else {
             break;
@@ -96,11 +96,14 @@ pub fn flush() {
     }
 }
 
-fn sender() -> &'static Mutex<Option<Sender<String>>> {
-    static TX: OnceLock<Mutex<Option<Sender<String>>>> = OnceLock::new();
+/// Lines waiting for the writer. A full queue (storage stalled) drops new lines instead of growing.
+const QUEUE: usize = 1024;
+
+fn sender() -> &'static Mutex<Option<SyncSender<String>>> {
+    static TX: OnceLock<Mutex<Option<SyncSender<String>>>> = OnceLock::new();
     TX.get_or_init(|| {
         STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
-        let (tx, rx) = channel::<String>();
+        let (tx, rx) = sync_channel::<String>(QUEUE);
         let spawned = std::thread::Builder::new().name("qx-stats".into()).spawn(move || {
             let Some(path) = path() else { return };
             if let Some(dir) = path.parent() {
@@ -111,10 +114,7 @@ fn sender() -> &'static Mutex<Option<Sender<String>>> {
                 while let Ok(more) = rx.try_recv() {
                     batch.push_str(&more);
                 }
-                rotate_if_big(&path);
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                    let _ = f.write_all(batch.as_bytes());
-                }
+                append(&path, batch.as_bytes());
             }
         });
         match spawned {
@@ -127,20 +127,45 @@ fn sender() -> &'static Mutex<Option<Sender<String>>> {
     })
 }
 
-/// Keep the newest half when the file passes `ROTATE_AT`, starting at a line boundary.
-fn rotate_if_big(path: &std::path::Path) {
-    let Ok(md) = std::fs::metadata(path) else { return };
-    if md.len() < ROTATE_AT {
-        return;
+/// Append `text`, first keeping only the newest half (from a line boundary) once the file passes
+/// `ROTATE_AT`. The file is held without write sharing for the whole step, so one qx process never
+/// rotates a stale copy over lines another one has just appended.
+fn append(path: &std::path::Path, text: &[u8]) {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true);
+    // FILE_SHARE_READ: `qx gain` can still read while a writer holds the file.
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::share_mode(&mut opts, 1);
+    let mut held = None;
+    for _ in 0..200 {
+        match opts.open(path) {
+            Ok(f) => {
+                held = Some(f);
+                break;
+            }
+            // ERROR_SHARING_VIOLATION: another qx process is appending; it holds the file for moments.
+            Err(e) if cfg!(windows) && e.raw_os_error() == Some(32) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(_) => return,
+        }
     }
-    if let Ok(data) = std::fs::read(path) {
-        let from = data.len() / 2;
-        let start = data[from..].iter().position(|&b| b == b'\n').map_or(data.len(), |i| from + i + 1);
-        let _ = std::fs::write(path, &data[start..]);
+    let Some(mut f) = held else { return };
+    if f.metadata().is_ok_and(|m| m.len() >= ROTATE_AT) {
+        let mut data = Vec::new();
+        if f.read_to_end(&mut data).is_ok() {
+            let from = data.len() / 2;
+            let start = data[from..].iter().position(|&b| b == b'\n').map_or(data.len(), |i| from + i + 1);
+            let kept = &data[start..];
+            let _ = f
+                .seek(SeekFrom::Start(0))
+                .and_then(|_| f.write_all(kept))
+                .and_then(|_| f.set_len(kept.len() as u64));
+        }
     }
+    let _ = f.seek(SeekFrom::End(0)).and_then(|_| f.write_all(text));
 }
 
-pub fn line(e: &Entry) -> String {
+fn line(e: &Entry) -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -154,13 +179,13 @@ pub fn line(e: &Entry) -> String {
     format!("{v}\n")
 }
 
-/// Queue one entry. Cheap: a channel send. A closed or missing writer drops the entry.
+/// Queue one entry. Cheap: a non-blocking send. A closed, missing or full writer drops the entry.
 pub fn record(e: Entry) {
     if !enabled() {
         return;
     }
     if let Some(tx) = sender().lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-        let _ = tx.send(line(&e));
+        let _ = tx.try_send(line(&e));
     }
 }
 
@@ -173,15 +198,12 @@ pub fn record_now(e: Entry) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    rotate_if_big(&path);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = f.write_all(line(&e).as_bytes());
-    }
+    append(&path, line(&e).as_bytes());
 }
 
 /// One tool's row of the `qx gain` report.
 #[derive(Default)]
-pub struct Group {
+struct Group {
     pub ms: Vec<u64>,
     pub raw: u64,
     pub reply: u64,
@@ -247,7 +269,7 @@ fn human(secs: u64) -> String {
 }
 
 /// Median of a non-empty slice (sorts it).
-pub fn median(v: &mut [u64]) -> u64 {
+fn median(v: &mut [u64]) -> u64 {
     v.sort_unstable();
     v[v.len() / 2]
 }
@@ -260,7 +282,7 @@ pub fn parse_since(s: &str) -> Option<u64> {
         _ => (s, 'd'),
     };
     let n: u64 = num.parse().ok()?;
-    Some(n * match unit {
+    n.checked_mul(match unit {
         'd' => 86_400,
         'h' => 3_600,
         'm' => 60,
@@ -271,6 +293,13 @@ pub fn parse_since(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn since_overflow_is_none_and_path_with_equals_is_program() {
+        assert_eq!(parse_since("18446744073709551615d"), None);
+        // The program is kept as the key (not `--version`); the key filter drops `=`.
+        assert_eq!(first_word(r"C:\tools\a=b.exe --version"), "ab");
+    }
 
     #[test]
     fn the_key_is_only_a_bare_program_name() {
@@ -316,5 +345,28 @@ mod tests {
     fn the_median_of_an_odd_and_even_list() {
         assert_eq!(median(&mut [5, 1, 9]), 5);
         assert_eq!(median(&mut [4, 1, 9, 2]), 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_rotation_waits_for_another_writer_and_keeps_its_line() {
+        use std::io::{Seek, SeekFrom};
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = std::env::temp_dir().join(format!("qx-stats-rotate-{}.jsonl", std::process::id()));
+        let row = "x".repeat(99) + "\n";
+        std::fs::write(&path, row.repeat((ROTATE_AT / 100 + 1) as usize)).unwrap();
+        // Another qx process holds the ledger mid-append, as `append` does.
+        let mut other = std::fs::OpenOptions::new().read(true).write(true).share_mode(1).open(&path).unwrap();
+        let p = path.clone();
+        let ours = std::thread::spawn(move || append(&p, b"ours\n"));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        other.seek(SeekFrom::End(0)).unwrap();
+        other.write_all(b"theirs\n").unwrap();
+        drop(other);
+        ours.join().unwrap();
+        let data = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(data.ends_with("theirs\nours\n"), "another process's line was lost");
+        assert!((data.len() as u64) < ROTATE_AT, "the file was not rotated");
     }
 }

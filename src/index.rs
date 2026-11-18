@@ -131,7 +131,7 @@ mod imp {
             ov: *mut Overlapped,
             completion: *mut c_void,
         ) -> i32;
-        fn CancelIoEx(h: Handle, ov: *mut Overlapped) -> i32;
+        fn CancelIoEx(h: Handle, ov: *mut c_void) -> i32;
     }
 
     const INVALID_HANDLE: isize = -1;
@@ -163,7 +163,7 @@ mod imp {
     impl Drop for Index {
         fn drop(&mut self) {
             unsafe {
-                CancelIoEx(self.dir, &mut self.pending.ov);
+                CancelIoEx(self.dir, (&mut self.pending.ov as *mut Overlapped).cast());
                 // The request ends with exactly one packet; the buffer stays until the kernel is done with it.
                 let (mut n, mut key, mut pov) = (0u32, 0usize, std::ptr::null_mut());
                 let got = GetQueuedCompletionStatus(self.port, &mut n, &mut key, &mut pov, 2000);
@@ -174,6 +174,8 @@ mod imp {
                 CloseHandle(self.dir);
                 CloseHandle(self.port);
             }
+            // Its changes are no longer seen: content cached under its mtimes cannot be vouched for.
+            crate::fsops::content_forget(&self.root, true);
         }
     }
 
@@ -297,6 +299,8 @@ mod imp {
                 self.broken = true;
                 return;
             }
+            // A folder that went takes everything cached below it; a file only itself (a lookup, not a scan).
+            let gone_tree = matches!(action, REMOVED | RENAMED_OLD) && self.snap.files.binary_search_by(|e| e.rel.as_str().cmp(rel)).is_err();
             // A path inside a generated or VCS directory is not in the list: one name check, no syscall.
             // The last part may be a plain file that only has such a name (`vendor`, `dist`): that one is listed.
             let mut skip_leaf = false;
@@ -315,6 +319,7 @@ mod imp {
                     }
                 }
                 let full = self.root.join(rel.replace('/', "\\"));
+                crate::fsops::content_forget(&full, gone_tree);
                 match action {
                     REMOVED | RENAMED_OLD => Arc::make_mut(&mut self.snap).remove(rel),
                     ADDED | RENAMED_NEW | MODIFIED => match std::fs::symlink_metadata(&full) {
@@ -336,6 +341,8 @@ mod imp {
                 return;
             }
             let full = self.root.join(rel.replace('/', "\\"));
+            // A rewrite that keeps the mtime would otherwise be served from the content cache.
+            crate::fsops::content_forget(&full, gone_tree);
             match action {
                 REMOVED | RENAMED_OLD => Arc::make_mut(&mut self.snap).remove(rel),
                 ADDED | RENAMED_NEW | MODIFIED => {
@@ -402,9 +409,26 @@ mod imp {
             }
             let mut stack = vec![(dir.to_path_buf(), rel.to_string())];
             while let Some((d, r)) = stack.pop() {
-                let Ok(rd) = std::fs::read_dir(&d) else { continue };
-                for e in rd.flatten() {
-                    let Ok(ft) = e.file_type() else { continue };
+                let rd = match std::fs::read_dir(&d) {
+                    Ok(rd) => rd,
+                    Err(e) => {
+                        // Files below it would be missing from the list until the next rebuild.
+                        if crate::fsops::walk_lost(&e) {
+                            self.broken = true;
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                for e in rd {
+                    let Ok(e) = e else {
+                        self.broken = true;
+                        return;
+                    };
+                    let Ok(ft) = e.file_type() else {
+                        self.broken = true;
+                        return;
+                    };
                     let name = e.file_name().to_string_lossy().into_owned();
                     let child_rel = format!("{r}/{name}");
                     if ft.is_symlink() {
@@ -433,7 +457,14 @@ mod imp {
                             }
                         }
                     } else if ft.is_file() {
-                        let modified = e.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+                        let modified = match e.metadata().and_then(|m| m.modified()) {
+                            Ok(m) => m,
+                            Err(err) if !crate::fsops::walk_lost(&err) => continue, // gone again; its REMOVED follows
+                            Err(_) => {
+                                self.broken = true;
+                                return;
+                            }
+                        };
                         Arc::make_mut(&mut self.snap).upsert(&child_rel, e.path(), modified);
                     }
                 }
@@ -482,10 +513,13 @@ mod imp {
         if !index.issue() {
             return None; // Drop closes the handles
         }
-        let (parts, skipped) = crate::fsops::walk_live(root, false, Vec::<Entry>::new, |found, p, meta| {
+        let (parts, skipped, complete) = crate::fsops::walk_live(root, false, Vec::<Entry>::new, |found, p, meta| {
             let rel = p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/");
             found.push(Entry { path: p.to_path_buf(), rel, modified: meta.modified() });
         });
+        if !complete {
+            return None; // a folder could not be read: a list missing its files would stay wrong
+        }
         let mut files: Vec<Entry> = parts.into_iter().flatten().collect();
         if files.len() >= crate::fsops::MAX_WALK_FILES {
             return None; // too big to hold exactly: keep walking
@@ -631,6 +665,24 @@ mod imp {
             let left = BUILDING.lock().unwrap_or_else(|e| e.into_inner()).contains(&k);
             assert!(!left, "the root is still on the building list");
             assert!(!wait_for_build(Path::new("C:\\qx-test-panicking-root")));
+        }
+
+        #[test]
+        fn a_folder_that_cannot_be_listed_breaks_the_index() {
+            let dir = std::env::temp_dir().join(format!("qx-index-addtree-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.txt"), "x").unwrap();
+            let mut index = build(&dir).expect("an index was built");
+            index.git_ok = false; // no git process for this check
+            // Gone again before it was listed: its REMOVED follows and the list stays right.
+            index.add_tree(&dir.join("gone"), "gone");
+            assert!(!index.broken);
+            // Any other failure (here a file where a folder was expected) would leave files out.
+            index.add_tree(&dir.join("f.txt"), "f.txt");
+            assert!(index.broken);
+            drop(index);
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

@@ -23,8 +23,19 @@ fn is_env_header(trimmed: &str) -> bool {
 
 /// A header as TOML reads it: no trailing comment, no spaces (`[ mcp_servers . qx ] # note`).
 fn norm_header(line: &str) -> String {
-    // `'qx'` and `"qx"` are the same key.
-    strip_comment(line).chars().filter(|c| !c.is_whitespace()).map(|c| if c == '\'' { '"' } else { c }).collect()
+    // `'qx'` and `"qx"` are the same key; spaces inside a quoted key are part of it.
+    let mut quote = None;
+    let mut out = String::new();
+    for c in strip_comment(line).chars() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), _) if c == q => quote = None,
+            (None, _) if c.is_whitespace() => continue,
+            _ => {}
+        }
+        out.push(if c == '\'' && quote != Some('"') { '"' } else { c });
+    }
+    out
 }
 
 /// Which lines sit inside a multi-line string (`"""` or `\'\'\'`): their text is a value, not TOML.
@@ -229,7 +240,12 @@ fn kept(lines: &[&str], tables: &[(usize, usize)]) -> Kept {
         let header = norm_header(lines[*start]);
         let body = &lines[start + 1..*end];
         if is_env_header(&header) {
-            for line in body {
+            for (k, line) in body.iter().enumerate() {
+                // Lines inside a multi-line value belong to the key that opened it.
+                if mask[start + 1 + k] {
+                    out.env.push(line.to_string());
+                    continue;
+                }
                 let t = line.trim();
                 if t.is_empty() || t.starts_with('#') || !t.contains('=') {
                     continue;
@@ -328,7 +344,7 @@ fn toml_value(line: &str, key: &str) -> Option<String> {
     None
 }
 
-fn strip_comment(line: &str) -> &str {
+pub(crate) fn strip_comment(line: &str) -> &str {
     let mut in_basic = false;
     let mut in_literal = false;
     for (i, c) in line.char_indices() {
@@ -416,6 +432,19 @@ mod tests {
 
     fn count(haystack: &str, needle: &str) -> usize {
         haystack.matches(needle).count()
+    }
+
+    #[test]
+    fn a_quoted_key_with_a_space_is_another_server() {
+        let src = "[mcp_servers.\"q x\"]\ncommand = 'other'\n";
+        assert!(matches!(edit_codex(Some(src), Path::new(EXE), Action::Remove), Edit::Unchanged));
+    }
+
+    #[test]
+    fn a_multiline_env_value_is_kept_whole() {
+        let src = "[mcp_servers.qx]\ncommand = 'old.exe'\n\n[mcp_servers.qx.env]\nCERT = \"\"\"\nline one\n\n  line two\n\"\"\"\n";
+        let out = changed(edit_codex(Some(src), Path::new(EXE), Action::Install));
+        assert!(out.contains("CERT = \"\"\"\nline one\n\n  line two\n\"\"\""), "{out}");
     }
 
     #[test]

@@ -246,7 +246,7 @@ fn strip_wrappers(seg: &str) -> String {
     loop {
         let n = match w.as_slice() {
             [a, ..] if wrapped && a.starts_with('-') => 1,
-            [a, ..] if a.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_')) => 1,
+            [a, ..] if crate::exec::assignment_word(a) => 1,
             ["time" | "env" | "npx" | "bunx" | "nohup", ..] => 1,
             ["pnpm" | "yarn" | "npm", "exec" | "dlx", ..] | ["uv" | "poetry" | "pipenv", "run", ..] => 2,
             _ => break,
@@ -450,7 +450,7 @@ fn is_build(l: &str) -> bool {
     ];
     BUILDS
         .iter()
-        .any(|p| l == *p || l.starts_with(&format!("{p} ")))
+        .any(|p| l.strip_prefix(p).is_some_and(|r| r.is_empty() || r.starts_with(' ')))
 }
 
 fn is_runtime(l: &str) -> bool {
@@ -1058,7 +1058,8 @@ fn routine_line(t: &str) -> bool {
         || t.ends_with("packages are looking for funding")
         || t.starts_with('=')
         || (t.starts_with('-') && t.chars().all(|c| c == '-'))
-        || t.contains(" -> ")
+        // `dotnet build`'s `App -> bin\App.dll`; any other arrow may be a result (`answer -> 42`).
+        || t.split_once(" -> ").is_some_and(|(_, out)| out.ends_with(".dll") || out.ends_with(".exe"))
         || STARTS.iter().any(|p| t.starts_with(p))
 }
 
@@ -1404,6 +1405,19 @@ fn json_min(label: &str, text: &str) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_invalid_assignment_word_is_not_stripped() {
+        assert_eq!(core_label("1X=foo cargo test"), "1X=foo cargo test");
+        assert_eq!(core_label("CI=1 cargo test"), "cargo test");
+    }
+
+    #[test]
+    fn only_build_artifact_arrows_are_routine() {
+        assert!(routine_line(r"App -> C:\src\App\bin\Debug\net8.0\App.dll"));
+        assert!(!routine_line("answer -> 42"));
+        assert!(is_build("cargo build") && is_build("cargo build --release") && !is_build("cargo buildx"));
+    }
 
     #[test]
     fn a_cut_stderr_marks_the_digest_lossy_so_it_is_spooled() {

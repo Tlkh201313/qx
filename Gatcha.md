@@ -3,10 +3,10 @@
 Not-obvious things that bite. Each line: trap → what to do. Read before build/test/bench/deploy. Add a line when something wastes >10 min. A trap fixed in code (and tested) gets deleted here. Agent behaviour errors go in Mistake.md, not here.
 
 ## Build / test
-- Test exe in `target\` gets a Low Mandatory Level label (seen 2026-10-24, still true 2026-11-02) → every file create fails `os error 5`, ~92 false test failures. Copy it out and run from repo root: `cp target/release/deps/qx-<hash>.exe <scratch>/probe/qxt.exe && <scratch>/probe/qxt.exe --test-threads=4`. Same label hits `target\release\qx.exe` itself: a bash pipeline through it dies `msys-2.0 ... NtCreateDirectoryObject ... 0xC0000022`, exit 127 (seen 2026-11-14), so copy the exe out before benching or timing `run` lines. Don't create test files named `nul.*`/`con.*` (Windows device names).
+- Test exe in `target\` gets a Low Mandatory Level label (seen 2026-10-24, still true 2026-11-02) → every file create fails `os error 5`, ~92 false test failures. The repo's `scratch\` inherits the same label (2026-11-18: 191 false failures), so copy it OUTSIDE the repo and run with cwd = repo root: `cp target/debug/deps/qx-<hash>.exe "$LOCALAPPDATA/Temp/qxprobe/qxt.exe" && "$LOCALAPPDATA/Temp/qxprobe/qxt.exe" --test-threads=4`. Same label hits `target\release\qx.exe` itself: a bash pipeline through it dies `msys-2.0 ... NtCreateDirectoryObject ... 0xC0000022`, exit 127 (seen 2026-11-14), so copy the exe out before benching or timing `run` lines. Don't create test files named `nul.*`/`con.*` (Windows device names).
 - `cargo test --release` does NOT relink `target\release\qx.exe` → e2e checks after it run a stale exe. `cargo build --release` first.
 - Free RAM ~1 GB: full `cargo test` in background gets killed. Use `-j 1`; run single tests from the built exe.
-- Last full run from a copied exe (2026-11-11, dev profile): 535 passed, 0 failed, 2 ignored, ~22 s. Run it with cwd = repo root (the `builtin` tests read repo files). More failures than that on a clean tree = the `target\` label above or a stuck warm-PowerShell test, not your change. CI sets `QX_REQUIRE_ORACLE=1` (GNU grep/sed parity tests must run, not skip).
+- Last full run from a copied exe (2026-11-18, dev profile): 612 passed, 0 failed, 2 ignored, ~30 s. Run it with cwd = repo root (the `builtin` tests read repo files). More failures than that on a clean tree = the `target\` label above or a stuck warm-PowerShell test, not your change. CI sets `QX_REQUIRE_ORACLE=1` (GNU grep/sed parity tests must run, not skip).
 - rustc overflows its stack on `guard.rs` (exit 0xc00000fd) → build with `RUST_MIN_STACK=268435456`.
 - Worktrees build the same test exe name (`qx-<hash>.exe`) → a shared `target` runs another tree's code. Give each tree its own `CARGO_TARGET_DIR` and check `--list` names the test you added.
 - PATH differs: Git Bash puts Git `usr\bin` before System32, MCP server sees plain Windows PATH (`sort`, `find` differ). Run PATH-sensitive tests under both.
@@ -14,7 +14,8 @@ Not-obvious things that bite. Each line: trap → what to do. Read before build/
 
 ## Live server / deploy
 - Live MCP `qx` runs the OLD `~/.cargo/bin/qx.exe` until the client restarts. Never overwrite it while serving; use `qx deploy` from a copy outside `target\`. New code: test with `target\release\qx.exe` CLI.
-- Rollback = `~/.cargo/bin/qx.exe.old-<ts>` (swept by next deploy). Keep a durable copy first.
+- Rollback = `~/.cargo/bin/qx.exe.old-<ts>` (swept by next deploy). Keep a durable copy first: `qx.prev.exe` beside the exe is the pre-2026-11-15 build (no `--rollback` command yet).
+- Kill switches (env, set in the client's MCP config): `QX_READ_MEMORY=off` (repeat `fs read` stubs), `QX_RUN_MEMORY=off` (repeat `run` reply notes), `QX_STATS=off` (call ledger `%LOCALAPPDATA%\qx\stats.jsonl`), `QX_WARM=off`.
 
 ## Python stub
 - Edit to the TLS stub text → bump `N` in `PYTHON_FAST_TLS_DIR` (`python-fast-tls-vN`, `src/exec.rs`), or old stubs stay cached.

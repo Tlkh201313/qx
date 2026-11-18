@@ -4,7 +4,7 @@
 //! server speaks correctly to dsh, Claude Code, Codex, OpenCode, Hermes and pi.
 
 use crate::client::{self, Client, Native, Structured};
-use crate::{builtin, compact, digest, exec, guard, npm, redact, stats};
+use crate::{builtin, compact, digest, exec, guard, npm, redact, runmem, stats};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -111,11 +111,14 @@ fn serve_io<R: BufRead, W: Write + Send + 'static>(mut reader: R, out: W, limits
             continue;
         }
         let req = Arc::new(req);
+        // Registered here, on the reader thread, so a cancel read after this line finds the call.
+        let pending = Pending::admit(&req);
         let (out_w, active_w, req_w) = (out.clone(), active.clone(), req.clone());
         // A refused spawn (memory pressure) answers this call instead of unwinding the reader loop.
         let spawned = std::thread::Builder::new().name("qx-call".into()).spawn(move || {
             let (out, active, req) = (out_w, active_w, req_w);
             let _active = Active(active);
+            let _pending = pending;
             if SHUTDOWN.load(Ordering::SeqCst) {
                 // The client is gone: never start work nobody will read, but still answer
                 // every id that was waiting.
@@ -180,23 +183,23 @@ fn route(req: &Value) -> Route {
     }
 }
 
-/// Request ids a refused reply must cover: every request that carries one, so a batch
-/// stays a batch and no id is left waiting.
+/// Answers a request refused before it ran: each `tools/call` with an id gets `reply`, and the other
+/// items of a batch (ping, list, cancel) get their normal answer, so a batch stays a batch.
 fn send_all<W: Write>(out: &Mutex<W>, req: &Value, reply: impl Fn(Value) -> Value) {
+    let answer = |item: &Value| match item.get("id") {
+        Some(id) if is_worker(item) => Some(reply(id.clone())),
+        _ => guarded(item),
+    };
     match req {
         Value::Array(batch) => {
-            let replies: Vec<Value> = batch
-                .iter()
-                .filter_map(|item| item.get("id").cloned())
-                .map(&reply)
-                .collect();
+            let replies: Vec<Value> = batch.iter().filter_map(answer).collect();
             if !replies.is_empty() {
                 send(out, &Value::Array(replies));
             }
         }
         one => {
-            if let Some(id) = one.get("id").cloned() {
-                send(out, &reply(id));
+            if let Some(resp) = answer(one) {
+                send(out, &resp);
             }
         }
     }
@@ -217,9 +220,41 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// Running `tools/call`s by request id, so `notifications/cancelled` can stop the right one.
 static INFLIGHT: Mutex<Vec<(String, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
 
-/// Cancels that named no running call: a call still waiting for a worker slot (or one that has
-/// already finished). `Inflight::begin` honours the first kind; the list is capped so the second cannot grow it.
-static EARLY_CANCELS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Ids of admitted `tools/call`s whose worker has not finished, each with whether a cancel named it
+/// before it began (it was still waiting for a worker slot). Only these carry a cancel forward: a
+/// late cancel for a finished id must not stop a later call that reuses the id.
+static PENDING: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
+
+/// Holds a request's call ids in `PENDING` from admission until its worker is done.
+struct Pending(Vec<String>);
+
+impl Pending {
+    fn admit(req: &Value) -> Self {
+        let items = match req {
+            Value::Array(batch) => batch.as_slice(),
+            one => std::slice::from_ref(one),
+        };
+        let keys: Vec<String> = items
+            .iter()
+            .filter(|item| is_worker(item))
+            .filter_map(|item| item.get("id"))
+            .map(Value::to_string)
+            .collect();
+        PENDING.lock().unwrap_or_else(|e| e.into_inner()).extend(keys.iter().map(|k| (k.clone(), false)));
+        Pending(keys)
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        for key in &self.0 {
+            if let Some(i) = pending.iter().position(|(k, _)| k == key) {
+                pending.swap_remove(i);
+            }
+        }
+    }
+}
 
 struct Inflight(Option<String>, Option<Arc<AtomicBool>>);
 
@@ -234,16 +269,12 @@ impl Inflight {
         let Some(key) = id.as_ref().map(Value::to_string) else {
             return Inflight(None, None);
         };
-        // Lock order is always INFLIGHT then EARLY_CANCELS, held across check-and-insert, so a cancel
-        // lands either in the flag or in the early list this reads, never between the two.
+        // Lock order is always INFLIGHT then PENDING, held across check-and-insert, so a cancel
+        // lands either in the flag or in the pending entry this reads, never between the two.
         let flag = {
             let mut running = INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-            let mut early = EARLY_CANCELS.lock().unwrap_or_else(|e| e.into_inner());
-            let before = early.len();
-            early.retain(|k| *k != key);
-            let flag = Arc::new(AtomicBool::new(
-                SHUTDOWN.load(Ordering::SeqCst) || early.len() != before,
-            ));
+            let early = PENDING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(k, c)| *k == key && *c);
+            let flag = Arc::new(AtomicBool::new(SHUTDOWN.load(Ordering::SeqCst) || early));
             running.push((key.clone(), flag.clone()));
             flag
         };
@@ -272,11 +303,11 @@ fn cancel(id: &Value) {
         }
     }
     if !found {
-        let mut early = EARLY_CANCELS.lock().unwrap_or_else(|e| e.into_inner());
-        if early.len() >= 64 {
-            early.remove(0);
+        for (k, early) in PENDING.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+            if *k == key {
+                *early = true;
+            }
         }
-        early.push(key);
     }
 }
 
@@ -295,7 +326,7 @@ static SPAWN_GATE: Mutex<Option<Arc<Gate>>> = Mutex::new(None);
 
 /// A slot for one real process. Waits for a free one until `deadline`, and gives up at once when the
 /// call is cancelled; `None` inside `Ok` means there is no gate to wait on. Err is the reply text.
-pub(crate) fn spawn_slot(deadline: std::time::Instant) -> Result<Option<Slot>, String> {
+fn spawn_slot(deadline: std::time::Instant) -> Result<Option<Slot>, String> {
     let gate = SPAWN_GATE.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let Some(gate) = gate else { return Ok(None) };
     match gate.acquire_until(deadline, &exec::should_stop) {
@@ -332,7 +363,7 @@ impl Gate {
     }
 }
 
-pub(crate) struct Slot(std::sync::Arc<Gate>);
+struct Slot(std::sync::Arc<Gate>);
 
 impl Drop for Slot {
     fn drop(&mut self) {
@@ -639,7 +670,9 @@ pub(crate) fn run_label(program: Option<&str>, args: &[String], cmdline: Option<
     let Some(p) = program else {
         return cmdline.unwrap_or("").to_string();
     };
-    let mut l = p.to_string();
+    let base = p.rsplit(['\\', '/']).next().unwrap_or(p);
+    let base = base.len().checked_sub(4).filter(|&i| base.is_char_boundary(i) && base[i..].eq_ignore_ascii_case(".exe")).map_or(base, |i| &base[..i]);
+    let mut l = base.to_string();
     for (i, a) in args.iter().enumerate() {
         if !(a.starts_with('-') || (i < 4 && l.len() <= 80)) {
             continue;
@@ -1014,14 +1047,37 @@ fn env_arg(args: &Value) -> Result<Vec<(String, String)>, String> {
         .collect()
 }
 
+/// Filesystem calls still running after their caller was cancelled and stopped waiting. Capped so
+/// repeated cancelled scans cannot pile up threads and disk work without limit.
+static FS_STRAYS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_FS_STRAYS: usize = 4;
+
+/// Held by a `cancellable` thread and, on cancel, by its waiter: whichever lets go second
+/// settles the stray count, so a thread that ends before the waiter counts it is never leaked.
+struct Stray(Arc<AtomicBool>);
+
+impl Drop for Stray {
+    fn drop(&mut self) {
+        if self.0.swap(true, Ordering::SeqCst) {
+            FS_STRAYS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Run `work` on its own thread and wait for it, but stop waiting at once when the call is cancelled.
 /// The thread is left to finish alone. Err says why there is no value.
 fn cancellable<T: Send + 'static>(call: &Inflight, work: impl FnOnce() -> T + Send + 'static) -> Result<T, &'static str> {
     use std::sync::mpsc::RecvTimeoutError;
+    if FS_STRAYS.load(Ordering::SeqCst) >= MAX_FS_STRAYS {
+        return Err("not started: earlier cancelled fs calls are still running; retry shortly");
+    }
     let (tx, rx) = std::sync::mpsc::channel();
+    let done = Arc::new(AtomicBool::new(false));
+    let stray = Stray(done.clone());
     std::thread::Builder::new()
         .name("qx-fs".into())
         .spawn(move || {
+            let _stray = stray;
             let _ = tx.send(work());
         })
         .map_err(|_| "could not start a worker thread")?;
@@ -1029,7 +1085,11 @@ fn cancellable<T: Send + 'static>(call: &Inflight, work: impl FnOnce() -> T + Se
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(v) => return Ok(v),
             Err(RecvTimeoutError::Disconnected) => return Err("panicked"),
-            Err(RecvTimeoutError::Timeout) if call.cancelled() => return Err("cancelled"),
+            Err(RecvTimeoutError::Timeout) if call.cancelled() => {
+                FS_STRAYS.fetch_add(1, Ordering::SeqCst);
+                drop(Stray(done));
+                return Err("cancelled; it may still finish in the background");
+            }
             Err(RecvTimeoutError::Timeout) => {}
         }
     }
@@ -1062,7 +1122,7 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
                 }
                 tool_result(id, &reply.text, reply.is_error, reply.structured)
             }
-            Err(why) => tool_text(id, &format!("[qx] fs call {why}; it may still finish in the background"), true),
+            Err(why) => tool_text(id, &format!("[qx] fs call {why}"), true),
         };
     }
     if name != "run" {
@@ -1161,7 +1221,7 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
     let mut decision = if let Some(p) = program {
         guard::check(p, &list, cwd.as_deref())
     } else if let Some(c) = cmdline {
-        guard::check_shell(c, cwd.as_deref())
+        guard::check_shell(c, shell, cwd.as_deref())
     } else {
         guard::Decision::allow()
     };
@@ -1329,6 +1389,13 @@ fn render(id: Option<Value>, outcome: exec::Outcome, source: &str, ctx: &RunCtx,
         let (cap_so, cap_se) = stream_caps(so.len(), se.len());
         truncated |= cap_text(&mut so, cap_so);
         truncated |= cap_text(&mut se, cap_se);
+        // The same text as the last run of this command: a note instead (its spool file, if any, was named then).
+        if !runmem::off() {
+            let key = format!("{}\0{label}", cwd.map(|c| c.display().to_string()).unwrap_or_default());
+            if let Some(note) = runmem::seen(&key, &so, &se, outcome.code, matches!(profile, "test" | "build")) {
+                (so, se, truncated, lossy, redactions) = (note, String::new(), false, false, 0);
+            }
+        }
         // A cut or a digest that dropped content must never lose facts for good: the agent can grep the full text.
         if truncated || lossy {
             spool = compact::spool(&original.0, &original.1);
@@ -1562,6 +1629,12 @@ fn tool_result(id: Option<Value>, text: &str, is_error: bool, extra: Value) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_label_uses_the_program_basename() {
+        let l = run_label(Some(r"C:\Program Files\Git\bin\git.EXE"), &["status".to_string()], None);
+        assert_eq!(l, "git status");
+    }
 
     #[test]
     fn initialize_carries_routing_instructions() {
@@ -1802,6 +1875,8 @@ mod tests {
             (900u64, json!({"program":"mkdir","args":["made"],"cwd":cwd}), "made"),
             (901u64, json!({"command":"cmd /c echo x> marker.txt","cwd":cwd}), "marker.txt"),
         ] {
+            // The reader admits a request before it can see a cancel naming it.
+            let _pending = Pending::admit(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call"}));
             let note = format!(r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{{"requestId":{id}}}}}"#);
             assert!(respond(&note).is_none());
             let r = client::scoped(Client::Dsh, || call_id(id, args));
@@ -1856,7 +1931,8 @@ mod tests {
     #[test]
     fn a_cancel_that_arrives_before_the_call_gets_a_slot_is_not_lost() {
         let _server = server_lock();
-        // The reader answers `notifications/cancelled` while the call still waits for a worker slot.
+        // The reader admitted the call, then answers `notifications/cancelled` while it still waits for a worker slot.
+        let _pending = Pending::admit(&json!({"jsonrpc":"2.0","id":78,"method":"tools/call"}));
         assert!(respond(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":78}}"#).is_none());
         let t = std::time::Instant::now();
         let r = client::scoped(Client::Dsh, || {
@@ -1871,14 +1947,50 @@ mod tests {
         // Touches the process-wide cancel registry, so it never overlaps a server test.
         let _server = server_lock();
         for i in 5000..5400 {
+            let pending = Pending::admit(&json!({"jsonrpc":"2.0","id":i,"method":"tools/call"}));
             let canceller = std::thread::spawn(move || cancel(&json!(i)));
             let guard = Inflight::begin(&Some(json!(i)));
             canceller.join().unwrap();
             let key = i.to_string();
             let hit = INFLIGHT.lock().unwrap().iter().any(|(k, f)| *k == key && f.load(Ordering::Relaxed));
             drop(guard);
+            drop(pending);
             assert!(hit, "cancel {i} was lost between the two lists");
         }
+    }
+
+    #[test]
+    fn a_late_cancel_does_not_stop_a_later_call_that_reuses_the_id() {
+        let _server = server_lock();
+        // Id 5500 already finished, so nothing is pending under it when this cancel arrives.
+        cancel(&json!(5500));
+        let _pending = Pending::admit(&json!({"jsonrpc":"2.0","id":5500,"method":"tools/call"}));
+        let call = Inflight::begin(&Some(json!(5500)));
+        assert!(!call.cancelled(), "a stale cancel stopped a new call");
+    }
+
+    #[test]
+    fn cancelled_fs_work_left_running_is_capped() {
+        let _server = server_lock();
+        let call = Inflight(None, Some(Arc::new(AtomicBool::new(true))));
+        let hold = Arc::new(AtomicBool::new(true));
+        for _ in 0..MAX_FS_STRAYS {
+            let h = hold.clone();
+            let got = cancellable(&call, move || {
+                while h.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            assert!(got.is_err_and(|why| why.starts_with("cancelled")));
+        }
+        let refused = cancellable(&call, || ());
+        assert!(refused.is_err_and(|why| why.starts_with("not started")), "{refused:?}");
+        hold.store(false, Ordering::SeqCst);
+        let t = std::time::Instant::now();
+        while FS_STRAYS.load(Ordering::SeqCst) > 0 && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(cancellable(&Inflight(None, None), || 5), Ok(5));
     }
 
     #[test]
@@ -2104,7 +2216,7 @@ mod tests {
             d.store(true, Ordering::SeqCst);
             7
         });
-        assert_eq!(got, Err("cancelled"), "a cancelled call reports nothing");
+        assert!(got.is_err_and(|why| why.starts_with("cancelled")), "a cancelled call reports nothing");
         assert!(t.elapsed() < Duration::from_millis(500), "and returns at once: {:?}", t.elapsed());
         assert!(!done.load(Ordering::SeqCst));
         canceller.join().unwrap();
@@ -2338,7 +2450,7 @@ mod tests {
         let by_id = |id: u64| replies.iter().find(|v| v.get("id") == Some(&json!(id))).cloned();
         // A busy batch must answer its non-call requests too, and stay an array.
         let ping = by_id(32).unwrap_or_else(|| panic!("id 32 unanswered: {replies:?}"));
-        assert!(ping.get("result").is_some(), "{ping}");
+        assert_eq!(ping.get("result"), Some(&json!({})), "a batched ping got the busy reply: {ping}");
         let refused = by_id(33).unwrap_or_else(|| panic!("id 33 unanswered: {replies:?}"));
         // The text, not `structuredContent`: which one a reply carries depends on the client
         // profile, and `CLAUDECODE=1` in the test's own environment selects one without it.

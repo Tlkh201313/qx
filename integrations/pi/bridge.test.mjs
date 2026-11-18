@@ -1,7 +1,7 @@
 // Run: node integrations/pi/bridge.test.mjs   (no qx binary needed)
 import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { QxBridge } from "./qx/bridge.js";
@@ -169,6 +169,17 @@ try {
   const cancel = sent.find((m) => m.method === "notifications/cancelled");
   assert.equal(cancel?.params?.requestId, request.id);
   assert.equal(bridge.pending.size, 0);
+}
+
+// 8. The pi fs schema offers every key the server's fs tool accepts, and nothing else: pi sends
+// only what its schema declares. Read as text, since `qx.js` imports pi's typebox.
+{
+  const source = (path) => readFileSync(new URL(path, import.meta.url), "utf8").replace(/\r\n/g, "\n");
+  const known = source("../../src/fsops/mod.rs").match(/const KNOWN_KEYS: &\[&str\] = &\[([^\]]*)\]/)[1];
+  const server = [...known.matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort();
+  const block = source("./qx.js").match(/const FS_PARAMETERS = Type\.Object\(\{\n([\s\S]*?)\n\}\);/)[1];
+  const pi = [...block.matchAll(/^ {2}"?([\w-]+)"?:/gm)].map((m) => m[1]).sort();
+  assert.deepEqual(pi, server);
 }
 
 console.log("bridge ok");

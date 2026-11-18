@@ -18,6 +18,7 @@ mod npm;
 mod python;
 mod redact;
 mod resolve;
+mod runmem;
 mod setup;
 mod stats;
 #[cfg_attr(test, allow(dead_code))] // `mcp::serve` starts it outside tests only
@@ -107,13 +108,17 @@ fn streams(tty: bool, explicit: Option<bool>, redact: Option<&str>) -> bool {
     explicit.unwrap_or(tty && !matches!(redact, Some("1" | "on")))
 }
 
+/// The value after a flag. A missing value, or another `--flag` in its place, is an error: `qx -c --raw`
+/// must not run `--raw` as the command, and `--timeout --raw` must not swallow the flag.
+fn flag_value<'a>(flag: &str, v: Option<&'a String>, what: &str) -> Result<&'a String, String> {
+    v.filter(|v| !v.starts_with("--")).ok_or_else(|| format!("{flag} needs {what}"))
+}
+
 /// The number after a flag. `--timeout` (`secs`) also takes `30s`, `5m` and `1h`. A missing or bad value
-/// is an error: a silent default would turn `--timeout 5m` into 120 s and `--timeout --raw` into a swallowed flag.
+/// is an error: a silent default would turn `--timeout 5m` into 120 s.
 fn flag_num(flag: &str, v: Option<&String>, secs: bool) -> Result<u64, String> {
     let what = if secs { "a number of seconds (or 30s, 5m, 1h)" } else { "a whole number" };
-    let Some(v) = v.filter(|v| !v.starts_with("--")) else {
-        return Err(format!("{flag} needs {what}"));
-    };
+    let v = flag_value(flag, v, what)?;
     let (num, scale) = match v.char_indices().last() {
         Some((i, 's')) if secs => (&v[..i], 1),
         Some((i, 'm')) if secs => (&v[..i], 60),
@@ -127,6 +132,26 @@ fn flag_num(flag: &str, v: Option<&String>, secs: bool) -> Result<u64, String> {
 fn secs_until(deadline: u64) -> u64 {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     deadline.saturating_sub(now)
+}
+
+/// The guard's verdict on a CLI command. For `-c` the `NAME=value` words in front of the line are
+/// judged too, as the MCP path does: their values reach the child unseen by the line check.
+fn cli_decision(shell_cmd: Option<&str>, shell: &str, rest: &[String], cwd: Option<&std::path::Path>) -> guard::Decision {
+    let Some(sh) = shell_cmd else {
+        return match rest.split_first() {
+            Some((prog, args)) => guard::check(prog, args, cwd),
+            None => guard::Decision::allow(),
+        };
+    };
+    // Under PowerShell a simple-looking line still means PowerShell (`rd a,b` is Remove-Item on a list).
+    let simple = if exec::shell_for(sh, shell) == "powershell" { None } else { exec::split_simple(sh) };
+    let mut decision = if let Some((prog, sargs)) = simple {
+        guard::check(&prog, &sargs, cwd)
+    } else {
+        guard::check_shell(sh, shell, cwd)
+    };
+    guard::merge(&mut decision, guard::check_env(&exec::peel_env(sh).0));
+    decision
 }
 
 fn run_cli(args: &[String], force_raw: bool) -> i32 {
@@ -195,20 +220,21 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
                 }
                 i += 1;
             }
-            "--cwd" => {
+            "--cwd" | "--shell" | "-c" | "--command" => {
                 i += 1;
-                o.cwd = args.get(i).map(|t| std::path::absolute(t).unwrap_or_else(|_| PathBuf::from(t)));
-                i += 1;
-            }
-            "--shell" => {
-                i += 1;
-                o.shell = args.get(i).cloned().unwrap_or_else(|| "auto".to_string());
-                i += 1;
-            }
-            "-c" | "--command" => {
-                // Flags may follow the command line (`qx -c "..." --cwd D`); they still apply.
-                i += 1;
-                shell_cmd = args.get(i).cloned();
+                let v = match flag_value(a, args.get(i), "a value") {
+                    Ok(v) => v.clone(),
+                    Err(e) => {
+                        eprintln!("qx: {e}");
+                        return 2;
+                    }
+                };
+                match a {
+                    "--cwd" => o.cwd = Some(std::path::absolute(&v).unwrap_or_else(|_| PathBuf::from(&v))),
+                    "--shell" => o.shell = v,
+                    // Flags may follow the command line (`qx -c "..." --cwd D`); they still apply.
+                    _ => shell_cmd = Some(v),
+                }
                 i += 1;
             }
             "-h" | "--help" => {
@@ -245,17 +271,7 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
         Some(sh) => sh.clone(),
         None => args.get(i..).unwrap_or(&[]).join(" "),
     };
-    let decision = if let Some(sh) = &shell_cmd {
-        if let Some((prog, sargs)) = exec::split_simple(sh) {
-            guard::check(&prog, &sargs, o.cwd.as_deref())
-        } else {
-            guard::check_shell(sh, o.cwd.as_deref())
-        }
-    } else if let Some(prog) = args.get(i) {
-        guard::check(prog, &args[i + 1..], o.cwd.as_deref())
-    } else {
-        guard::Decision::allow()
-    };
+    let decision = cli_decision(shell_cmd.as_deref(), &o.shell, args.get(i..).unwrap_or(&[]), o.cwd.as_deref());
     if !decision.allowed() {
         eprintln!("[qx guard] BLOCKED: {}", decision.summary());
         guard::record("cli", &guard_command, &decision);
@@ -552,7 +568,7 @@ fn check_cmd(rest: &[String]) -> i32 {
     }
     let cwd = std::env::current_dir().ok();
     let decision = if rest.len() == 1 {
-        guard::check_shell(&rest[0], cwd.as_deref())
+        guard::check_shell(&rest[0], "auto", cwd.as_deref())
     } else {
         guard::check(&rest[0], &rest[1..], cwd.as_deref())
     };
@@ -748,6 +764,30 @@ mod tests {
         assert_eq!(run_cli(&s(&["--capture", "-c", "exit 3", "--cwd", &missing.to_string_lossy()]), false), 2);
         assert_eq!(run_cli(&s(&["--capture", "-c", "exit 0", "stray"]), false), 2);
         assert_eq!(run_cli(&s(&["--capture", "-c", "exit 3"]), false), 3);
+    }
+
+    #[test]
+    fn a_string_flag_without_its_value_is_an_error() {
+        // `qx -c --raw` used to run `--raw` as the command.
+        for bad in [&["-c", "--raw"][..], &["-c"], &["--shell", "--capture", "-c", "exit 0"], &["--cwd", "--raw", "-c", "exit 0"]] {
+            let mut a = s(&["--capture"]);
+            a.extend(s(bad));
+            assert_eq!(run_cli(&a, false), 2, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_dash_c_env_prefix_is_judged_by_the_guard() {
+        // `GIT_EXTERNAL_DIFF` makes an allowed `git diff` run any program; the line check alone never sees it.
+        let d = cli_decision(Some("GIT_EXTERNAL_DIFF=x git diff"), "auto", &[], None);
+        assert!(d.level != guard::Level::Allow, "{}", d.summary());
+    }
+
+    #[test]
+    fn a_simple_line_under_powershell_is_judged_as_powershell() {
+        // `rd` is Remove-Item in PowerShell, which takes `a,b` as two paths.
+        let d = cli_decision(Some(r"rd x,C:\Windows"), "powershell", &[], None);
+        assert_eq!(d.level, guard::Level::Deny, "{}", d.summary());
     }
 
     #[test]

@@ -14,14 +14,12 @@ pub enum Installed {
     Replaced { aside: Option<PathBuf> },
 }
 
-/// `%CARGO_HOME%\bin\qx.exe`, else `%USERPROFILE%\.cargo\bin\qx.exe`.
+/// `%CARGO_HOME%\bin\qx.exe`, else `<home>\.cargo\bin\qx.exe` (home per `resolve::home_dir`).
 pub fn canonical() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("CARGO_HOME").filter(|h| !h.is_empty()) {
         return Some(PathBuf::from(home).join("bin").join("qx.exe"));
     }
-    std::env::var_os("USERPROFILE")
-        .filter(|h| !h.is_empty())
-        .map(|home| PathBuf::from(home).join(".cargo").join("bin").join("qx.exe"))
+    crate::resolve::home_dir().map(|home| home.join(".cargo").join("bin").join("qx.exe"))
 }
 
 fn file_name(dst: &Path) -> std::io::Result<String> {
@@ -30,7 +28,7 @@ fn file_name(dst: &Path) -> std::io::Result<String> {
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "destination has no file name"))
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
@@ -72,6 +70,9 @@ fn read_full(r: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usiz
 
 /// Copy `src` over `dst`, keeping the previous `dst` as a sibling until clients exit.
 pub fn install(src: &Path, dst: &Path) -> std::io::Result<Installed> {
+    // Through a symlink, the file it points at is the one to replace, not the link.
+    let target = if dst.is_symlink() { std::fs::canonicalize(dst).ok() } else { None };
+    let dst = target.as_deref().unwrap_or(dst);
     if same_path(src, dst) {
         return Ok(Installed::Unchanged);
     }
@@ -95,8 +96,14 @@ pub fn install(src: &Path, dst: &Path) -> std::io::Result<Installed> {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let new = parent.join(format!("{name}.new-{}", std::process::id()));
-    // Copy first, so a half-written file can never take the canonical name.
-    if let Err(e) = std::fs::copy(src, &new) {
+    // Copy first, so a half-written file can never take the canonical name; flush it, so power
+    // loss after the rename cannot leave a partial file there once the old copy is gone.
+    // A plain create, not `fs::copy`: a read-only source would make the copy read-only and unflushable.
+    let copied = std::fs::File::create(&new).and_then(|mut out| {
+        std::io::copy(&mut std::fs::File::open(src)?, &mut out)?;
+        out.sync_all()
+    });
+    if let Err(e) = copied {
         let _ = std::fs::remove_file(&new);
         return Err(e);
     }
@@ -248,6 +255,27 @@ mod tests {
         assert_eq!(install(&src, &dst).unwrap(), Installed::Replaced { aside: None });
         assert_eq!(std::fs::read_to_string(&dst).unwrap(), "B");
         assert_eq!(sweep_aside(&dst), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_replaces_the_target_of_a_symlink() {
+        let dir = tmp("link");
+        let (src, real, link) = (dir.join("src.exe"), dir.join("real.exe"), dir.join("qx.exe"));
+        std::fs::write(&src, "B").unwrap();
+        std::fs::write(&real, "A").unwrap();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&real, &link);
+        #[cfg(not(windows))]
+        let made = std::os::unix::fs::symlink(&real, &link);
+        // Creating a symlink on Windows needs developer mode or admin rights.
+        if made.is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        install(&src, &link).unwrap();
+        assert!(link.is_symlink(), "the link must stay a link");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "B");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

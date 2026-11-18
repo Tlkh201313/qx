@@ -101,7 +101,7 @@ fn direct_step(f: &Fast, s: &Step) -> Option<Command> {
     if !matches!(target, crate::resolve::Target::Direct { .. }) {
         return None;
     }
-    let mut c = crate::exec::command_for(&program, target, &args).ok()?;
+    let mut c = crate::exec::command_for(&program, target, &args, &[]).ok()?;
     decorate(&mut c, f, s);
     Some(c)
 }
@@ -604,7 +604,7 @@ fn bin_path(root: &Path) -> OsString {
             .iter()
             .any(|d| d.to_string_lossy().to_ascii_lowercase() == lower)
         {
-            dirs.push(p);
+            dirs.push(p.clone());
         }
     }
     std::env::join_paths(&dirs).unwrap_or_else(|_| {

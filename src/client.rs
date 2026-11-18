@@ -146,7 +146,9 @@ impl Client {
             Client::OpenCode => format!("qx_{tool}"),
             // omp joins server and tool with one underscore (`mcp/tool-bridge.ts`).
             Client::Omp => format!("mcp__qx_{tool}"),
-            Client::Cursor | Client::Generic => format!("the qx `{tool}` tool"),
+            // Cursor hides MCP tools behind one meta-tool; a server in ~/.cursor/mcp.json is `user-<name>`.
+            Client::Cursor => format!("`CallMcpTool` (server `user-qx`, toolName `{tool}`)"),
+            Client::Generic => format!("the qx `{tool}` tool"),
             _ => format!("mcp__qx__{tool}"),
         }
     }
@@ -212,6 +214,19 @@ impl Client {
     /// Server instructions, kept under 1024 bytes: Codex reads the first 512, Claude
     /// Code truncates at 4096, dsh fails above 32 KiB, and all three are paid per request.
     pub fn instructions(self) -> String {
+        if self == Client::Omp {
+            // `qx setup omp` hooks omp's own `bash` (integrations/omp/qx.js), and omp's file tools
+            // are as lean as `fs`, so the model keeps them; omp itself lists the `xd://` routes.
+            return format!(
+                "omp's `bash` already runs through qx, which compacts its output: keep using `bash` and \
+                 omp's file tools. Reach for {} only for what `bash` lacks: `program` + `args` with no \
+                 shell, or a command that outlives `timeout_ms` and becomes a job (`job`, `wait_ms`, \
+                 `kill`). {} batches several reads or greps in one call (`paths`, `ops`). Always pass \
+                 `cwd`. A cut output names a `full_output` file. If a qx call fails, fall back to `bash`.",
+                self.tool_id("run"),
+                self.tool_id("fs"),
+            );
+        }
         let (shell, read) = (self.native(Native::Shell), self.native(Native::Read));
         // Naming Edit/Glob/Grep too keeps the model off its own tools: native Edit waited a median
         // 7 s on a permission prompt and wanted a prior Read. Codex maps several roles to one tool.
@@ -362,6 +377,8 @@ mod tests {
         assert!(Client::Codex.instructions().contains("apply_patch"));
         assert!(Client::ClaudeCode.instructions().contains("`Write`, `Edit`, `Glob` and `Grep`"));
         assert!(Client::Codex.instructions().starts_with("qx replaces `exec_command` and `apply_patch`"));
+        // omp's bash is hooked, so its text keeps the model on `bash` instead of replacing it.
+        assert!(!Client::Omp.instructions().contains("replaces"));
     }
 
     #[test]

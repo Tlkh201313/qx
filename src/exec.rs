@@ -39,8 +39,7 @@ pub fn prepare(cmd: &mut Command) {
     let inherited: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     cmd.env_clear();
 
-    let dirs = resolve::path_dirs();
-    let path = std::env::join_paths(&dirs).unwrap_or_else(|_| {
+    let path = std::env::join_paths(resolve::path_dirs()).unwrap_or_else(|_| {
         OsString::from(if cfg!(windows) {
             r"C:\Windows\System32;C:\Windows"
         } else {
@@ -390,7 +389,7 @@ fn prepend_paths(cmd: &mut Command, front: &[std::path::PathBuf]) {
     let key = |d: &std::path::Path| d.to_string_lossy().trim_end_matches(['\\', '/']).to_ascii_lowercase();
     let keys: Vec<String> = front.iter().map(|d| key(d)).collect();
     let mut dirs = front.to_vec();
-    dirs.extend(resolve::path_dirs().into_iter().filter(|d| !keys.contains(&key(d))));
+    dirs.extend(resolve::path_dirs().iter().filter(|d| !keys.contains(&key(d))).cloned());
     if let Ok(path) = std::env::join_paths(dirs) {
         cmd.env("PATH", path);
     }
@@ -461,14 +460,14 @@ pub fn build_command_env(
             line.push(' ');
             line.push_str(&cmd_quote(a));
         }
-        let mut c = cmd_exe(&line);
+        let mut c = cmd_exe(&line)?;
         prepare(&mut c);
         apply_child_defaults(&mut c, false);
         return Ok(c);
     }
-    // `PATH=<dir> tool`: the child gets that PATH, so it is also where the program is looked up.
+    // `PATH=<dir> tool`: the child gets that PATH instead of qx's, so it is the only place the program is looked up.
     let mut target = match envs.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case("PATH")) {
-        Some((_, p)) => resolve::resolve_in(program, &std::env::split_paths(p).collect::<Vec<_>>(), cwd),
+        Some((_, p)) => resolve::resolve_only(program, &std::env::split_paths(p).collect::<Vec<_>>(), cwd),
         None => resolve::resolve(program, cwd),
     };
     // `find src -name x` and `sort -n`: System32 ships unrelated tools under those names
@@ -478,7 +477,7 @@ pub fn build_command_env(
             target = Target::Direct { exe, prefix: Vec::new() };
         }
     }
-    command_for(program, target, args)
+    command_for(program, target, args, envs)
 }
 
 /// A name Windows also ships, where the arguments show the caller wanted the POSIX tool.
@@ -504,8 +503,9 @@ fn npmish(program: &str) -> bool {
 }
 
 /// One resolved target to the command that runs it. `build_command_at` and the npm fast
-/// path share this, so a script step and a direct call cannot drift apart.
-pub fn command_for(program: &str, target: Target, args: &[String]) -> Result<Command, String> {
+/// path share this, so a script step and a direct call cannot drift apart. `envs` are the
+/// call's `NAME=value` prefixes, applied by the caller afterwards.
+pub fn command_for(program: &str, target: Target, args: &[String], envs: &[(String, String)]) -> Result<Command, String> {
     let npmish = npmish(program);
     match target {
         Target::Direct { exe, prefix } => {
@@ -522,7 +522,7 @@ pub fn command_for(program: &str, target: Target, args: &[String]) -> Result<Com
             // A venv's `python.exe` is a redirector: it re-execs the base interpreter. Running
             // the base directly with `__PYVENV_LAUNCHER__` set is the same session, one process
             // fewer.
-            let venv = crate::python::venv_redirect(&exe);
+            let venv = crate::python::venv_redirect_env(&exe, envs);
             let program = match &venv {
                 Some(v) => v.base.as_path(),
                 None => exe.as_path(),
@@ -533,7 +533,11 @@ pub fn command_for(program: &str, target: Target, args: &[String]) -> Result<Com
                 // A profile adds 300+ ms and can print into the output.
                 c.arg("-NoProfile");
             }
-            match cmd_c_line(&exe, args) {
+            let raw = cmd_c_line(&exe, args);
+            if let Some(r) = &raw {
+                cmd_fits(r)?;
+            }
+            match raw {
                 // The text after `/c` is a command line: raw, as `cmd_exe` passes it.
                 #[cfg(windows)]
                 Some(raw) => {
@@ -574,7 +578,7 @@ pub fn command_for(program: &str, target: Target, args: &[String]) -> Result<Com
                 line.push(' ');
                 line.push_str(&cmd_quote(a));
             }
-            let mut c = cmd_exe(&line);
+            let mut c = cmd_exe(&line)?;
             prepare(&mut c);
             apply_python_fast(&mut c);
             apply_child_defaults(&mut c, npmish);
@@ -728,6 +732,18 @@ fn msys_quote(a: &str) -> Option<String> {
 /// `cmd.exe` folds a line over ~8 KiB into "The command line is too long."
 const CMD_LINE_CAP: usize = 8_000;
 
+/// Every line cmd.exe gets passes here: past its limit the rest of the line, arguments included, is lost.
+fn cmd_fits(line: &str) -> Result<(), String> {
+    let n = line.encode_utf16().count();
+    if n > CMD_LINE_CAP {
+        return Err(format!(
+            "command line is {n} characters; cmd.exe stops near {CMD_LINE_CAP}. \
+             Put the long text in a file and pass its path, or call a real executable with `program` + `args`"
+        ));
+    }
+    Ok(())
+}
+
 /// Git Bash eats the `\` of an unquoted Windows path: `rm -rf .\cache` deletes `.cache`,
 /// `cat C:\a\b` opens `C:ab`, `rm out\*` removes nothing. Turn the `\` of a path-shaped
 /// word (`X:\..`, `.\..`, `..\..`, `name\name`, `dir\*`) into `/` before the line reaches bash.
@@ -831,18 +847,7 @@ pub fn build_shell(command: &str, shell: &str) -> Result<Command, String> {
 
 /// `build_shell` for a command that will run in `cwd` (None: qx's own folder).
 pub fn build_shell_in(command: &str, shell: &str, cwd: Option<&Path>) -> Result<Command, String> {
-    let shell = shell.trim().to_ascii_lowercase();
-    let shell = shell.strip_suffix(".exe").unwrap_or(&shell);
-    // Names models use for the shells qx has: anything unknown means "decide for me".
-    let shell = match shell {
-        "pwsh" | "powershell" | "ps" | "ps1" => "powershell",
-        "sh" | "bash" | "zsh" => "bash",
-        "cmd" => "cmd",
-        "none" => "none",
-        _ => "auto",
-    };
-    let choice = if shell == "auto" { pick_shell(command) } else { shell };
-    match choice {
+    match shell_for(command, shell) {
         "bash" => {
             // `ls | head` has no cmd.exe equivalent: bash is the only shell that runs it.
             let b = resolve::git_bash().ok_or_else(|| {
@@ -861,14 +866,7 @@ pub fn build_shell_in(command: &str, shell: &str, cwd: Option<&Path>) -> Result<
             if command.trim_end().contains('\n') {
                 return Err("cmd.exe runs only the first line of a multi-line command; use shell=powershell or one line".to_string());
             }
-            if command.len() > CMD_LINE_CAP {
-                return Err(format!(
-                    "command line is {} characters; cmd.exe stops near {CMD_LINE_CAP}. \
-                     Pass `program` + `args` instead of one long line",
-                    command.len()
-                ));
-            }
-            let mut c = cmd_exe(command);
+            let mut c = cmd_exe(command)?;
             prepare(&mut c);
             apply_python_fast(&mut c);
             apply_child_defaults(&mut c, false);
@@ -878,13 +876,14 @@ pub fn build_shell_in(command: &str, shell: &str, cwd: Option<&Path>) -> Result<
             // The prelude keeps piped output UTF-8 and drops progress-bar noise.
             // Own line, so parse errors point at the command, not the prelude.
             // -Command folds a failing native exit code to 1; hand the real one back. Only when
-            // the last statement failed: `git diff --quiet; echo done` succeeds, as cold.
+            // the last statement failed: `git diff --quiet; echo done` succeeds, as cold. And only
+            // when no PowerShell error came after it: `cmd /c exit 7; Get-Item missing` is the cmdlet's 1.
             Ok(powershell(format!(
-                "$ProgressPreference='SilentlyContinue';try{{[Console]::OutputEncoding=[Text.Encoding]::UTF8}}catch{{}}\n{command}\n$qxok=$?;if(!$qxok){{if($LASTEXITCODE){{exit $LASTEXITCODE}};exit 1}}"
+                "$ProgressPreference='SilentlyContinue';try{{[Console]::OutputEncoding=[Text.Encoding]::UTF8}}catch{{}};$qxe=$Error.Count\n{command}\n$qxok=$?;if(!$qxok){{if($LASTEXITCODE -and $Error.Count -eq $qxe){{exit $LASTEXITCODE}};exit 1}}"
             )))
         }
-        "none" => Err("shell=none needs program+args".to_string()),
-        other => Err(format!("unknown shell: {other}")),
+        // `shell_for` names nothing else.
+        _ => Err("shell=none needs program+args".to_string()),
     }
 }
 
@@ -906,7 +905,8 @@ fn powershell(script: String) -> Command {
 /// quoting turns inner quotes into `\"`, which cmd hands to node/python as literal backslashes.
 /// `/s` plus the outer quotes make cmd strip exactly that outer pair, so a quoted
 /// `"C:\Program Files\x.exe" "a b"` survives.
-fn cmd_exe(line: &str) -> Command {
+fn cmd_exe(line: &str) -> Result<Command, String> {
+    cmd_fits(line)?;
     let mut c = Command::new("cmd.exe");
     #[cfg(windows)]
     {
@@ -915,7 +915,20 @@ fn cmd_exe(line: &str) -> Command {
     }
     #[cfg(not(windows))]
     c.args(["/d", "/s", "/c", line]);
-    c
+    Ok(c)
+}
+
+/// The shell a `command` runs in when the caller asks for `shell`: the names models use map to
+/// the shells qx has, and anything else means "decide for me" (`pick_shell`).
+pub(crate) fn shell_for(command: &str, shell: &str) -> &'static str {
+    let shell = shell.trim().to_ascii_lowercase();
+    match shell.strip_suffix(".exe").unwrap_or(&shell) {
+        "pwsh" | "powershell" | "ps" | "ps1" => "powershell",
+        "sh" | "bash" | "zsh" => "bash",
+        "cmd" => "cmd",
+        "none" => "none",
+        _ => pick_shell(command),
+    }
 }
 
 /// `auto` picks the shell that can parse the line: PowerShell syntax, else a POSIX
@@ -1152,6 +1165,8 @@ pub(crate) struct Capture {
     /// Set by `snapshot`: a daemon still writing to the pipe is drained and discarded, so it
     /// cannot grow a hidden buffer after the call has returned.
     closed: std::sync::atomic::AtomicBool,
+    /// Set by `release_reader`: the reader ends before its next read instead of starting one.
+    stop: std::sync::atomic::AtomicBool,
 }
 
 /// The first bytes up to the head budget, then a ring of the newest ones: a huge log's final error
@@ -1163,14 +1178,17 @@ struct Buf {
     dropped: usize,
 }
 
+/// Read `r` on a thread of its own. The receiver gets `r` back when the reading ends, so the pipe
+/// stays open until the caller drops it (or hands it on, see `release_reader`).
 fn capture_from_cap<R: Read + Send + 'static>(
     mut r: R,
     cap: usize,
-) -> (std::sync::Arc<Capture>, mpsc::Receiver<()>) {
+) -> (std::sync::Arc<Capture>, mpsc::Receiver<R>) {
     let sink = std::sync::Arc::new(Capture {
         data: std::sync::Mutex::new(Buf::default()),
         truncated: std::sync::atomic::AtomicBool::new(false),
         closed: std::sync::atomic::AtomicBool::new(false),
+        stop: std::sync::atomic::AtomicBool::new(false),
     });
     let shared = sink.clone();
     let (tx, rx) = mpsc::channel();
@@ -1179,6 +1197,9 @@ fn capture_from_cap<R: Read + Send + 'static>(
     std::thread::spawn(move || {
         let mut chunk = [0u8; 64 * 1024];
         loop {
+            if shared.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
             match r.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -1204,7 +1225,7 @@ fn capture_from_cap<R: Read + Send + 'static>(
                 Err(_) => break,
             }
         }
-        let _ = tx.send(());
+        let _ = tx.send(r);
     });
     (sink, rx)
 }
@@ -1270,7 +1291,7 @@ fn cut_note(stream: &str) -> String {
 }
 
 fn snapshot(c: &Capture) -> (Vec<u8>, bool) {
-    let mut data = match c.data.lock() {
+    let data = match c.data.lock() {
         Ok(mut b) => {
             c.closed.store(true, std::sync::atomic::Ordering::Relaxed);
             let mut head = std::mem::take(&mut b.head);
@@ -1299,7 +1320,6 @@ fn snapshot(c: &Capture) -> (Vec<u8>, bool) {
         }
         Err(_) => Vec::new(),
     };
-    data.shrink_to_fit();
     (
         data,
         c.truncated.load(std::sync::atomic::Ordering::Relaxed),
@@ -1716,8 +1736,15 @@ fn collect(
     timeout: Option<Duration>,
     start: Instant,
 ) -> std::io::Result<Outcome> {
-    let (out_sink, out_done) = capture_from_cap(child.stdout.take().expect("stdout piped"), CAPTURE_CAP);
-    let (err_sink, err_done) = capture_from_cap(child.stderr.take().expect("stderr piped"), CAPTURE_CAP);
+    let out = child.stdout.take().expect("stdout piped");
+    let err = child.stderr.take().expect("stderr piped");
+    #[cfg(windows)]
+    let pipes = {
+        use std::os::windows::io::AsRawHandle;
+        (out.as_raw_handle(), err.as_raw_handle())
+    };
+    let (out_sink, out_done) = capture_from_cap(out, CAPTURE_CAP);
+    let (err_sink, err_done) = capture_from_cap(err, CAPTURE_CAP);
     PROGRESS_SLOT.with(|p| {
         if let Some(slot) = p.borrow().as_ref() {
             *slot.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -1731,8 +1758,19 @@ fn collect(
     // Grandchildren can hold the pipe open; don't block forever, but keep any
     // partial output the readers already captured.
     let drain = Instant::now() + Duration::from_millis(250);
-    let _ = out_done.recv_timeout(drain.saturating_duration_since(Instant::now()));
-    let _ = err_done.recv_timeout(drain.saturating_duration_since(Instant::now()));
+    let out_end = out_done.recv_timeout(drain.saturating_duration_since(Instant::now()));
+    let err_end = err_done.recv_timeout(drain.saturating_duration_since(Instant::now()));
+    // A reader still waiting would hold its thread for as long as the daemon lives.
+    #[cfg(windows)]
+    {
+        if matches!(out_end, Err(mpsc::RecvTimeoutError::Timeout)) {
+            release_reader(&out_sink, &out_done, pipes.0);
+        }
+        if matches!(err_end, Err(mpsc::RecvTimeoutError::Timeout)) {
+            release_reader(&err_sink, &err_done, pipes.1);
+        }
+    }
+    drop((out_end, err_end)); // the pipes whose readers finished close here
     let (so, so_cut) = snapshot(&out_sink);
     let (se, se_cut) = snapshot(&err_sink);
 
@@ -1753,6 +1791,104 @@ fn collect(
         timed_out,
         cut: so_cut || se_cut,
     })
+}
+
+/// Free a reader that a background descendant (`start /b server`) keeps waiting on a pipe it
+/// holds open: the thread ends, and the pipe goes to the shared drainer, so the daemon can still
+/// write to it.
+#[cfg(windows)]
+fn release_reader<P: orphans::Pipe + 'static>(c: &Capture, done: &mpsc::Receiver<P>, pipe: std::os::windows::io::RawHandle) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CancelIoEx(file: *mut std::ffi::c_void, overlapped: *mut std::ffi::c_void) -> i32;
+    }
+    c.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    // A read the reader starts between two cancels is caught by the next one.
+    for _ in 0..40 {
+        // SAFETY: the reader owns the pipe until it sends it back, and a sent one waits in `done`,
+        // so the handle is open. A null OVERLAPPED cancels every read on it.
+        unsafe { CancelIoEx(pipe, std::ptr::null_mut()) };
+        match done.recv_timeout(Duration::from_millis(5)) {
+            Ok(p) => {
+                orphans::adopt(Box::new(p));
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+/// Pipes a background descendant still holds after its command returned. One thread drains them
+/// all and throws the bytes away: the daemon neither blocks on a full pipe nor fails on a closed
+/// one. The thread ends with the last pipe; the next orphan starts a new one.
+#[cfg(windows)]
+mod orphans {
+    use std::ffi::c_void;
+    use std::io::Read;
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn PeekNamedPipe(pipe: *mut c_void, buf: *mut c_void, size: u32, read: *mut u32, avail: *mut u32, left: *mut u32) -> i32;
+    }
+
+    pub trait Pipe: Read + AsRawHandle + Send {}
+    impl<T: Read + AsRawHandle + Send> Pipe for T {}
+
+    /// The pipes, and whether a thread is draining them.
+    static ORPHANS: Mutex<(Vec<Box<dyn Pipe>>, bool)> = Mutex::new((Vec::new(), false));
+
+    pub fn adopt(pipe: Box<dyn Pipe>) {
+        let mut o = ORPHANS.lock().unwrap_or_else(|e| e.into_inner());
+        o.0.push(pipe);
+        if !o.1 {
+            o.1 = std::thread::Builder::new().name("qx-orphans".into()).spawn(drain).is_ok();
+        }
+    }
+
+    fn drain() {
+        const QUICK: Duration = Duration::from_millis(10);
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut nap = QUICK;
+        loop {
+            let mut pipes = {
+                let mut o = ORPHANS.lock().unwrap_or_else(|e| e.into_inner());
+                if o.0.is_empty() {
+                    o.1 = false;
+                    return;
+                }
+                std::mem::take(&mut o.0)
+            };
+            let mut got = false;
+            pipes.retain_mut(|p| {
+                let mut avail = 0u32;
+                let null: *mut c_void = std::ptr::null_mut();
+                // SAFETY: `p` owns an open pipe handle; only `avail` is written.
+                let open = unsafe { PeekNamedPipe(p.as_raw_handle(), null, 0, null.cast(), &mut avail, null.cast()) } != 0;
+                if !open || avail == 0 {
+                    return open; // a failed peek: every writer is gone
+                }
+                got = true;
+                // Only what is already there, so the read cannot wait on a quiet daemon.
+                let n = buf.len().min(avail as usize);
+                matches!(p.read(&mut buf[..n]), Ok(k) if k > 0)
+            });
+            ORPHANS.lock().unwrap_or_else(|e| e.into_inner()).0.append(&mut pipes);
+            // A quiet daemon is polled less often.
+            nap = if got { QUICK } else { (nap * 2).min(Duration::from_millis(250)) };
+            std::thread::sleep(nap);
+        }
+    }
+
+    /// No pipe is waiting and no thread is draining.
+    #[cfg(test)]
+    pub fn idle() -> bool {
+        let o = ORPHANS.lock().unwrap_or_else(|e| e.into_inner());
+        o.0.is_empty() && !o.1
+    }
 }
 
 /// One powershell.exe already past its startup (0.3 s idle, seconds on a busy machine), parked
@@ -2134,7 +2270,7 @@ fn chain_starts(s: &str) -> Vec<&str> {
 }
 
 /// `NAME=value` as the first word of a command: a POSIX assignment prefix.
-fn assignment_word(w: &str) -> bool {
+pub(crate) fn assignment_word(w: &str) -> bool {
     w.split_once('=').is_some_and(|(n, _)| {
         !n.is_empty()
             && !n.starts_with(|c: char| c.is_ascii_digit())
@@ -2682,8 +2818,17 @@ mod tests {
     fn a_cmd_shim_refuses_a_newline_in_an_argument() {
         let shim = Target::Shim(PathBuf::from("x.cmd"));
         let args = ["line1\nline2".to_string(), "--dry-run".to_string()];
-        let err = command_for("x.cmd", shim, &args).expect_err("must refuse, cmd.exe would cut the line");
+        let err = command_for("x.cmd", shim, &args, &[]).expect_err("must refuse, cmd.exe would cut the line");
         assert!(err.contains("newline"), "{err}");
+    }
+
+    #[test]
+    fn every_cmd_route_refuses_a_line_cmd_would_cut() {
+        let long = "x".repeat(9000);
+        let shim = Target::Shim(PathBuf::from("x.cmd"));
+        assert!(command_for("x.cmd", shim, std::slice::from_ref(&long), &[]).is_err(), ".cmd shim");
+        assert!(build_command("cmd", &["/c".to_string(), format!("echo {long}")]).is_err(), "cmd /c");
+        assert!(build_command("dir", &["/b".to_string(), long]).is_err(), "cmd internal");
     }
 
     #[test]
@@ -2840,6 +2985,8 @@ mod tests {
             ("Write-Output ok", 0),
             // A native failure earlier in the script is not the script's status.
             ("cmd /c exit 7; Write-Output ok", 0),
+            // Nor is it once a cmdlet failed after it.
+            ("cmd /c exit 7; Get-Item C:\\qx-no-such-zz", 1),
         ] {
             let o = run_captured(build_shell(cmd, "powershell").unwrap(), Some(Duration::from_secs(60))).unwrap();
             assert_eq!(o.code, want, "{cmd}");
@@ -2912,6 +3059,34 @@ mod tests {
         let o = run_captured(build_shell("start /b ping -n 6 127.0.0.1", "cmd").unwrap(), Some(Duration::from_secs(30))).unwrap();
         assert_eq!(o.code, 0);
         assert!(t.elapsed() < Duration::from_secs(4), "waited {:?} for the background ping", t.elapsed());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_background_child_holding_the_pipes_keeps_no_reader_thread() {
+        let slot = ProgressSlot::default();
+        set_progress_slot(Some(slot.clone()));
+        let t = Instant::now();
+        let o = run_captured(build_shell("start /b ping -n 6 127.0.0.1 & echo x", "cmd").unwrap(), Some(Duration::from_secs(30)));
+        set_progress_slot(None);
+        let o = o.unwrap();
+        assert_eq!(o.code, 0, "stderr: {}", o.stderr);
+        assert!(o.stdout.lines().any(|l| l.trim() == "x"), "stdout: {}", o.stdout);
+        assert!(t.elapsed() < Duration::from_secs(3), "waited {:?} for the background ping", t.elapsed());
+        // A live reader thread holds one more reference to its capture.
+        let p = slot.lock().unwrap().take().expect("collect publishes its progress");
+        let readers = || std::sync::Arc::strong_count(&p.out) + std::sync::Arc::strong_count(&p.err) - 2;
+        let t = Instant::now();
+        while readers() > 0 && t.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(readers(), 0, "a reader thread is still blocked on the ping's pipe");
+        // The drainer keeps the pipes open for ping, and ends once ping has exited.
+        let t = Instant::now();
+        while !orphans::idle() && t.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(orphans::idle(), "the drainer thread outlived its last pipe");
     }
 
     #[test]

@@ -46,28 +46,13 @@ fn prime_tools() {
         };
         let mut cmd = std::process::Command::new(&exe);
         cmd.args(&prefix).arg("--version");
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
-        if let Ok(mut child) = cmd.spawn() {
-            let end = std::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                match child.try_wait() {
-                    Ok(None) if std::time::Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
-                    Ok(None) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                    _ => break,
-                }
-            }
-        }
+        // Job-backed: a tool that hangs past the limit is killed together with everything it started.
+        let _ = crate::exec::run_captured(cmd, Some(Duration::from_secs(5)));
     }
 }
 
@@ -103,7 +88,7 @@ mod os {
 
     /// Full speed while idle: Windows otherwise puts a quiet background process in its efficiency
     /// mode (slower clocks, coarse timers) and trims its pages, and the next call pays for the wake-up.
-    pub fn boost_process() {
+    pub(super) fn boost_process() {
         const PROCESS_POWER_THROTTLING: i32 = 4;
         const EXECUTION_SPEED: u32 = 0x1;
         const IGNORE_TIMER_RESOLUTION: u32 = 0x4;
@@ -126,7 +111,7 @@ mod os {
         }
     }
 
-    pub fn lower_this_thread() {
+    pub(super) fn lower_this_thread() {
         const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
         unsafe {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);

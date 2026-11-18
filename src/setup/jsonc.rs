@@ -571,38 +571,10 @@ fn last_significant(bytes: &[u8]) -> Option<(usize, u8)> {
 }
 
 fn string_value(text: &str, i: &mut usize) -> Result<String, String> {
-    let b = text.as_bytes();
-    if b.get(*i) != Some(&b'"') {
-        return Err("expected a string".into());
-    }
-    *i += 1;
-    let mut out = String::new();
-    while let Some(&c) = b.get(*i) {
-        match c {
-            b'"' => {
-                *i += 1;
-                return Ok(out);
-            }
-            b'\\' => {
-                let escaped = *b.get(*i + 1).ok_or("unterminated escape")?;
-                out.push(match escaped {
-                    b'n' => '\n',
-                    b't' => '\t',
-                    b'r' => '\r',
-                    b'"' => '"',
-                    b'\\' => '\\',
-                    b'/' => '/',
-                    other => other as char,
-                });
-                *i += 2;
-            }
-            other => {
-                out.push(other as char);
-                *i += 1;
-            }
-        }
-    }
-    Err("unterminated string".into())
+    let start = *i;
+    string_bytes(text.as_bytes(), i)?;
+    // `"q\u0078"` is `qx`: decode the token the way JSON does.
+    serde_json::from_str(&text[start..*i]).map_err(|e| format!("bad string: {e}"))
 }
 
 fn value(b: &[u8], i: &mut usize) -> Result<(), String> {
@@ -707,6 +679,12 @@ fn string_bytes(b: &[u8], i: &mut usize) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn escaped_member_names_match_their_decoded_text() {
+        let src = "{\"mcpServers\": {\"q\\u0078\": {\"command\": \"old\"}}}";
+        assert!(member(src, &["mcpServers", "qx"]).unwrap().is_some());
+    }
 
     #[test]
     fn set_member_preserves_unrelated_bytes() {

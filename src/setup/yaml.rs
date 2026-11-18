@@ -77,7 +77,9 @@ pub fn edit_dsh(text: Option<&str>, exe: &Path, a: Action) -> Edit {
     };
     // An item spelled some other way (flow mapping, quoted id) is not ours to rewrite:
     // appending a second mcp-qx registration would give dsh two qx servers.
-    if block.is_none() && text.is_some_and(|t| t.contains("mcp-qx")) {
+    // A comment that mentions it is not an item.
+    let mentions = |t: &str| t.lines().any(|l| !l.trim_start().starts_with('#') && l.split(" #").next().unwrap_or("").contains("mcp-qx"));
+    if block.is_none() && text.is_some_and(mentions) {
         return Edit::Refuse(refusal_dsh(
             exe,
             "this file already has an mcp-qx item in a shape qx does not rewrite",
@@ -227,6 +229,23 @@ fn verdict(out: String, original: Option<&str>) -> Edit {
 }
 
 pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
+    // A BOM is not part of the first line: set it aside and put it back on what is written.
+    match text.and_then(|t| t.strip_prefix('\u{feff}')) {
+        Some(body) => match edit_hermes_body(Some(body), exe, a) {
+            Edit::Changed(out) if !out.is_empty() => Edit::Changed(format!("\u{feff}{out}")),
+            other => other,
+        },
+        None => edit_hermes_body(text, exe, a),
+    }
+}
+
+/// `'qx':` or `"qx":`, with or without a value after the colon.
+fn quoted_qx_key(line: &str) -> bool {
+    let t = line.trim();
+    ["'qx'", "\"qx\""].iter().any(|k| t.strip_prefix(k).is_some_and(|r| r.trim_start().starts_with(':')))
+}
+
+fn edit_hermes_body(text: Option<&str>, exe: &Path, a: Action) -> Edit {
     let source = text.unwrap_or("");
     if has_tab_indent(source) {
         return Edit::Refuse(refusal_hermes(exe, "config.yaml uses tab indentation"));
@@ -268,9 +287,12 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
         .filter(|i| *i > 0)
         .min()
         .unwrap_or(2);
-    let qx = (servers + 1..end).find(|i| {
-        indent_of(lines[*i].as_str()) == child_indent && lines[*i].trim().starts_with("qx:")
-    });
+    let at_child = |i: &usize| indent_of(lines[*i].as_str()) == child_indent;
+    let qx = (servers + 1..end).find(|i| at_child(i) && lines[*i].trim().starts_with("qx:"));
+    // `'qx':` and `"qx":` name the same server; qx does not rewrite those spellings.
+    if qx.is_none() && (servers + 1..end).any(|i| at_child(&i) && quoted_qx_key(&lines[i])) {
+        return Edit::Refuse(refusal_hermes(exe, "the qx server key is quoted"));
+    }
     match (qx, a) {
         (None, Action::Remove) => Edit::Unchanged,
         (None, Action::Install) => {
@@ -410,7 +432,7 @@ fn kept(lines: &[String], start: usize, end: usize) -> Kept {
 }
 
 pub fn hermes_command(text: &str) -> Option<String> {
-    let lines: Vec<&str> = text.lines().collect();
+    let lines: Vec<&str> = text.trim_start_matches('\u{feff}').lines().collect();
     let (servers, end) = top_child(&lines, "mcp_servers")?;
     let child_indent = (servers + 1..end)
         .filter(|i| !is_noise(lines[*i]))
@@ -424,15 +446,29 @@ pub fn hermes_command(text: &str) -> Option<String> {
     (qx..qend).find_map(|i| yaml_scalar(lines[i], "command"))
 }
 
-/// The value of a `key: value` line, single quotes stripped.
+/// The value of a `key: value` line, single quotes stripped, a trailing ` # comment` dropped.
 fn yaml_scalar(line: &str, key: &str) -> Option<String> {
     let t = line.trim();
     let rest = t.strip_prefix(&format!("{key}:"))?.trim();
-    let quoted = rest.starts_with('\'');
-    let rest = rest.strip_prefix('\'').unwrap_or(rest);
-    let rest = rest.strip_suffix('\'').unwrap_or(rest);
-    // Inside a single-quoted scalar a doubled quote is one quote.
-    (!rest.is_empty()).then(|| if quoted { rest.replace("''", "'") } else { rest.to_string() })
+    let value = match rest.strip_prefix('\'') {
+        // Inside a single-quoted scalar a doubled quote is one quote; the first lone one ends it.
+        Some(body) => {
+            let mut out = String::new();
+            let mut chars = body.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\'' {
+                    if chars.peek() != Some(&'\'') {
+                        break;
+                    }
+                    chars.next();
+                }
+                out.push(c);
+            }
+            out
+        }
+        None => after_key(rest, ""),
+    };
+    (!value.is_empty()).then_some(value)
 }
 
 fn finish(lines: Vec<String>, trailing_newline: bool, eol: &str) -> String {
@@ -489,7 +525,7 @@ pub fn prune_dsh_binaries(dsh_home: &Path) -> Vec<String> {
 }
 
 /// `qx.exe`, or `qx` + a separator + a hex build id (`qx-1a2b3c4d5e6f.exe`): not `qxl-viewer.exe`, `qx-lint.exe`.
-fn is_qx_build(lower_name: &str) -> bool {
+pub(crate) fn is_qx_build(lower_name: &str) -> bool {
     let Some(stem) = lower_name.strip_suffix(".exe") else { return false };
     stem == "qx"
         || stem.strip_prefix("qx").and_then(|r| r.strip_prefix(|c: char| !c.is_ascii_alphanumeric())).is_some_and(|id| {
@@ -789,5 +825,37 @@ mod tests {
         assert_eq!(qx_indent(&out), vec![4], "{out}");
         assert_eq!(hermes_command(&out).as_deref(), Some(r"C:\q\qx.exe"));
         assert_eq!(hermes_command(src).as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn hermes_bom_does_not_add_a_second_servers_key() {
+        let exe = Path::new(r"C:\q\qx.exe");
+        let src = "\u{feff}mcp_servers:\n  other:\n    command: o\n";
+        let out = changed(edit_hermes(Some(src), exe, Action::Install));
+        assert!(out.starts_with(src), "{out}");
+        assert_eq!(out.matches("mcp_servers:").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn hermes_quoted_qx_key_is_refused() {
+        let exe = Path::new(r"C:\q\qx.exe");
+        let src = "mcp_servers:\n  'qx':\n    command: old\n";
+        assert!(matches!(edit_hermes(Some(src), exe, Action::Install), Edit::Refuse(_)));
+    }
+
+    #[test]
+    fn yaml_command_drops_a_trailing_comment() {
+        assert_eq!(yaml_scalar("  command: 'C:\\qx.exe' # canonical", "command").as_deref(), Some("C:\\qx.exe"));
+        assert_eq!(yaml_scalar("  command: 'it''s' # c", "command").as_deref(), Some("it's"));
+        assert_eq!(yaml_scalar("  command: C:/qx.exe # c", "command").as_deref(), Some("C:/qx.exe"));
+    }
+
+    #[test]
+    fn dsh_comment_mentioning_mcp_qx_is_not_an_item() {
+        let exe = Path::new(r"C:\q\qx.exe");
+        let src = "# old mcp-qx entry removed\n";
+        assert!(matches!(edit_dsh(Some(src), exe, Action::Remove), Edit::Unchanged));
+        let out = changed(edit_dsh(Some(src), exe, Action::Install));
+        assert!(out.starts_with(src), "{out}");
     }
 }

@@ -56,8 +56,14 @@ pub fn resolve(program: &str, cwd: Option<&Path>) -> Target {
     }
     let found = match find_on_path(program) {
         Some(p) => classify(p),
-        // Git for Windows ships the coreutils the built-ins only partly cover.
-        None => git_coreutil(program).map_or(Target::Missing, classify),
+        None => {
+            // Found only beside the call's folder: that answer belongs to the folder, so it is not cached.
+            if let Some(p) = beside_cwd(program, path_dirs(), cwd) {
+                return classify(p);
+            }
+            // Git for Windows ships the coreutils the built-ins only partly cover.
+            git_coreutil(program).map_or(Target::Missing, classify)
+        }
     };
     if !matches!(found, Target::Missing) {
         if let Ok(mut guard) = cache().lock() {
@@ -98,9 +104,23 @@ fn resolve_path(program: &str, cwd: Option<&Path>) -> Target {
     Target::Missing
 }
 
+/// The absolute PATH entries only: a relative one means a different folder for every call's cwd.
 pub fn find_on_path(name: &str) -> Option<PathBuf> {
     let exts = pathext();
-    path_dirs().iter().find_map(|dir| find_in_dir(dir, name, &exts))
+    path_dirs().iter().filter(|d| d.is_absolute()).find_map(|dir| find_in_dir(dir, name, &exts))
+}
+
+/// What cmd.exe also searches: the call's folder, then PATH's relative entries joined onto it.
+/// Tried only after the absolute entries miss, so a file dropped in a project never shadows a real tool.
+fn beside_cwd(program: &str, dirs: &[PathBuf], cwd: Option<&Path>) -> Option<PathBuf> {
+    let base = match cwd {
+        Some(c) => c.to_path_buf(),
+        None => std::env::current_dir().ok()?,
+    };
+    let exts = pathext();
+    std::iter::once(base.clone())
+        .chain(dirs.iter().filter(|d| d.is_relative()).map(|d| base.join(d)))
+        .find_map(|d| find_in_dir(&d, program, &exts))
 }
 
 /// The coreutils Git for Windows ships in `usr\bin`. A built-in that declines its
@@ -130,6 +150,20 @@ pub fn resolve_in(program: &str, first: &[PathBuf], cwd: Option<&Path>) -> Targe
         }
     }
     resolve(program, cwd)
+}
+
+/// `PATH=<dirs> tool`: the child's PATH replaces the inherited one, so only `dirs` (and the
+/// call's folder) can hold the program. Never cached: `dirs` belongs to this one call.
+pub fn resolve_only(program: &str, dirs: &[PathBuf], cwd: Option<&Path>) -> Target {
+    if program.contains(['\\', '/']) || Path::new(program).is_absolute() {
+        return resolve_path(program, cwd);
+    }
+    let exts = pathext();
+    dirs.iter()
+        .filter(|d| d.is_absolute())
+        .find_map(|d| find_in_dir(d, program, &exts))
+        .or_else(|| beside_cwd(program, dirs, cwd))
+        .map_or(Target::Missing, classify)
 }
 
 /// `<Git>\usr\bin\<name>.exe`, for a name in `COREUTILS` only.
@@ -206,27 +240,29 @@ fn find_in_dir(dir: &Path, name: &str, exts: &[String]) -> Option<PathBuf> {
 }
 
 fn stat_dir(dir: &Path, name: &str, exts: &[String]) -> Option<PathBuf> {
-    // Try real Windows executables first. Node ships an extensionless `npm`
-    // shell script next to npm.cmd; the extensionless file is not runnable.
+    // A name that already carries a runnable extension means that file, not `tool.exe.com`.
+    if runnable_bare(Path::new(name), exts) {
+        let direct = dir.join(name);
+        if direct.is_file() {
+            return Some(direct);
+        }
+    }
+    // Then real Windows executables. Node ships an extensionless `npm` shell script next to
+    // npm.cmd; the extensionless file is not runnable.
     for ext in exts {
         let candidate = dir.join(format!("{name}{ext}"));
         if candidate.is_file() {
             return Some(candidate);
         }
     }
-    let direct = dir.join(name);
-    if direct.is_file() && runnable_bare(&direct, exts) {
-        return Some(direct);
-    }
     None
 }
 
 /// A name that already carries its extension (`npm.cmd`) counts only when that is a real `.exe`/`.com`,
-/// or a `.cmd`/`.bat` PATHEXT lists. An extensionless `npm` shell script, or `notes.txt`, is no program.
+/// a `.ps1`, or a `.cmd`/`.bat` PATHEXT lists. An extensionless `npm` shell script, or `notes.txt`, is no program.
 fn runnable_bare(p: &Path, exts: &[String]) -> bool {
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    ext == "exe"
-        || ext == "com"
+    matches!(ext.as_str(), "exe" | "com" | "ps1")
         || (matches!(ext.as_str(), "cmd" | "bat") && exts.iter().any(|e| e.trim_start_matches('.') == ext))
 }
 
@@ -237,16 +273,18 @@ fn pick_listed(dir: &Path, name: &str, exts: &[String], entries: &[(String, bool
         let want = file.to_ascii_lowercase();
         entries.iter().any(|(n, reparse)| *n == want && (!*reparse || candidate.is_file()))
     };
+    if runnable_bare(Path::new(name), exts) {
+        let direct = dir.join(name);
+        if listed(name, &direct) {
+            return Some(direct);
+        }
+    }
     for ext in exts {
         let file = format!("{name}{ext}");
         let candidate = dir.join(&file);
         if listed(&file, &candidate) {
             return Some(candidate);
         }
-    }
-    let direct = dir.join(name);
-    if runnable_bare(&direct, exts) && listed(name, &direct) {
-        return Some(direct);
     }
     None
 }
@@ -326,23 +364,16 @@ fn list_prefix(dir: &Path, name: &str) -> Result<Vec<(String, bool)>, ()> {
 
 /// PATH entries, deduplicated case-insensitively and with the malformed tail
 /// produced when an oversized environment block is truncated removed.
-pub fn path_dirs() -> Vec<PathBuf> {
+pub fn path_dirs() -> &'static [PathBuf] {
     // PATH is read once per process: nothing in qx edits its own environment (children get a copy).
     static DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
-    DIRS.get_or_init(compute_path_dirs).clone()
+    DIRS.get_or_init(|| split_path_dirs(&std::env::var_os("PATH").unwrap_or_default().to_string_lossy()))
 }
 
-fn compute_path_dirs() -> Vec<PathBuf> {
-    let raw = std::env::var_os("PATH").unwrap_or_default();
-    let raw = raw.to_string_lossy();
-    let cut = raw
-        .to_ascii_lowercase()
-        .find("pathext=")
-        .map(|i| &raw[..i])
-        .unwrap_or(&raw);
+fn split_path_dirs(raw: &str) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for dir in std::env::split_paths(cut) {
+    for dir in std::env::split_paths(raw) {
         if dir.as_os_str().is_empty() {
             continue;
         }
@@ -350,6 +381,11 @@ fn compute_path_dirs() -> Vec<PathBuf> {
             .to_string_lossy()
             .trim_end_matches(['\\', '/'])
             .to_ascii_lowercase();
+        // The truncated block runs on into the next variable: an entry that starts `PATHEXT=`
+        // ends PATH. A folder such as `C:\tools\pathext=x` is still a folder.
+        if key.starts_with("pathext=") {
+            break;
+        }
         if seen.insert(key) {
             out.push(dir);
         }
@@ -408,7 +444,7 @@ pub fn rustup_direct(
     // `RUSTUP_TOOLCHAIN=nightly cargo build`: the proxy honours the variable, the real binary does not.
     if envs
         .iter()
-        .any(|(k, _)| ["RUSTUP_TOOLCHAIN", "RUSTUP_HOME", "CARGO_HOME"].iter().any(|n| k.eq_ignore_ascii_case(n)))
+        .any(|(k, _)| ["RUSTUP_TOOLCHAIN", "RUSTUP_HOME", "CARGO_HOME", "PATH"].iter().any(|n| k.eq_ignore_ascii_case(n)))
     {
         return None;
     }
@@ -487,13 +523,17 @@ fn cargo_home() -> Option<PathBuf> {
 }
 
 fn is_rustup_proxy(exe: &Path) -> bool {
-    let Some(bin) = cargo_home().map(|h| h.join("bin")) else {
-        return false;
-    };
-    if exe.parent().map(norm_path) != Some(norm_path(&bin)) {
+    cargo_home().is_some_and(|h| proxy_of(exe, &h.join("bin")))
+}
+
+/// rustup installs each proxy as a hard link (or copy) of `rustup.exe` in `bin`. A custom
+/// `cargo.exe` dropped in the same folder is a different program, and its size gives it away.
+fn proxy_of(exe: &Path, bin: &Path) -> bool {
+    if exe.parent().map(norm_path) != Some(norm_path(bin)) {
         return false;
     }
-    bin.join("rustup.exe").is_file()
+    let len = |p: &Path| std::fs::metadata(p).ok().filter(|m| m.is_file()).map(|m| m.len());
+    len(&bin.join("rustup.exe")).is_some_and(|r| len(exe) == Some(r))
 }
 
 fn has_toolchain_file(cwd: &Path) -> bool {
@@ -518,8 +558,8 @@ fn parse_settings(text: &str) -> RustupSettings {
     let mut overrides = Vec::new();
     let mut in_overrides = false;
     for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        let line = crate::setup::toml::strip_comment(line).trim();
+        if line.is_empty() {
             continue;
         }
         if line.starts_with('[') {
@@ -659,6 +699,13 @@ fn node_target(shim: &Path) -> Option<Target> {
     ];
 
     let scripts = mappings.iter().find(|(n, _)| *n == stem).map(|(_, s)| *s)?;
+    // Only a shim npm or cmd-shim wrote, launching the script mapped here: a hand-made
+    // `npm.cmd`/`tsc.cmd` wrapper has logic (or a different script) that must keep running.
+    let text = std::fs::read_to_string(shim).ok()?;
+    if !(plain_shim(&text) || text.trim_start().starts_with(":: Created by npm, please don't edit manually.")) {
+        return None;
+    }
+    let launches = text.to_ascii_lowercase().replace('/', "\\");
 
     let node = if dir.join("node.exe").is_file() {
         dir.join("node.exe")
@@ -674,7 +721,7 @@ fn node_target(shim: &Path) -> Option<Target> {
 
     for rel in scripts {
         let bundled = dir.join(rel.replace('/', "\\"));
-        if bundled.is_file() {
+        if bundled.is_file() && launches.contains(&rel.replace('/', "\\")) {
             let script = if prefer_global {
                 pick_npm_script(bundled, prefix.as_deref(), rel)
             } else {
@@ -888,6 +935,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn settings_value_drops_trailing_comment() {
+        let s = parse_settings("default_toolchain = \"stable\" # active\n");
+        assert_eq!(s.default_toolchain.as_deref(), Some("stable"));
+    }
+
+    #[test]
     fn a_verbatim_path_is_the_same_place_as_the_plain_one() {
         assert_eq!(norm_path_str(r"\\?\C:\Users\Me\"), norm_path_str(r"c:/users/me"));
     }
@@ -917,7 +970,7 @@ mod tests {
         // and on the real PATH, for names that exist on most machines and one that does not
         for name in ["cmd", "powershell", "where", "git", "cargo", "qx", "no-such-program-zz"] {
             for dir in path_dirs() {
-                assert_eq!(find_in_dir(&dir, name, &exts), stat_dir(&dir, name, &exts), "{name} in {}", dir.display());
+                assert_eq!(find_in_dir(dir, name, &exts), stat_dir(dir, name, &exts), "{name} in {}", dir.display());
             }
         }
     }
@@ -1188,5 +1241,79 @@ default_toolchain = "stable-x86_64-pc-windows-msvc"
         if direct.is_none() {
             assert!(matches!(resolve("wc", None), Target::Direct { .. }));
         }
+    }
+
+    #[test]
+    fn a_bare_name_resolves_in_the_call_folder_and_relative_path_entries() {
+        let d = tmp("cwdtool");
+        fs::create_dir_all(d.join("rel")).unwrap();
+        fs::write(d.join("qxcwdtool.exe"), "").unwrap();
+        fs::write(d.join("rel").join("qxreltool.cmd"), "@echo hi\r\n").unwrap();
+        match resolve("qxcwdtool", Some(&d)) {
+            Target::Direct { exe, .. } => assert_eq!(exe, d.join("qxcwdtool.exe")),
+            _ => panic!("a program in the call's folder must resolve"),
+        }
+        assert!(matches!(resolve("qxcwdtool", None), Target::Missing), "never cached for another folder");
+        assert_eq!(
+            beside_cwd("qxreltool", &[PathBuf::from("rel")], Some(&d)),
+            Some(d.join("rel").join("qxreltool.cmd"))
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_replacement_path_is_the_only_one_searched() {
+        let d = tmp("onlypath");
+        fs::write(d.join("qxonlytool.cmd"), "@echo hi\r\n").unwrap();
+        let dirs = [d.clone()];
+        assert!(matches!(resolve_only("cmd", &dirs, Some(&d)), Target::Missing), "cmd.exe is not on that PATH");
+        assert!(matches!(resolve_only("qxonlytool", &dirs, None), Target::Shim(_)));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_name_with_its_extension_means_that_file() {
+        let d = tmp("exact-ext");
+        for f in ["tool.exe", "tool.exe.com", "s.ps1"] {
+            fs::write(d.join(f), "x").unwrap();
+        }
+        let exts = pathext();
+        assert_eq!(find_in_dir(&d, "tool.exe", &exts), Some(d.join("tool.exe")));
+        assert_eq!(stat_dir(&d, "tool.exe", &exts), Some(d.join("tool.exe")));
+        assert_eq!(find_in_dir(&d, "s.ps1", &exts), Some(d.join("s.ps1")));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_hand_made_npm_wrapper_is_not_bypassed() {
+        let d = tmp("npmwrap");
+        let cli = d.join("node_modules").join("npm").join("bin").join("npm-cli.js");
+        fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        fs::write(&cli, "").unwrap();
+        fs::write(d.join("node.exe"), "").unwrap();
+        let shim = d.join("npm.cmd");
+        let launch = "\"%~dp0\\node.exe\" \"%~dp0\\node_modules\\npm\\bin\\npm-cli.js\" %*\r\n";
+        fs::write(&shim, format!("@echo off\r\nset NODE_OPTIONS=--max-old-space-size=8192\r\n{launch}")).unwrap();
+        assert!(node_target(&shim).is_none(), "the wrapper's own setting would be lost");
+        fs::write(&shim, format!(":: Created by npm, please don't edit manually.\r\n@ECHO OFF\r\n{launch}")).unwrap();
+        assert!(matches!(node_target(&shim), Some(Target::Direct { .. })));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn only_a_copy_of_rustup_is_a_proxy() {
+        let bin = tmp("proxy");
+        fs::write(bin.join("rustup.exe"), "rustup-bytes").unwrap();
+        fs::write(bin.join("cargo.exe"), "rustup-bytes").unwrap();
+        fs::write(bin.join("rustc.exe"), "custom").unwrap();
+        assert!(proxy_of(&bin.join("cargo.exe"), &bin));
+        assert!(!proxy_of(&bin.join("rustc.exe"), &bin));
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn only_an_entry_starting_pathext_ends_path() {
+        let dirs = split_path_dirs(r"C:\tools\pathext=helpers;C:\b;PATHEXT=.COM;.EXE");
+        assert_eq!(dirs, vec![PathBuf::from(r"C:\tools\pathext=helpers"), PathBuf::from(r"C:\b")]);
     }
 }

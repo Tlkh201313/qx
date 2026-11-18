@@ -46,7 +46,7 @@ CASES = [
     ("run node -e 1", "run", {"program": "node", "args": ["-e", "1"], "cwd": cwd}),
     ("run python -c pass", "run", {"program": "python", "args": ["-c", "pass"], "cwd": cwd}),
     ("fs read Cargo.toml", "fs", {"op": "read", "path": "Cargo.toml", "cwd": cwd}),
-    ("fs read src/fsops.rs (2000 lines)", "fs", {"op": "read", "path": "src/fsops.rs", "cwd": cwd}),
+    ("fs read src/guard.rs (2000 lines)", "fs", {"op": "read", "path": "src/guard.rs", "cwd": cwd}),
     ("fs stat", "fs", {"op": "stat", "path": "Cargo.toml", "cwd": cwd}),
     ("fs list src", "fs", {"op": "list", "path": "src", "cwd": cwd}),
     ("fs glob src/**/*.rs", "fs", {"op": "glob", "pattern": "src/**/*.rs", "cwd": cwd}),

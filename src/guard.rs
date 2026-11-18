@@ -75,8 +75,11 @@ pub fn check(program: &str, args: &[String], cwd: Option<&Path>) -> Decision {
     check_mode(mode(), program, args, cwd)
 }
 
-pub fn check_shell(command: &str, cwd: Option<&Path>) -> Decision {
-    check_shell_mode(mode(), command, cwd)
+/// `shell` is the caller's shell choice (`auto`, `cmd`, `bash`, `powershell`, or a name models use).
+pub fn check_shell(command: &str, shell: &str, cwd: Option<&Path>) -> Decision {
+    // Only a comma reads differently under PowerShell, so other lines skip picking the shell.
+    let ps = command.contains(',') && crate::exec::shell_for(crate::exec::peel_env(command).1, shell) == "powershell";
+    check_payload(mode(), command, cwd, ps)
 }
 
 /// How many launchers, `$(..)` and `-c` payloads deep the guard follows before it gives up and
@@ -94,6 +97,9 @@ thread_local! {
     /// The directory the top-level call runs in. A `cd` later in the line moves the shell, not the
     /// workspace: deleting this directory or a parent of it stays refused wherever the shell went.
     static ORIGIN: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    /// The line being judged runs under PowerShell: there `rm`, `del`, `rd`, `rmdir` and `erase`
+    /// are Remove-Item, which reads `a,b` as a list of paths.
+    static POWERSHELL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The call's directory as an absolute, cleaned path. A relative `cwd` (a client sending ".") is
@@ -151,6 +157,27 @@ impl Drop for Depth {
     }
 }
 
+/// Which shell parses the line, for as long as it lives; the outer one comes back after.
+struct Shell(bool);
+
+impl Shell {
+    fn enter(powershell: bool) -> Shell {
+        Shell(POWERSHELL.with(|p| p.replace(powershell)))
+    }
+}
+
+impl Drop for Shell {
+    fn drop(&mut self) {
+        POWERSHELL.with(|p| p.set(self.0));
+    }
+}
+
+/// Judge `line` as text for PowerShell (`powershell`) or for another shell.
+fn check_payload(m: Mode, line: &str, cwd: Option<&Path>, powershell: bool) -> Decision {
+    let _shell = Shell::enter(powershell);
+    check_shell_mode(m, line, cwd)
+}
+
 fn too_deep() -> Decision {
     let mut d = Decision::allow();
     d.deny("nested too deeply to judge safely");
@@ -172,7 +199,7 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
 
     // `%ComSpec% /c ..`, `& $env:ComSpec ..`: the program word is judged by what it names.
     let name = base_name(&expand_env(&expand_dollar_env(program)));
-    let joined = args.join(" ");
+    let joined = || args.join(" ");
 
     // Assigning a qx switch is never a legitimate agent action.
     if matches!(name.as_str(), "env" | "set" | "export" | "setx") && args.iter().any(|a| qx_switch(a)) {
@@ -224,6 +251,12 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
     }
 
     match name.as_str() {
+        // `-WhatIf` only reports what would be deleted; `-WhatIf:$false` and a `-WhatIf` path after `--` do not.
+        "remove-item" | "ri"
+            if args
+                .iter()
+                .take_while(|a| *a != "--")
+                .any(|a| a.eq_ignore_ascii_case("-whatif") || a.eq_ignore_ascii_case("-whatif:$true")) => {}
         "rm" | "del" | "erase" | "rd" | "rmdir" | "remove-item" | "ri" => {
             destructive(&name, args, cwd, &mut d);
         }
@@ -250,7 +283,7 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
             if let Some(p) = payload {
                 let target = format!("\"{}\\{mask}\"", dir.trim_end_matches(['\\', '/']));
                 let p = ["@path", "@relpath", "@file", "@fname"].iter().fold(p, |p, v| replace_ci(&p, v, &target));
-                merge(&mut d, check_shell_mode(m, &p, cwd));
+                merge(&mut d, check_payload(m, &p, cwd, false));
             }
         }
         "cp" | "copy" | "mv" | "move" | "copy-item" | "cpi" | "move-item" | "mi" | "ren" | "rename" | "rename-item" | "rni" => {
@@ -309,7 +342,7 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
             if let Some(dst) = paths.get(1) {
                 deny_if_protected(dst, cwd, &mut d);
             }
-            let j = joined.to_ascii_lowercase();
+            let j = joined().to_ascii_lowercase();
             if j.contains("/mir") || j.contains("/purge") {
                 match paths.get(1).and_then(|dst| protected(&absolutize(dst, cwd), cwd)) {
                     Some(r) => d.deny(format!("robocopy /mir or /purge would empty {r}")),
@@ -317,7 +350,7 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
                 }
             }
         }
-        "psql" | "mysql" | "mariadb" | "sqlite3" | "sqlcmd" => check_sql(&joined, &mut d),
+        "psql" | "mysql" | "mariadb" | "sqlite3" | "sqlcmd" => check_sql(&joined(), &mut d),
         "powershell" | "pwsh" => {
             // PowerShell takes -e, -ec and any prefix of -EncodedCommand, introduced by `-`, `--`, `/`
             // or a typographic dash.
@@ -332,16 +365,16 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
                 d.deny("encoded PowerShell hides its payload");
             }
             if let Some(payload) = shell_payload(args).or_else(|| ps_script(args)) {
-                merge(&mut d, check_shell_mode(m, &payload, cwd));
+                merge(&mut d, check_payload(m, &payload, cwd, true));
                 check_ps_exfil(&payload, &mut d);
             }
         }
-        "cmd" | "bash" | "sh" | "zsh" => {
+        "cmd" | "bash" | "sh" | "zsh" | "dash" | "ksh" => {
             if let Some(payload) = shell_payload(args) {
-                merge(&mut d, check_shell_mode(m, &payload, cwd));
+                merge(&mut d, check_payload(m, &payload, cwd, false));
             }
         }
-        "eval" => merge(&mut d, check_shell_mode(m, &joined, cwd)),
+        "eval" => merge(&mut d, check_payload(m, &joined(), cwd, false)),
         "format"
         | "diskpart"
         | "mkfs"
@@ -355,7 +388,7 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
             d.deny(format!("{name} can destroy disks or boot configuration"));
         }
         // No argument, `/enum` and `/v` only list the boot entries.
-        "bcdedit" if !args.iter().all(|a| matches!(a.to_ascii_lowercase().as_str(), "/enum" | "/v" | "all" | "active")) => {
+        "bcdedit" if !args.iter().all(|a| matches!(a.to_ascii_lowercase().as_str(), "/enum" | "/v" | "all" | "active" | "/?")) => {
             d.deny("bcdedit can destroy disks or boot configuration");
         }
         "new-localuser" | "remove-localuser" | "add-localgroupmember" | "enable-psremoting"
@@ -363,7 +396,7 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
             d.deny(format!("{name} changes local accounts or remote access"));
         }
         "set-mppreference" => {
-            let j = joined.to_ascii_lowercase();
+            let j = joined().to_ascii_lowercase();
             if j.contains("disablerealtimemonitoring")
                 || j.contains("disableioavprotection")
                 || j.contains("disablebehaviormonitoring")
@@ -379,7 +412,7 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
             d.warn("changing a Windows service")
         }
         "netsh" => {
-            let j = joined.to_ascii_lowercase();
+            let j = joined().to_ascii_lowercase();
             if j.contains("advfirewall")
                 && (j.contains("set") || j.contains("off") || j.contains("disable"))
             {
@@ -389,14 +422,14 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
             }
         }
         "chmod" => {
-            let j = joined.to_ascii_lowercase();
+            let j = joined().to_ascii_lowercase();
             if j.contains("777") || j.contains("a+rwx") {
                 d.warn("world-writable permissions");
             }
         }
         "set-acl" => d.warn("changing file permissions"),
         "docker" => {
-            let j = joined.to_ascii_lowercase();
+            let j = joined().to_ascii_lowercase();
             if j.contains("system prune")
                 || j.contains("volume rm")
                 || j.contains(" volume prune")
@@ -414,7 +447,7 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
                 d.warn("destroys infrastructure");
             }
         "aws" => {
-            let j = joined.to_ascii_lowercase();
+            let j = joined().to_ascii_lowercase();
             if j.contains("s3 rb") && j.contains("--force") {
                 d.warn("deletes an S3 bucket and its contents");
             }
@@ -429,7 +462,8 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
         }
         "reg" => {
             let w = op_word(args);
-            if w.as_deref() == Some("delete") {
+            // `reg delete /?` prints the help of `delete`.
+            if w.as_deref() == Some("delete") && !(args.len() == 2 && args[1] == "/?") {
                 d.deny("deleting registry keys");
             }
             // Whole path components: `\Runtime` is not `\Run`.
@@ -464,11 +498,11 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
             }
         }
         "vssadmin"
-            if joined.to_ascii_lowercase().contains("delete") => {
+            if joined().to_ascii_lowercase().contains("delete") => {
                 d.deny("deleting volume shadow copies");
             }
         "cipher"
-            if joined.to_ascii_lowercase().contains("/w") => {
+            if joined().to_ascii_lowercase().contains("/w") => {
                 d.deny("wiping free disk space");
             }
         "takeown" => {
@@ -496,8 +530,8 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
                 deny_if_protected(v, cwd, &mut d);
             }
         }
-        // `at 10:00 x.exe` schedules a task like `schtasks /create`; a bare `at` only lists jobs.
-        "at" if !args.is_empty() => d.deny("scheduled-task persistence"),
+        // `at 10:00 x.exe` schedules a task like `schtasks /create`; a bare `at` only lists jobs, `at /?` prints help.
+        "at" if !(args.is_empty() || args.len() == 1 && args[0] == "/?") => d.deny("scheduled-task persistence"),
         "rsync" if args.iter().any(|a| a.starts_with("--delete") || a == "--del" || a == "--remove-source-files") => {
             match args.iter().rfind(|a| !a.starts_with('-')).map(|t| absolutize(t, cwd)) {
                 Some(p) if protected(&p, cwd).is_some() => d.deny(format!("rsync --delete removes files in {}", p.display())),
@@ -507,12 +541,12 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
         // `alias x='rm -rf /'` runs its value whenever `x` is typed.
         "alias" => {
             for v in args.iter().filter_map(|a| a.split_once('=').map(|(_, v)| v)) {
-                merge(&mut d, check_shell_mode(m, v, cwd));
+                merge(&mut d, check_payload(m, v, cwd, false));
             }
         }
         "icacls" => d.warn("changing file permissions"),
         "wmic" => {
-            if joined.to_ascii_lowercase().contains("call create") {
+            if joined().to_ascii_lowercase().contains("call create") {
                 d.deny("wmic process creation");
             } else {
                 d.warn("wmic can modify the system");
@@ -522,7 +556,7 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
             d.warn("LOLBin commonly abused for download/execution")
         }
         "net" => {
-            let j = joined.to_ascii_lowercase();
+            let j = joined().to_ascii_lowercase();
             if (j.contains("user") || j.contains("localgroup")) && j.contains("/add") {
                 d.deny("creating a local account or elevating one");
             }
@@ -543,7 +577,7 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
             }
         }
         "taskkill" => {
-            let j = joined.to_ascii_lowercase();
+            let j = joined().to_ascii_lowercase();
             const CRITICAL: &[&str] = &[
                 "explorer.exe",
                 "csrss.exe",
@@ -557,7 +591,7 @@ pub fn check_mode(m: Mode, program: &str, args: &[String], cwd: Option<&Path>) -
             }
         }
         "npm" | "cargo"
-            if joined.to_ascii_lowercase().split_whitespace().any(|w| w == "publish") && !args.iter().any(|a| a == "--dry-run") => {
+            if joined().to_ascii_lowercase().split_whitespace().any(|w| w == "publish") && !args.iter().any(|a| a == "--dry-run") => {
                 d.warn("publishing a package is irreversible");
             }
         "twine" => d.warn("uploading a package is irreversible"),
@@ -917,10 +951,13 @@ fn judge_line(m: Mode, command: &str, cwd: Option<&Path>, sq: bool) -> Decision 
     // `d=/; rm -rf $d`, `$p = "..."; Remove-Item $p`, `set T=..&& rd %T%`: literal assignments made
     // earlier on the line, so a later delete is judged by the value it really gets.
     let mut assigned: Vec<(String, String)> = Vec::new();
+    // Only the top-level line is parsed by the shell exactly as written; a nested payload has been
+    // through an outer shell that may have expanded `$` inside its own double quotes.
+    let literal = sq && DEPTH.with(|d| d.get()) == 1;
     for (s, piped) in split_segments(command, sq) {
         // `try { A } catch { B }`, `if x (A) else (B)`: braces, and the parentheses of a cmd body,
         // end a command wherever a block starts or stops.
-        let mut tokens = tokenize_with(&s, sq);
+        let mut tokens = tokenize_with(&s, sq, true, literal);
         if paren_aware(&tokens) {
             tokens = split_parens(tokens);
         }
@@ -930,7 +967,7 @@ fn judge_line(m: Mode, command: &str, cwd: Option<&Path>, sq: bool) -> Decision 
             for t in w.iter_mut() {
                 *t = substitute_assigned(t, &assigned);
             }
-            let n = w.iter().take_while(|t| is_assignment(t)).count();
+            let n = w.iter().take_while(|t| crate::exec::assignment_word(t)).count();
             if w.iter().take(n + 1).any(|t| qx_switch(t)) {
                 d.deny("attempt to disable a qx safeguard");
             }
@@ -959,17 +996,36 @@ fn judge_line(m: Mode, command: &str, cwd: Option<&Path>, sq: bool) -> Decision 
                     w.splice(1..1, switches);
                 }
             }
-            // bash drops a backslash before a plain letter: `r\m` runs `rm`. cmd reads it as a path; judge both.
-            let posix = w.first().filter(|f| f.contains('\\') && !f.contains([':', '/'])).map(|f| f.replace('\\', ""));
-            let alt = posix.filter(|p| !p.is_empty()).map(|p| {
-                let mut alt = w.clone();
-                alt[0] = p;
-                alt
+            // bash drops a backslash before a plain letter (`r\m` runs `rm`; cmd reads it as a path) and
+            // an empty substitution leaves nothing behind (`r$()m` runs `rm`): judge that reading too.
+            let alt = w.first().and_then(|f| {
+                let mut p = drop_substitutions(f);
+                if p.contains('\\') && !p.contains([':', '/']) {
+                    p = p.replace('\\', "");
+                }
+                (!p.is_empty() && p != *f).then(|| {
+                    let mut alt = w.clone();
+                    alt[0] = p;
+                    alt
+                })
             });
-            if !w.is_empty() {
-                segments.push((w, piped));
+            for mut seg in std::iter::once(w).chain(alt).filter(|s| !s.is_empty()) {
+                // The quote marks only keep a delete's operands literal; any other program may hand
+                // its words to a shell that reads them again (`bash -c '..$HOME..'`). A quoted dash word
+                // is a value only to a cmdlet: bash and cmd strip the quotes, so `rm "-rf"` is a flag.
+                let name = base_name(&seg[0]);
+                let keep_dollar = DELETES.contains(&name.as_str());
+                let keep_dash = matches!(name.as_str(), "remove-item" | "ri");
+                for t in seg.iter_mut() {
+                    if !keep_dollar && t.contains(LITERAL_DOLLAR) {
+                        *t = t.replace(LITERAL_DOLLAR, "$");
+                    }
+                    if !keep_dash && t.contains(QUOTED_DASH) {
+                        *t = t.replace(QUOTED_DASH, "-");
+                    }
+                }
+                segments.push((seg, piped));
             }
-            segments.extend(alt.map(|a| (a, piped)));
         }
     }
 
@@ -994,7 +1050,7 @@ fn judge_line(m: Mode, command: &str, cwd: Option<&Path>, sq: bool) -> Decision 
                 _ => None,
             };
             if let Some(t) = text {
-                merge(&mut d, check_shell_mode(m, &t, cwd));
+                merge(&mut d, check_payload(m, &t, cwd, matches!(name.as_str(), "powershell" | "pwsh")));
             }
         }
         if prog == TOO_DEEP {
@@ -1303,6 +1359,35 @@ fn runs_code_from_env(name: &str, value: &str) -> bool {
     }
 }
 
+/// `w` with its `$(..)`, `${..}` and backtick parts removed: what is left when each expands to nothing.
+fn drop_substitutions(w: &str) -> String {
+    let mut out = String::with_capacity(w.len());
+    let mut it = w.chars().peekable();
+    while let Some(c) = it.next() {
+        let next = it.peek().copied();
+        match (c, next) {
+            ('`', _) => while it.next().is_some_and(|c| c != '`') {},
+            ('$', Some(open @ ('(' | '{'))) => {
+                it.next();
+                let close = if open == '(' { ')' } else { '}' };
+                let mut depth = 1;
+                for c in it.by_ref() {
+                    if c == open {
+                        depth += 1;
+                    } else if c == close {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Texts of `$(..)`, `<(..)`, `>(..)` and backtick substitutions, outside single quotes.
 fn substitutions(s: &str) -> Vec<String> {
     let b: Vec<char> = s.chars().collect();
@@ -1376,6 +1461,11 @@ fn base_name(program: &str) -> String {
 
 /// Subcommand after global options, skipping option values (`git -C dir push`, `kubectl -n ns delete`).
 fn sub_command(args: &[String]) -> Option<String> {
+    sub_index(args).map(|i| args[i].to_ascii_lowercase())
+}
+
+/// Position of `sub_command`'s word in `args`.
+fn sub_index(args: &[String]) -> Option<usize> {
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -1384,7 +1474,7 @@ fn sub_command(args: &[String]) -> Option<String> {
         } else if a.starts_with('-') {
             i += 1;
         } else {
-            return Some(a.to_ascii_lowercase());
+            return Some(i);
         }
     }
     None
@@ -1547,12 +1637,6 @@ fn deny_if_protected(raw: &str, cwd: Option<&Path>, d: &mut Decision) {
     }
 }
 
-/// `FOO=1` prefix of a shell command line.
-fn is_assignment(t: &str) -> bool {
-    t.split_once('=')
-        .is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-}
-
 fn var_name_ok(n: &str) -> bool {
     !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
@@ -1571,18 +1655,19 @@ fn record_assignment(w: &[String], assigned: &mut Vec<(String, String)>) {
     match w {
         [kw, rest @ ..] if matches!(kw.as_str(), "export" | "local" | "declare" | "readonly" | "typeset") => {
             // Flags (`-x`, `-r`) and bare names carry no value.
-            for kv in rest.iter().filter(|t| is_assignment(t)) {
+            for kv in rest.iter().filter(|t| crate::exec::assignment_word(t)) {
                 let (k, v) = kv.split_once('=').unwrap_or_default();
                 put(k, v);
             }
         }
-        _ if !w.is_empty() && w.iter().all(|t| is_assignment(t)) => {
+        _ if !w.is_empty() && w.iter().all(|t| crate::exec::assignment_word(t)) => {
             for kv in w {
                 let (k, v) = kv.split_once('=').unwrap_or_default();
                 put(k, v);
             }
         }
-        [set, kv] if set.eq_ignore_ascii_case("set") && is_assignment(kv) => {
+        // cmd names may start with a digit.
+        [set, kv] if set.eq_ignore_ascii_case("set") && kv.split_once('=').is_some_and(|(k, _)| var_name_ok(k)) => {
             let (k, v) = kv.split_once('=').unwrap_or_default();
             put(k, v);
         }
@@ -1765,14 +1850,14 @@ fn unwrap_wrapper(name: &str, args: &[String]) -> Option<(String, Vec<String>)> 
                     None => {
                         split.push(a.clone());
                         // `env -u X -S "rm .."`: the option's value is not the command.
-                        if matches!(a.as_str(), "-u" | "--unset" | "-C" | "--chdir") {
+                        if matches!(a.as_str(), "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0") {
                             split.extend(it.next().cloned());
                         }
                     }
                 }
             }
             let args = &split[..];
-            let mut cur = after_flags(args, &["-u", "--unset", "-C", "--chdir"], &["--"])?;
+            let mut cur = after_flags(args, &["-u", "--unset", "-C", "--chdir", "-a", "--argv0"], &["--"])?;
             while cur.0.contains('=') {
                 cur = after_flags(&cur.1, &[], &[])?; // `env A=1 B=2 prog`
             }
@@ -1834,7 +1919,9 @@ fn unwrap_wrapper(name: &str, args: &[String]) -> Option<(String, Vec<String>)> 
             let (_duration, rest) = after_flags(args, &["-s", "--signal", "-k", "--kill-after"], &["--"])?;
             Some((rest.first()?.clone(), rest[1..].to_vec()))
         }
-        "nohup" | "time" | "winpty" | "setsid" | "busybox" | "builtin" => after_flags(args, &[], &["--"]),
+        "nohup" | "winpty" | "setsid" | "busybox" | "builtin" => after_flags(args, &[], &["--"]),
+        // GNU `time -o FILE -f FORMAT prog`.
+        "time" => after_flags(args, &["-o", "--output", "-f", "--format"], &["--"]),
         "stdbuf" => after_flags(args, &["-i", "-o", "-e", "--input", "--output", "--error"], &["--"]),
         "nice" => after_flags(args, &["-n", "--adjustment"], &["--"]),
         "sudo" | "doas" => after_flags(
@@ -1947,7 +2034,38 @@ fn short_flag(a: &str, c: char) -> bool {
 
 fn check_git(args: &[String], d: &mut Decision) {
     let joined = args.join(" ").to_ascii_lowercase();
-    let sub = sub_command(args);
+    let at = sub_index(args);
+    let sub = at.map(|i| args[i].to_ascii_lowercase());
+
+    // `--dry-run`, and `-n` where git means the same (push, clean, `reflog expire|delete`), only
+    // reports. The last of `--dry-run`/`--no-dry-run` wins and words after `--` are paths.
+    if matches!(sub.as_deref(), Some("push" | "clean" | "reflog")) {
+        let flags = at.map_or(&args[..0], |i| &args[i + 1..]);
+        let mut dry = false;
+        let mut it = flags.iter().take_while(|a| *a != "--");
+        while let Some(a) = it.next() {
+            if a.starts_with("--no-d") && "--no-dry-run".starts_with(a.as_str()) {
+                dry = false;
+            } else if a == "--dry-run" {
+                dry = true;
+            } else if matches!(a.as_str(), "--push-option" | "--repo" | "--receive-pack" | "--exec" | "--exclude") {
+                it.next(); // its value, even `-n`
+            } else if a.starts_with('-') && !a.starts_with("--") {
+                // In a short group `-o` (push) and `-e` (clean) take the rest, or the next word, as their value.
+                let (group, next_is_value) = match a[1..].find(['o', 'e']) {
+                    Some(j) => (&a[1..1 + j], j + 2 == a.len()),
+                    None => (&a[1..], false),
+                };
+                dry |= group.contains('n');
+                if next_is_value {
+                    it.next();
+                }
+            }
+        }
+        if dry {
+            return;
+        }
+    }
 
     match sub.as_deref() {
         Some("push") => {
@@ -2056,7 +2174,7 @@ fn check_code(m: Mode, text: &str, cwd: Option<&Path>, d: &mut Decision) {
                 if runs {
                     spawn = true;
                     if !lits.is_empty() {
-                        merge(d, check_shell_mode(m, &lits.join(" "), cwd));
+                        merge(d, check_payload(m, &lits.join(" "), cwd, false));
                     }
                     continue;
                 }
@@ -2146,7 +2264,13 @@ fn destructive(name: &str, args: &[String], cwd: Option<&Path>, d: &mut Decision
         return;
     }
 
-    let targets: Vec<String> = targets.iter().flat_map(|t| braces(t)).collect();
+    // PowerShell reads `a,b` as a list of paths, and runs `rm`/`del`/`rd`/`rmdir`/`erase` as Remove-Item.
+    let list = matches!(name, "remove-item" | "ri") || POWERSHELL.with(|p| p.get());
+    let targets: Vec<String> = targets
+        .iter()
+        .flat_map(|t| braces(t))
+        .flat_map(|t| if list { t.split(',').map(String::from).collect() } else { vec![t] })
+        .collect();
     for t in &targets {
         // `$(pwd)`, `` `pwd` ``: peeled below to a bare word, but the shell runs it and deletes its output.
         let t_trim = t.trim();
@@ -2737,7 +2861,7 @@ fn split_segments(s: &str, sq: bool) -> Vec<(String, bool)> {
 }
 
 fn tokenize(s: &str) -> Vec<String> {
-    tokenize_with(s, true)
+    tokenize_with(s, true, false, false)
 }
 
 /// `args` sent as one string: a JSON array (`["a","b"]`, which some models send stringified) or plain
@@ -2749,11 +2873,19 @@ pub fn args_from_text(s: &str) -> Vec<String> {
             return v;
         }
     }
-    tokenize_with(t, true)
+    tokenize_with(t, true, false, false)
 }
 
-/// Words of a command; `sq` says whether `'` quotes (it does not in cmd.exe).
-fn tokenize_with(s: &str, sq: bool) -> Vec<String> {
+/// Stands for a `$` the shell keeps literal (single-quoted), so no expansion of the guard's touches it.
+const LITERAL_DOLLAR: char = '\u{E000}';
+/// Stands for a quoted `-` that starts a word: PowerShell passes `'-WhatIf'` as a value, not a switch.
+const QUOTED_DASH: char = '\u{E001}';
+/// Programs whose operands keep the `LITERAL_DOLLAR` mark.
+const DELETES: &[&str] = &["rm", "del", "erase", "rd", "rmdir", "remove-item", "ri"];
+
+/// Words of a command; `sq` says whether `'` quotes (it does not in cmd.exe). With `marks`, a quoted
+/// leading `-` becomes `QUOTED_DASH`, and with `literal` each single-quoted `$` becomes `LITERAL_DOLLAR`.
+fn tokenize_with(s: &str, sq: bool, marks: bool, literal: bool) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
@@ -2762,6 +2894,10 @@ fn tokenize_with(s: &str, sq: bool) -> Vec<String> {
             Some(q) => {
                 if c == q {
                     quote = None;
+                } else if marks && c == '-' && cur.is_empty() {
+                    cur.push(QUOTED_DASH);
+                } else if marks && literal && q == '\'' && c == '$' {
+                    cur.push(LITERAL_DOLLAR);
                 } else {
                     cur.push(c);
                 }
@@ -4100,6 +4236,124 @@ mod tests {
         assert_eq!(level(&format!("rm -rf {}", std::env::temp_dir().display())), Level::Warn);
         for c in ["shutdown /s /t 0", "shutdown /s /t 0 /c /a", "shutdown /r /a", "bcdedit /set testsigning on", "bcdedit /delete {current}", r"rsync -a --delete src/ C:\Windows\", "at 10:00 calc.exe", r"Clear-Content C:\Windows\win.ini"] {
             assert!(denied(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn dash_and_ksh_payloads_are_judged() {
+        assert!(denied("/bin/dash -c 'rm -rf /'"));
+        assert!(denied("ksh -c 'rm -rf /'"));
+    }
+
+    #[test]
+    fn an_empty_substitution_inside_the_program_word_is_judged_without_it() {
+        for c in ["bash -c 'r$()m -rf /'", "r$()m -rf /", "r``m -rf /", "r${EMPTY_X}m -rf /"] {
+            assert!(denied(c), "{c}");
+        }
+        assert!(!denied("$(dirname $0)/run.sh"));
+    }
+
+    #[test]
+    fn env_argv0_value_is_not_the_program() {
+        assert!(denied("env --argv0 fake rm -rf /"));
+        assert!(denied("env -a fake rm -rf /"));
+    }
+
+    #[test]
+    fn gnu_time_option_values_are_not_the_program() {
+        assert!(denied("/usr/bin/time -o qx-time.log rm -rf /"));
+        assert!(denied("/usr/bin/time --format %e rm -rf /"));
+    }
+
+    #[test]
+    fn remove_item_whatif_only_reports() {
+        assert_eq!(level(r"Remove-Item -Recurse -WhatIf C:\Windows"), Level::Allow);
+        assert_eq!(level(r"ri -WhatIf:$true -Recurse C:\Windows"), Level::Allow);
+        for c in [
+            r"Remove-Item -Recurse -WhatIf:$false C:\Windows",
+            r"Remove-Item -Recurse C:\Windows -- -WhatIf",
+            r"del /s /q C:\Windows -WhatIf",
+            // A quoted `-WhatIf` is a path, not the switch.
+            r"Remove-Item '-WhatIf' C:\Windows",
+            r#"Remove-Item "-WhatIf" C:\Windows"#,
+            r"Remove-Item -Path '-WhatIf',C:\Windows",
+            r#"powershell -c "Remove-Item '-WhatIf' C:\Windows""#,
+        ] {
+            assert!(denied(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_flag_outside_powershell_is_still_a_flag() {
+        for (quoted, plain) in [
+            (r#"rm "-rf" C:\Windows"#, r"rm -rf C:\Windows"),
+            ("rm '-rf' ~/Documents", "rm -rf ~/Documents"),
+            (r#"rd "/s" "/q" C:\Windows"#, r"rd /s /q C:\Windows"),
+        ] {
+            assert_eq!(level(quoted), level(plain), "{quoted}");
+            assert!(denied(quoted), "{quoted}");
+        }
+    }
+
+    #[test]
+    fn git_dry_runs_only_report() {
+        for c in ["git push --force --dry-run", "git push -fn origin main", "git push --mirror -n", "git clean -fdn", "git clean -f --dry-run", "git reflog expire -n --expire=now --all"] {
+            assert_eq!(level(c), Level::Allow, "{c}");
+        }
+        for c in ["git push --force --dry-run --no-dry-run", "git push --force -o -n", "git push --force --push-option -n"] {
+            assert!(denied(c), "{c}");
+        }
+        for c in ["git clean -fd -- -n", "git clean -fd -e -n", "git clean -fdenode", "git commit -n -m x && git clean -f"] {
+            assert_eq!(level(c), Level::Warn, "{c}");
+        }
+    }
+
+    #[test]
+    fn a_single_quoted_dollar_at_top_level_is_literal() {
+        assert_eq!(level(r"Remove-Item -Recurse '$HOME\Documents'"), Level::Allow);
+        // Expanded by this shell, or by the shell a payload reaches.
+        for c in [
+            r#"Remove-Item -Recurse "$HOME\Documents""#,
+            "bash -c 'rm -rf $HOME/Documents'",
+            "echo 'rm -rf $HOME/Documents' | sh",
+            r#"powershell -c "Remove-Item -Recurse '$HOME\Documents'""#,
+            "env -S 'rm -rf ${HOME}/Documents'",
+        ] {
+            assert!(denied(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn a_digit_led_word_is_not_an_assignment_prefix() {
+        // bash runs a program named `1=x`; `rm` is only its argument.
+        assert_eq!(level("1=x rm -rf /"), Level::Allow);
+        assert!(denied("X1=x rm -rf /"));
+    }
+
+    #[test]
+    fn help_requests_are_allowed() {
+        for c in ["reg delete /?", "bcdedit /?", "at /?"] {
+            assert_eq!(level(c), Level::Allow, "{c}");
+        }
+        for c in [r"reg delete HKCU\Software\X /f", "bcdedit /? /delete {current}", "at /? 10:00 calc.exe"] {
+            assert!(denied(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn a_delete_alias_under_powershell_takes_a_comma_list() {
+        // PowerShell runs `rm`, `del`, `rd`, `rmdir` and `erase` as Remove-Item: `x,C:\Windows` deletes both.
+        for (line, shell) in [(r"rm x,C:\Windows", "powershell"), (r"rd x,C:\Windows; echo done", "auto")] {
+            assert!(!check_shell(line, shell, None).allowed(), "{line} ({shell})");
+        }
+        assert!(denied(r#"powershell -c "del x,C:\Windows""#));
+        // cmd's `%X:~0,3%` keeps its comma, also when cmd runs inside a PowerShell line.
+        for (line, shell) in [
+            ("rd /s /q %QX_UNSET_VAR:~0,3%", "cmd"),
+            ("rd /s /q %QX_UNSET_VAR:~0,3%", "auto"),
+            (r#"cmd /c "rd /s /q %QX_UNSET_VAR:~0,3%""#, "powershell"),
+        ] {
+            assert_eq!(check_shell(line, shell, None).level, Level::Warn, "{line} ({shell})");
         }
     }
 }

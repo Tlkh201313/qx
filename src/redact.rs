@@ -204,11 +204,22 @@ pub fn redact(input: &str) -> (String, usize) {
         if has_begin {
             // What precedes the header (a diff `+`, a `cat -n` number, a JSON key) stays, masked
             // like any other text; everything from the header on goes.
-            let at = line.to_ascii_lowercase().find("-----begin").unwrap_or(0);
+            let lower = line.to_ascii_lowercase();
+            let at = lower.find("-----begin").unwrap_or(0);
+            // An inline key (JSON) ends on this line: the text after its END marker stays.
+            let tail = lower[at..].find("-----end").and_then(|e| {
+                let e = at + e + 8;
+                lower[e..].find("-----").map(|d| e + d + 5)
+            });
             let (prefix, n) = mask_line(&line[..at]);
             out.push_str(&prefix);
             out.push_str("[REDACTED PRIVATE KEY]");
             count += 1 + n;
+            if let Some(t) = tail {
+                let (suffix, n) = mask_line(&line[t..]);
+                out.push_str(&suffix);
+                count += n;
+            }
             // A JSON-encoded key keeps BEGIN and END on one line; a PEM dump
             // spreads them across lines and must stay suppressed until END. A header that
             // is only quoted in source code does not own the lines after it.
@@ -326,7 +337,7 @@ fn mask_cookies(line: &str) -> (Cow<'_, str>, usize) {
         while s < end {
             let e = b[s..end].iter().position(|&c| c == b';').map_or(end, |i| s + i);
             if let Some(eq) = b[s..e].iter().position(|&c| c == b'=') {
-                if e - (s + eq + 1) >= 4 {
+                if e > s + eq + 1 {
                     ranges.push((s + eq + 1, e));
                 }
             }
@@ -369,7 +380,7 @@ fn mask_conn_strings(line: &str) -> (Cow<'_, str>, usize) {
             let b = bytes[k];
             if b == b'@' {
                 at = Some(k);
-            } else if b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b',' | b';' | b'|' | b'/' | b'?') {
+            } else if b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'|' | b'/' | b'?') {
                 // Userinfo ends at the path: `http://localhost:4873/@scope/pkg` has no password.
                 break;
             }
@@ -717,7 +728,12 @@ fn mask_tokens(line: &str) -> (Cow<'_, str>, usize) {
                     runs[slot] = (from, j, digit);
                 }
                 let (_, j, digit) = runs[slot];
-                if j - from >= min && (!body.needs_digit() || digit.is_some_and(|d| d >= from)) {
+                // `eyJ` opens ordinary base64 JSON too: a JWT has a header and a payload.
+                let jwt = bytes[i] != b'e' || {
+                    let mut parts = bytes[from..j].split(|&c| c == b'.');
+                    parts.next().is_some_and(|p| !p.is_empty()) && parts.next().is_some_and(|p| !p.is_empty())
+                };
+                if jwt && j - from >= min && (!body.needs_digit() || digit.is_some_and(|d| d >= from)) {
                     out.push_str(&line[copied..from]);
                     out.push_str("***");
                     count += 1;
@@ -760,7 +776,11 @@ fn mask_auth(line: &str) -> (Cow<'_, str>, usize) {
             continue;
         }
         let n = scheme.len();
-        for pos in (0..bytes.len().saturating_sub(n - 1)).filter(|&p| bytes[p..p + n].eq_ignore_ascii_case(scheme.as_bytes())) {
+        // `pallbearer` is not a scheme: a scheme starts at a word edge.
+        let edge = |p: usize| p == 0 || !bytes[p - 1].is_ascii_alphanumeric();
+        // In an Authorization header any credential is one, however short.
+        let min = if basic { 1 } else { min };
+        for pos in (0..bytes.len().saturating_sub(n - 1)).filter(|&p| edge(p) && bytes[p..p + n].eq_ignore_ascii_case(scheme.as_bytes())) {
             let start = pos + n;
             let mut end = start;
             while end < bytes.len() && bytes[end].is_ascii_graphic() && !matches!(bytes[end], b'"' | b'\'') {
@@ -836,6 +856,25 @@ mod tests {
         let (s, n) = redact("Authorization: Bearer abcdefghijklmnopqrstuvwxyz\n");
         assert!(!s.contains("abcdefghijklmnopqrstuvwxyz"));
         assert!(n >= 1);
+    }
+
+    #[test]
+    fn audit_redaction_cases() {
+        // Text after an inline key stays.
+        let (s, _) = redact(r#"{"k":"-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n","result":42}"#);
+        assert!(s.contains(r#""result":42"#) && !s.contains("MIIE"), "{s}");
+        // Short credentials in an Authorization header and short cookies are masked.
+        for (line, secret) in [("Authorization: Bearer abc", "abc"), ("Authorization: Basic dTpw", "dTpw"), ("Cookie: sid=abc", "abc")] {
+            assert!(!redact(line).0.contains(secret), "{line}");
+        }
+        // `;` may sit in a URI password.
+        assert!(!redact("postgres://alice:pa;ss@db/app").0.contains("pa;ss"));
+        // `bearer` inside a word is not a scheme.
+        assert_eq!(redact("pallbearer responsibilities include lifting").0, "pallbearer responsibilities include lifting");
+        // `eyJ` base64 JSON without JWT dots stays; a JWT is masked.
+        let b64 = "eyJuYW1lIjoiYWxpY2UiLCJyb2xlIjoiYWRtaW4iLCJ0ZWFtIjoiY29yZSJ9";
+        assert_eq!(redact(b64).0, b64);
+        assert!(!redact("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig").0.contains("eyJzdWIi"));
     }
 
     #[test]
@@ -1299,7 +1338,6 @@ mod tests {
             "- password: see the vault entry",
             "Get-Thing -Name token -Verbose",
             "run -x mytoken abcd1234wxyz",
-            "Cookie: a=1",
         ]);
     }
 
