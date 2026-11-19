@@ -7,9 +7,6 @@
 
 use crate::compact;
 
-/// How to get the uncut text: the CLI has `--raw`, an MCP call has `mode:"full"`.
-const FULL: &str = "--raw (CLI) or mode:\"full\" (MCP)";
-
 pub struct Digest {
     pub stdout: String,
     pub stderr: String,
@@ -34,6 +31,43 @@ impl Digest {
     }
 }
 
+/// A diff up to this many lines keeps every line; only its file headers fold (see `digest`).
+const DIFF_WHOLE: usize = 400;
+
+/// Line budget `(max, head, tail)` for the plain compaction of a command that `digest` declined: a diff that
+/// fits `DIFF_WHOLE` must not be cut at the usual 200 lines, or its middle files vanish.
+pub fn plain_budget(label: &str, usual: (usize, usize, usize)) -> (usize, usize, usize) {
+    if is_diff(&core_label(&label.to_ascii_lowercase())) {
+        (DIFF_WHOLE.max(usual.0), DIFF_WHOLE * 2 / 5, DIFF_WHOLE * 3 / 10)
+    } else {
+        usual
+    }
+}
+
+/// Git's Windows line-ending warnings are noise, not content: the callers drop them from a git command's
+/// stderr before it is digested or compacted, so each path keeps its own budget (the CLI's `--max-lines`,
+/// the MCP reply cap).
+pub fn drop_git_eol_warnings(label: &str, stderr: &mut String) {
+    if git_sub(&core_label(&label.to_ascii_lowercase())).is_some() && stderr.lines().any(eol_warning) {
+        *stderr = stderr.lines().filter(|l| !eol_warning(l)).fold(String::new(), |mut s, l| {
+            s.push_str(l);
+            s.push('\n');
+            s
+        });
+    }
+}
+
+/// git >= 2.37: `warning: in the working copy of 'X', LF will be replaced by CRLF the next time Git
+/// touches it`; older: `warning: LF will be replaced by CRLF in X.` plus an explanatory line.
+fn eol_warning(l: &str) -> bool {
+    (l.starts_with("warning: in the working copy of '")
+        && (l.contains(", LF will be replaced by CRLF the next time Git touches it")
+            || l.contains(", CRLF will be replaced by LF the next time Git touches it")))
+        || l.starts_with("warning: LF will be replaced by CRLF in ")
+        || l.starts_with("warning: CRLF will be replaced by LF in ")
+        || l.starts_with("The file will have its original line endings in your working directory")
+}
+
 pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Digest> {
     if std::env::var("QX_DIGEST").ok().as_deref() == Some("off") {
         return None;
@@ -50,29 +84,36 @@ pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Dige
         let (o, n) = git_log(stdout)?;
         ("git-log", o, None, n, false)
     } else if is_diff(&l) {
-        // A diff that fits is shown as git printed it: without its context lines and headers the hunk
-        // offsets no longer match what is shown. Only a long one is condensed (and spooled).
-        if stdout.lines().count() <= 400 {
-            return None;
+        // A diff that fits is shown with every hunk header, context, `+` and `-` line: without them the
+        // hunk offsets no longer match what is shown. Only its file headers fold, which loses nothing,
+        // so it skips the saving gate below; only a minified line past the per-line cap is cut (and
+        // spooled). Only a long diff is condensed.
+        if stdout.lines().count() <= DIFF_WHOLE {
+            let (trimmed, folded) = trim_diff_headers(stdout)?;
+            let (o, cut_o) = bound(trimmed, DIFF_WHOLE);
+            let (err, cut) = keep_stderr(stderr);
+            return Some(Digest { stdout: o, stderr: err, profile: "git-diff", omitted: 0, clipped: sd || ed || cut || cut_o || folded, passed: code == 0 });
         }
         let (o, n, c) = git_diff(stdout)?;
         ("git-diff", o, None, n, c)
     } else if is_pathlist(&l) {
         // Searches and listings first: `rg -n jest` is a search, whatever word it searches for.
-        let (o, n) = paths(stdout)?;
+        // Sorted output (`rg --files --sort modified`, `dir /b /o:d`, a pipe into `sort`): the order is the answer.
+        let sorted = label.contains('|') || words(&l).any(|w| w.starts_with("--sort") || w.to_ascii_lowercase().starts_with("/o"));
+        let (o, n) = paths(stdout, !sorted)?;
         ("paths", o, None, n, false)
     } else if is_search(&l) {
         let (o, n, c) = grep(stdout)?;
         ("search", o, None, n, c)
     } else if is_test(&l) {
-        if verbatim(&l, code) {
+        if verbatim(&l) {
             return None;
         }
         let merged = merge(stdout, stderr);
         let (o, n, c) = diagnostic(&merged, code, false)?;
         ("test", o, Some(String::new()), n, c)
     } else if is_build(&l) {
-        if verbatim(&l, code) {
+        if verbatim(&l) {
             return None;
         }
         let merged = merge(stdout, stderr);
@@ -124,7 +165,7 @@ fn bound(text: String, cap: usize) -> (String, bool) {
 
 /// The caller asked for the output itself: `--nocapture` and `-s` print what the tests print, and
 /// `--json` output is for a parser. A passing run's summary-only digest would drop all of it.
-fn verbatim(l: &str, code: i32) -> bool {
+fn verbatim(l: &str) -> bool {
     let machine = |w: &str| w.starts_with('-') && ["json", "junit", "tap", "xml"].iter().any(|k| w.contains(k));
     let shows = |w: &str| {
         matches!(
@@ -142,7 +183,6 @@ fn verbatim(l: &str, code: i32) -> bool {
     };
     let w: Vec<&str> = words(l).collect();
     // A failing run that asked for its output (`--nocapture`, `-v`) wants the prints most of all.
-    let _ = code;
     w.iter().any(|x| machine(x))
         || w.iter().any(|x| shows(x))
         || w.windows(2).any(|p| p[0] == "--reporter" && p[1] == "verbose")
@@ -234,7 +274,7 @@ fn strip_wrappers(seg: &str) -> String {
     loop {
         let n = match w.as_slice() {
             [a, ..] if wrapped && a.starts_with('-') => 1,
-            [a, ..] if a.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_')) => 1,
+            [a, ..] if crate::exec::assignment_word(a) => 1,
             ["time" | "env" | "npx" | "bunx" | "nohup", ..] => 1,
             ["pnpm" | "yarn" | "npm", "exec" | "dlx", ..] | ["uv" | "poetry" | "pipenv", "run", ..] => 2,
             _ => break,
@@ -297,11 +337,18 @@ struct Commit {
     body: usize,
 }
 
-/// `commit <sha>/Author/Date/message` -> `sha7 subject (who, date) (refs) [+N body lines]`.
+/// `commit <sha>/Author/Date/message` -> `sha7 subject (who, date) (refs) [+N body lines]`. The 7-char
+/// hashes and the body markers say what was condensed; the caller spools the full text.
 fn git_log(text: &str) -> Option<(String, usize)> {
     let mut commits: Vec<Commit> = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("commit ") {
+            // `--parents` puts more hashes here; only a decoration may follow the hash.
+            let mut w = rest.split_whitespace();
+            w.next();
+            if w.next().is_some_and(|x| !x.starts_with('(')) {
+                return None;
+            }
             commits.push(Commit {
                 hash: rest.split_whitespace().next().unwrap_or("").chars().take(7).collect(),
                 deco: rest.find('(').map(|i| rest[i..].to_string()).unwrap_or_default(),
@@ -327,14 +374,30 @@ fn git_log(text: &str) -> Option<(String, usize)> {
             } else if !t.trim().is_empty() {
                 c.body += 1;
             }
+        } else if !(line.is_empty() || line.starts_with("Merge:") || line.starts_with("    ")) {
+            // A patch, stat, reflog or other line this shape does not know: leave the text whole.
+            return None;
         }
     }
     if commits.is_empty() || commits.iter().any(|c| c.hash.is_empty() || c.subject.is_empty()) {
         return None;
     }
+    // One author and one day on every entry (a solo branch, a fresh clone's recent history) is said
+    // once in a header; entries that differ keep their own `(who, date)`.
+    let same = commits.len() >= 2
+        && !commits[0].who.is_empty()
+        && !commits[0].when.is_empty()
+        && commits.iter().all(|c| c.who == commits[0].who && c.when == commits[0].when);
     let mut out = String::new();
+    if same {
+        out.push_str(&format!("all by {}, {}\n", commits[0].who, commits[0].when));
+    }
     for c in &commits {
-        out.push_str(&format!("{} {} ({}, {})", c.hash, c.subject, c.who, c.when));
+        if same {
+            out.push_str(&format!("{} {}", c.hash, c.subject));
+        } else {
+            out.push_str(&format!("{} {} ({}, {})", c.hash, c.subject, c.who, c.when));
+        }
         if !c.deco.is_empty() {
             out.push(' ');
             out.push_str(&c.deco);
@@ -344,7 +407,6 @@ fn git_log(text: &str) -> Option<(String, usize)> {
         }
         out.push('\n');
     }
-    out.push_str(&format!("[qx] git log condensed (7-char hashes, bodies dropped); full text: {FULL}\n"));
     let omitted = text.lines().count().saturating_sub(commits.len());
     Some((out, omitted))
 }
@@ -429,7 +491,18 @@ fn is_build(l: &str) -> bool {
     ];
     BUILDS
         .iter()
-        .any(|p| l == *p || l.starts_with(&format!("{p} ")))
+        .any(|p| l.strip_prefix(p).is_some_and(|r| r.is_empty() || r.starts_with(' ')))
+}
+
+/// Paths under the cwd in the text a reply shows (the spool keeps the original). A build or test shortens
+/// both streams; a script's traceback, digested or too short to be, sits on stderr, so the program's own
+/// output stays as printed.
+pub fn shorten_paths(profile: &str, label: &str, so: &mut String, se: &mut String, cwd: Option<&std::path::Path>) {
+    match profile {
+        "build" | "test" => compact::relative_to_cwd(so, se, cwd),
+        "traceback" | "" if is_runtime(&core_label(&label.to_ascii_lowercase())) => compact::relative_to_cwd(&mut String::new(), se, cwd),
+        _ => {}
+    }
 }
 
 fn is_runtime(l: &str) -> bool {
@@ -451,9 +524,7 @@ fn traceback(text: &str) -> Option<(String, usize, bool)> {
     if py && lines.iter().any(|l| l.starts_with("Ran ") && l.contains(" test")) {
         return None;
     }
-    let mut out = String::new();
-    let mut kept = 0usize;
-    let mut clipped = false;
+    let mut keep = vec![false; lines.len()];
     let mut in_py = false;
     let mut frames = false; // a frame was seen, so the next unindented line is the exception
     let mut msg_left = 0usize; // continuation lines of the exception message still to keep
@@ -461,7 +532,7 @@ fn traceback(text: &str) -> Option<(String, usize, bool)> {
     while i < lines.len() {
         let t = lines[i].trim();
         let indented = lines[i].starts_with(char::is_whitespace);
-        let keep = if t.starts_with("Traceback (most recent call last):") {
+        keep[i] = if t.starts_with("Traceback (most recent call last):") {
             in_py = true;
             frames = false;
             msg_left = 0;
@@ -500,8 +571,27 @@ fn traceback(text: &str) -> Option<(String, usize, bool)> {
         } else {
             false
         };
-        if keep {
-            if kept < 120 {
+        i += 1;
+    }
+    if !keep.contains(&true) {
+        return None;
+    }
+    // The program's own lines around the traceback (a log line naming the cause, a warning) are kept, the
+    // first few and the last ones before the failure; a longer run is cut and says so.
+    let outside: Vec<usize> = (0..lines.len()).filter(|&i| !keep[i] && !lines[i].trim().is_empty()).collect();
+    let (n, mut clipped) = (outside.len(), false);
+    for (k, &i) in outside.iter().enumerate() {
+        if n <= 40 || k < 10 || k >= n - 30 {
+            keep[i] = true;
+        } else {
+            clipped = true;
+        }
+    }
+    let mut out = String::new();
+    let mut kept = 0usize;
+    for i in 0..lines.len() {
+        if keep[i] {
+            if kept < 160 {
                 out.push_str(lines[i]);
                 out.push('\n');
                 kept += 1;
@@ -509,10 +599,6 @@ fn traceback(text: &str) -> Option<(String, usize, bool)> {
                 clipped = true;
             }
         }
-        i += 1;
-    }
-    if out.is_empty() {
-        return None;
     }
     Some((out, lines.len().saturating_sub(kept), clipped))
 }
@@ -560,38 +646,74 @@ fn is_pathlist(l: &str) -> bool {
     }
 }
 
-/// Lossless: consecutive paths in one directory become `dir/{a,b,c}`. Names that
-/// hold `,{}` (or end a directory path) stay as plain lines.
-fn paths(text: &str) -> Option<(String, usize)> {
+/// Lossless as a set: every path of one directory goes on ONE line `dir/{a,b,c}` (directories in order
+/// of first appearance, names in their original order), so the order across directories is regrouped.
+/// That is safe for `git ls-files` too: it prints in path order, so the set (with the directory of each
+/// name) is the whole answer and regrouping loses nothing, even with root files between directories.
+/// When the order is the answer (`rg --files --sort modified`, a pipe into `sort`), `regroup` is false
+/// and only consecutive paths of one directory share a line. When 3+ names of a line share one ending
+/// that starts at a `.`, `-` or `_` it is factored out: `dir/{a,b,c}.rs`, `dir/{a,b,c}-v2.md`. Names or
+/// dirs that hold `,{}`, a root name (no directory to share) or a directory path itself stay as plain lines.
+/// Half the lines must carry a directory: a repo's file list has root files (`Cargo.toml`, `README.md`)
+/// beside its folders, and those must not keep the folders from being grouped.
+fn paths(text: &str, regroup: bool) -> Option<(String, usize)> {
     let sep = |c: char| c == '/' || c == '\\';
     let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
-    if lines.len() < 12 || lines.iter().filter(|l| l.contains(sep)).count() * 10 < lines.len() * 9 {
+    if lines.len() < 12 || lines.iter().filter(|l| l.contains(sep)).count() * 2 < lines.len() {
         return None;
     }
     let cut = |l: &str| l.rfind(sep).map_or(0, |k| k + 1);
+    // A line that ends in a separator is a directory entry: it never joins the files of that directory.
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut index: std::collections::HashMap<(&str, bool), usize> = std::collections::HashMap::new();
+    for l in &lines {
+        let dir = &l[..cut(l)];
+        let key = (dir, dir.len() == l.len());
+        let g = match index.get(&key) {
+            Some(&g) if regroup || g + 1 == groups.len() => g,
+            _ => {
+                groups.push((dir, Vec::new()));
+                index.insert(key, groups.len() - 1);
+                groups.len() - 1
+            }
+        };
+        groups[g].1.push(&l[dir.len()..]);
+    }
+    // The longest ending every name shares that starts at a `.`, `-` or `_` and leaves each stem
+    // non-empty: `.rs` of `a.rs`, `-v2.md` of `a-v2.md`; none for `Makefile` or a dotfile (`.gitignore`).
+    fn shared_tail<'a>(names: &[&'a str]) -> Option<&'a str> {
+        let first = names[0];
+        let same = names[1..].iter().map(|n| first.bytes().rev().zip(n.bytes().rev()).take_while(|(a, b)| a == b).count()).min()?;
+        let shortest = names.iter().map(|n| n.len()).min()?;
+        (first.len() - same..first.len())
+            .find(|&k| matches!(first.as_bytes()[k], b'.' | b'-' | b'_') && k + 1 < first.len() && first.len() - k < shortest)
+            .map(|k| &first[k..])
+    }
     let mut out = String::new();
     let mut shown = 0usize;
-    let mut i = 0;
-    while i < lines.len() {
-        let dir = &lines[i][..cut(lines[i])];
-        let mut j = i + 1;
-        while j < lines.len() && lines[j].starts_with(dir) && cut(lines[j]) == dir.len() {
-            j += 1;
-        }
-        let names: Vec<&str> = lines[i..j].iter().map(|l| &l[dir.len()..]).collect();
-        if names.len() < 2 || dir.contains([',', '{', '}']) || names.iter().any(|n| n.is_empty() || n.contains([',', '{', '}'])) {
-            for l in &lines[i..j] {
-                out.push_str(l);
+    for (dir, names) in &groups {
+        if dir.is_empty() || names.len() < 2 || dir.contains([',', '{', '}']) || names.iter().any(|n| n.is_empty() || n.contains([',', '{', '}'])) {
+            for n in names {
+                out.push_str(dir);
+                out.push_str(n);
                 out.push('\n');
                 shown += 1;
             }
-        } else {
-            for chunk in names.chunks(60) {
-                out.push_str(&format!("{dir}{{{}}}\n", chunk.join(",")));
-                shown += 1;
-            }
+            continue;
         }
-        i = j;
+        for chunk in names.chunks(60) {
+            let common = (chunk.len() >= 3).then(|| shared_tail(chunk)).flatten();
+            match (chunk.len(), common) {
+                (1, _) => out.push_str(&format!("{dir}{}", chunk[0])),
+                (_, Some(e)) => {
+                    let stems: Vec<&str> = chunk.iter().map(|n| &n[..n.len() - e.len()]).collect();
+                    out.push_str(&format!("{dir}{{{}}}{e}", stems.join(",")));
+                }
+                _ => out.push_str(&format!("{dir}{{{}}}", chunk.join(","))),
+            }
+            out.push('\n');
+            shown += 1;
+        }
     }
     Some((out, lines.len().saturating_sub(shown)))
 }
@@ -610,37 +732,85 @@ fn is_search(l: &str) -> bool {
     })
 }
 
-/// The entry as listed: a bare path for the common `modified:`, the kind kept for the rest
-/// (`deleted: old.rs`, `renamed: a -> b`), which a path alone would pass off as an edit.
-fn status_path(t: &str) -> Option<String> {
+/// The entry of a long-format status as `(code, path)`. The code is one letter (`M A D R C T`) whose
+/// column (index or worktree) the section decides, or a full two-letter code that does not depend on
+/// it: a conflict, or `??` for `?? path`. For a rename or copy the path reads `old -> new`.
+fn status_path(t: &str) -> Option<(&'static str, String)> {
     if let Some(p) = t.strip_prefix("?? ") {
-        return Some(format!("untracked: {}", p.trim()));
+        return Some(("??", p.trim().to_string()));
     }
-    for k in [
-        "both modified:",
-        "both deleted:",
-        "both added:",
-        "modified:",
-        "new file:",
-        "deleted:",
-        "renamed:",
-        "copied:",
-        "typechange:",
-        "unmerged:",
+    for (k, code) in [
+        ("both modified:", "UU"),
+        ("both deleted:", "DD"),
+        ("both added:", "AA"),
+        ("added by us:", "AU"),
+        ("added by them:", "UA"),
+        ("deleted by us:", "DU"),
+        ("deleted by them:", "UD"),
+        ("modified:", "M"),
+        ("new file:", "A"),
+        ("deleted:", "D"),
+        ("renamed:", "R"),
+        ("copied:", "C"),
+        ("typechange:", "T"),
+        ("unmerged:", "UU"),
     ] {
         if let Some(p) = t.strip_prefix(k) {
-            let p = p.trim();
-            return Some(if k == "modified:" { p.to_string() } else { format!("{k} {p}") });
+            return Some((code, p.trim().to_string()));
         }
     }
     None
 }
 
+/// `'origin/main'` out of a branch sentence.
+fn quoted(s: &str) -> Option<&str> {
+    let a = s.find('\'')? + 1;
+    let b = a + s[a..].find('\'')?;
+    Some(&s[a..b])
+}
+
+/// `Your branch is ahead of 'origin/main' by 2 commits.` -> `("origin/main", Some("ahead 2"))`; `None` for
+/// a sentence this reader does not know. A diverged branch gets its counts from the following line.
+fn branch_line(t: &str) -> Option<(String, Option<String>)> {
+    let rest = t.strip_prefix("Your branch ")?;
+    let up = quoted(rest)?.to_string();
+    let by = || rest.split(" by ").nth(1)?.split_whitespace().next()?.parse::<usize>().ok();
+    let track = if rest.starts_with("is up to date") {
+        None
+    } else if rest.starts_with("is ahead of ") {
+        Some(format!("ahead {}", by()?))
+    } else if rest.starts_with("is behind ") {
+        Some(format!("behind {}", by()?))
+    } else if rest.starts_with("is based on ") && rest.contains("upstream is gone") {
+        Some("gone".to_string())
+    } else if rest.contains("have diverged") {
+        Some("diverged".to_string())
+    } else {
+        return None;
+    };
+    Some((up, track))
+}
+
+/// Lossless rewrite of the long `git status` into the short `-sb` encoding every agent reads: a `## branch`
+/// header, then one line per `XY` code (index column, worktree column) listing its paths.
 fn git_status(text: &str) -> Option<(String, usize)> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Sec {
+        Staged,
+        Unstaged,
+        Untracked,
+        Ignored,
+        Unmerged,
+    }
     let mut branch: Option<String> = None;
+    let mut detached: Option<String> = None;
+    let mut no_commits = false;
+    let mut upstream: Option<(String, Option<String>)> = None;
     let mut state: Vec<String> = Vec::new();
-    let mut sections: Vec<(&'static str, Vec<String>)> = Vec::new();
-    let mut cur: Option<usize> = None;
+    // `(code, path)` in order of first appearance; a path staged and also modified is one entry (`MM`).
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut staged: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut cur: Option<Sec> = None;
     let mut omitted = 0usize;
 
     for raw in text.lines() {
@@ -653,96 +823,161 @@ fn git_status(text: &str) -> Option<(String, usize)> {
             branch = Some(b.to_string());
             continue;
         }
-        if t.starts_with("HEAD detached at ") {
-            branch = Some(t.to_string());
+        if let Some(d) = t.strip_prefix("HEAD detached ") {
+            detached = Some(format!("detached {d}")); // `at abc123` or `from abc123`
             continue;
         }
-        if let Some(b) = t.strip_prefix("Your branch is ") {
-            state.push(b.trim_end_matches('.').to_string());
+        if t == "No commits yet" || t == "Initial commit" {
+            no_commits = true;
             continue;
+        }
+        if t.starts_with("Your branch ") {
+            match branch_line(t) {
+                Some(u) => upstream = Some(u),
+                None => state.push(t.trim_end_matches('.').to_string()),
+            }
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("and have ") {
+            if let Some((_, track)) = upstream.as_mut() {
+                let mut w = rest.split_whitespace();
+                if let (true, Some(a), Some("and"), Some(b)) = (track.as_deref() == Some("diverged"), w.next(), w.next(), w.next()) {
+                    if a.parse::<usize>().is_ok() && b.parse::<usize>().is_ok() {
+                        *track = Some(format!("ahead {a}, behind {b}"));
+                        continue;
+                    }
+                }
+            }
         }
         let section = match t {
-            "Changes to be committed:" => Some("staged"),
-            "Changes not staged for commit:" => Some("modified"),
-            "Untracked files:" => Some("untracked"),
-            "Ignored files:" => Some("ignored"), // `git status --ignored`
-            "Unmerged paths:" => Some("conflicted"),
+            "Changes to be committed:" => Some(Sec::Staged),
+            "Changes not staged for commit:" => Some(Sec::Unstaged),
+            "Untracked files:" => Some(Sec::Untracked),
+            "Ignored files:" => Some(Sec::Ignored), // `git status --ignored`
+            "Unmerged paths:" => Some(Sec::Unmerged),
             _ => None,
         };
-        if let Some(name) = section {
-            let idx = match sections.iter().position(|(n, _)| *n == name) {
-                Some(i) => i,
-                None => {
-                    sections.push((name, Vec::new()));
-                    sections.len() - 1
-                }
-            };
-            cur = Some(idx);
+        if section.is_some() {
+            cur = section;
             continue;
         }
         if t.starts_with("nothing to commit") {
             state.push("clean".to_string());
             continue;
         }
-        if t.starts_with("nothing added to commit") {
-            state.push("nothing added to commit (untracked files present)".to_string());
-            continue;
-        }
-        if t.starts_with("no changes added to commit") {
-            state.push("no changes added to commit".to_string());
-            continue;
-        }
-        if t.starts_with("(use \"")
+        // Both say what the `??` lines or the absent `A`/`M` lines already show.
+        if t.starts_with("nothing added to commit")
+            || t.starts_with("no changes added to commit")
+            || t.starts_with("(use \"")
             || t.starts_with("(commit or discard")
             || t.starts_with("(fix conflicts")
         {
             omitted += 1;
             continue;
         }
-        if let Some(i) = cur {
-            if matches!(sections[i].0, "untracked" | "ignored") {
-                sections[i].1.push(t.to_string());
-                continue;
-            }
-        }
-        if let Some(path) = status_path(t) {
-            let idx = match cur {
-                Some(i) => i,
-                None => {
-                    sections.push(("changed", Vec::new()));
-                    sections.len() - 1
-                }
-            };
-            sections[idx].1.push(path);
+        // `--show-stash`, and the merge notices: state, not a file of the section above. A merge in
+        // progress must stay visible even once its `UU` lines are gone.
+        if t.starts_with("Your stash currently has ") || t == "You have unmerged paths." || t.starts_with("All conflicts fixed but you are still merging") {
+            state.push(t.to_string());
             continue;
         }
-        // A line this digest does not know (`deleted by us:`, ` M file`, a rebase notice) is not ours to drop.
+        // git indents a listed path with one TAB; any other line here is a note this digest does not know.
+        if matches!(cur, Some(Sec::Untracked | Sec::Ignored)) && raw.starts_with('\t') {
+            let code = if cur == Some(Sec::Ignored) { "!!" } else { "??" };
+            entries.push((code.to_string(), t.to_string()));
+            continue;
+        }
+        if let Some((code, path)) = status_path(t) {
+            let letter = code.as_bytes()[0] as char;
+            let code = match (code.len(), cur) {
+                (2, _) => code.to_string(),
+                (_, Some(Sec::Staged)) => format!("{letter} "),
+                (_, Some(Sec::Unstaged)) => format!(" {letter}"),
+                // A bare entry outside any section: the column is unknown, so do not guess.
+                _ => return None,
+            };
+            // A change made after staging belongs on the line of its staged entry (`MM`).
+            if cur == Some(Sec::Unstaged) {
+                if let Some(&i) = staged.get(&path) {
+                    if entries[i].0.ends_with(' ') {
+                        entries[i].0 = format!("{}{letter}", &entries[i].0[..1]);
+                        continue;
+                    }
+                }
+            }
+            if cur == Some(Sec::Staged) {
+                // The worktree side names the renamed file by its new path.
+                let key = path.rsplit_once(" -> ").map_or(path.as_str(), |(_, n)| n).to_string();
+                staged.insert(key, entries.len());
+            }
+            entries.push((code, path));
+            continue;
+        }
+        // A line this digest does not know (a rebase notice, ` M file`) is not ours to drop.
         return None;
     }
 
     let mut out = String::new();
-    if let Some(b) = branch {
-        out.push_str("branch ");
-        out.push_str(&b);
+    let head = match (&detached, &branch) {
+        (Some(d), _) => Some(format!("## HEAD ({d})")),
+        (None, Some(b)) if no_commits => Some(format!("## No commits yet on {b}")),
+        (None, Some(b)) => Some(format!("## {b}")),
+        _ => None,
+    };
+    if no_commits && (detached.is_some() || branch.is_none()) {
+        state.push("No commits yet".to_string());
+    }
+    if let Some(mut h) = head {
+        if detached.is_none() {
+            if let Some((up, track)) = &upstream {
+                h.push_str("...");
+                h.push_str(up);
+                if let Some(t) = track {
+                    h.push_str(&format!(" [{t}]"));
+                }
+            }
+        }
+        out.push_str(&h);
         out.push('\n');
     }
     for s in state {
         out.push_str(&s);
         out.push('\n');
     }
-    for (name, files) in sections {
-        if files.is_empty() {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for (code, path) in entries {
+        match groups.iter().position(|(c, _)| *c == code) {
+            Some(i) => groups[i].1.push(path),
+            None => groups.push((code, vec![path])),
+        }
+    }
+    for (code, paths) in groups {
+        // A rename (`old -> new`) or any path with whitespace would not survive a space-joined list.
+        let joinable = paths.iter().all(|p| !p.is_empty() && !p.contains(char::is_whitespace));
+        if !joinable {
+            for p in &paths {
+                out.push_str(&format!("{code} {p}\n"));
+            }
             continue;
         }
-        out.push_str(name);
-        out.push_str(" (");
-        out.push_str(&files.len().to_string());
-        out.push_str("):\n");
-        for f in files {
-            out.push_str("  ");
-            out.push_str(&f);
-            out.push('\n');
+        // Wrapped at ~200 chars so no line reaches the per-line cap, which would cut the list; every
+        // line repeats its code, so each stands on its own.
+        let mut cur = String::new();
+        for p in &paths {
+            if !cur.is_empty() && cur.len() + p.len() + 1 > 200 {
+                out.push_str(&cur);
+                out.push('\n');
+                cur.clear();
+            }
+            if cur.is_empty() {
+                cur = format!("{code} {p}");
+            } else {
+                cur.push(' ');
+                cur.push_str(p);
+            }
         }
+        out.push_str(&cur);
+        out.push('\n');
     }
     if out.is_empty() {
         return None;
@@ -750,9 +985,182 @@ fn git_status(text: &str) -> Option<(String, usize)> {
     Some((out, omitted))
 }
 
+/// The name `diff --git a/X b/X` shows when both sides are the same path. `None` for quoted, prefixed
+/// differently (`--no-prefix`, `i/`, `w/`) or differing names: those are kept as git printed them.
+fn same_diff_path(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("diff --git a/")?;
+    let n = rest.len().checked_sub(3)? / 2;
+    (rest.len() == 2 * n + 3 && rest.get(n..n + 3) == Some(" b/") && rest.get(..n) == rest.get(n + 3..)).then(|| &rest[..n])
+}
+
+/// Fold the header block that starts at `lines[i]` (a `diff --git` line) into compact lines and return
+/// them with the index of the first line after the block. Nothing is lost: the `index` line is a blob
+/// hash, `---`/`+++` repeat the path, and mode, rename and similarity info move into the title line:
+/// `diff X`, `diff X (deleted 100644)`, `diff A -> B (renamed 95%)`. Lines it cannot place (mode
+/// change, copy, odd prefixes) stay as git printed them.
+fn fold_diff_header(lines: &[&str], i: usize) -> (Vec<String>, usize) {
+    let mut j = i + 1;
+    let (mut new_mode, mut del_mode, mut sim) = (None, None, None);
+    let (mut from, mut to) = (None, None);
+    let (mut minus, mut plus) = (None, None);
+    let mut others: Vec<&str> = Vec::new();
+    while let Some(&l) = lines.get(j) {
+        if let Some(m) = l.strip_prefix("new file mode ") {
+            new_mode = Some(m);
+        } else if let Some(m) = l.strip_prefix("deleted file mode ") {
+            del_mode = Some(m);
+        } else if let Some(s) = l.strip_prefix("similarity index ") {
+            sim = Some(s);
+        } else if let Some(f) = l.strip_prefix("rename from ") {
+            from = Some(f);
+        } else if let Some(t) = l.strip_prefix("rename to ") {
+            to = Some(t);
+        } else if l.starts_with("--- ") {
+            minus = Some(l);
+        } else if l.starts_with("+++ ") {
+            plus = Some(l);
+        } else if l.starts_with("old mode ")
+            || l.starts_with("new mode ")
+            || l.starts_with("dissimilarity index ")
+            || l.starts_with("copy from ")
+            || l.starts_with("copy to ")
+        {
+            others.push(l);
+        } else if !l.starts_with("index ") {
+            break;
+        }
+        j += 1;
+    }
+    let line = lines[i];
+    let renamed = from.zip(to);
+    let (a, b) = match (same_diff_path(line), renamed) {
+        (Some(p), None) => (p, p),
+        (_, Some((f, t))) if new_mode.is_none() && del_mode.is_none() => (f, t),
+        _ => {
+            // Unplaceable names: only the blob-hash line goes.
+            let mut out = vec![line.to_string()];
+            out.extend(lines[i + 1..j].iter().filter(|l| !l.starts_with("index ")).map(|l| l.to_string()));
+            return (out, j);
+        }
+    };
+    let mut title = if a == b { format!("diff {a}") } else { format!("diff {a} -> {b}") };
+    let mut tags: Vec<String> = Vec::new();
+    if let Some(m) = new_mode {
+        tags.push(format!("new {m}"));
+    }
+    if let Some(m) = del_mode {
+        tags.push(format!("deleted {m}"));
+    }
+    if renamed.is_some() {
+        tags.push(format!("renamed {}", sim.unwrap_or("")).trim_end().to_string());
+    }
+    if !tags.is_empty() {
+        title.push_str(&format!(" ({})", tags.join(", ")));
+    }
+    let mut out = vec![title];
+    out.extend(others.iter().map(|l| l.to_string()));
+    let want_minus = if new_mode.is_some() { "--- /dev/null".to_string() } else { format!("--- a/{a}") };
+    let want_plus = if del_mode.is_some() { "+++ /dev/null".to_string() } else { format!("+++ b/{b}") };
+    for (got, want) in [(minus, want_minus), (plus, want_plus)] {
+        if let Some(g) = got.filter(|g| *g != want) {
+            out.push(g.to_string());
+        }
+    }
+    (out, j)
+}
+
+/// Whole-file diffs shrink to what an agent needs: that the file went or came, and how big it is. The
+/// caller marks the digest clipped, so the full text is spooled and named. `folded` is the header block
+/// `fold_diff_header` made and `at` the index of its hunk header. A deleted file of 6+ lines becomes one
+/// line (its content is in git already); a new file of over 20 lines keeps its first 5 lines. Returns the
+/// lines to print instead of the header block and the body, and the index after them; `None` leaves the
+/// diff as it is (a smaller file, a mode change, a path with spaces, a body that does not match its
+/// hunk header).
+fn fold_whole_file(folded: &[String], lines: &[&str], at: usize) -> Option<(Vec<String>, usize)> {
+    const DELETED_MIN: usize = 6;
+    const NEW_MIN: usize = 21;
+    const NEW_SHOWN: usize = 5;
+    let [title] = folded else { return None };
+    let (path, tag) = title.strip_prefix("diff ")?.rsplit_once(" (")?;
+    let tag = tag.strip_suffix(')')?;
+    if path.is_empty() || path.contains(char::is_whitespace) {
+        return None;
+    }
+    let deleted = match tag.split_once(' ') {
+        Some(("deleted", m)) if m.bytes().all(|b| b.is_ascii_digit()) => true,
+        Some(("new", m)) if m.bytes().all(|b| b.is_ascii_digit()) => false,
+        _ => return None,
+    };
+    let hunk = *lines.get(at)?;
+    let count = if deleted { hunk.strip_prefix("@@ -1,")?.strip_suffix(" +0,0 @@")? } else { hunk.strip_prefix("@@ -0,0 +1,")?.strip_suffix(" @@")? };
+    let n: usize = count.parse().ok()?;
+    let min = if deleted { DELETED_MIN } else { NEW_MIN };
+    if n < min {
+        return None;
+    }
+    let sign = if deleted { '-' } else { '+' };
+    let body = lines.get(at + 1..at + 1 + n)?;
+    if !body.iter().all(|l| l.starts_with(sign)) {
+        return None;
+    }
+    let mut end = at + 1 + n;
+    while lines.get(end).is_some_and(|l| l.starts_with('\\')) {
+        end += 1; // `\ No newline at end of file`
+    }
+    let rep = if deleted {
+        vec![format!("deleted {path} ({n} lines)")]
+    } else {
+        let mut v = vec![title.clone(), hunk.to_string()];
+        v.extend(body[..NEW_SHOWN].iter().map(|l| l.to_string()));
+        v.push(format!("… {} more lines", n - NEW_SHOWN));
+        v
+    };
+    Some((rep, end))
+}
+
+/// A diff short enough to show whole: only its headers are folded, every hunk header, context, `+` and
+/// `-` line stays, except a whole-file body that `fold_whole_file` shrinks. `None` when there is nothing
+/// to fold or the diff has merge-conflict columns. The flag says a whole-file body was folded, so the
+/// full text is worth keeping.
+fn trim_diff_headers(text: &str) -> Option<(String, bool)> {
+    if diff_is_combined(text) {
+        return None;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut folded_whole = false;
+    while i < lines.len() {
+        if lines[i].starts_with("diff --git ") {
+            let (folded, next) = fold_diff_header(&lines, i);
+            let (shown, end) = match fold_whole_file(&folded, &lines, next) {
+                Some(f) => {
+                    folded_whole = true;
+                    f
+                }
+                None => (folded, next),
+            };
+            for l in shown {
+                out.push_str(&l);
+                out.push('\n');
+            }
+            i = end;
+        } else {
+            out.push_str(lines[i]);
+            out.push('\n');
+            i += 1;
+        }
+    }
+    (out.len() < text.len()).then_some((out, folded_whole))
+}
+
+/// A merge-conflict diff marks each side with a column of its own; this reader knows one.
+fn diff_is_combined(text: &str) -> bool {
+    text.starts_with("diff --cc") || text.contains("\ndiff --cc ") || text.contains("\n@@@ ") || text.starts_with("@@@ ")
+}
+
 fn git_diff(text: &str) -> Option<(String, usize, bool)> {
-    // A merge-conflict diff marks each side with a column of its own; this reader knows one.
-    if text.starts_with("diff --cc") || text.contains("\ndiff --cc ") || text.contains("\n@@@ ") || text.starts_with("@@@ ") {
+    if diff_is_combined(text) {
         return None;
     }
     let mut out = String::new();
@@ -761,11 +1169,29 @@ fn git_diff(text: &str) -> Option<(String, usize, bool)> {
     let mut in_hunk = false;
     let mut changed = 0usize;
     let mut kept = 0usize;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    let mut folded_whole = false;
 
-    for line in text.lines() {
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
         if line.starts_with("diff --git ") {
-            out.push_str(line);
-            out.push('\n');
+            let (folded, next) = fold_diff_header(&lines, i - 1);
+            let (shown, end) = match fold_whole_file(&folded, &lines, next) {
+                Some((rep, end)) => {
+                    changed += 1;
+                    folded_whole = true;
+                    (rep, end)
+                }
+                None => (folded, next),
+            };
+            omitted += (end - (i - 1)).saturating_sub(shown.len());
+            for l in shown {
+                out.push_str(&l);
+                out.push('\n');
+            }
+            i = end;
             in_hunk = false;
             continue;
         }
@@ -842,11 +1268,9 @@ fn git_diff(text: &str) -> Option<(String, usize, bool)> {
         return None;
     }
     if clipped {
-        out.push_str(&format!(
-            "[qx] {omitted} diff lines omitted; full text: {FULL}\n"
-        ));
+        out.push_str(&format!("[qx] {omitted} diff lines omitted\n"));
     }
-    Some((out, omitted, clipped))
+    Some((out, omitted, clipped || folded_whole))
 }
 
 fn fail_line(t: &str, build: bool) -> bool {
@@ -864,7 +1288,14 @@ fn fail_line(t: &str, build: bool) -> bool {
     }
     t.starts_with("FAILED")
         || t.starts_with("FAIL ")
+        || t.starts_with("FAIL\t")
+        || t == "FAIL"
         || t.starts_with("FAIL:")
+        // node:test `✖ name`, dotnet `Failed Name [3 ms]`, maven `[ERROR] ...`, mocha `1) name`
+        || t.starts_with('\u{2716}')
+        || t.starts_with("Failed ")
+        || t.starts_with("[ERROR]")
+        || mocha_item(t)
         || t.starts_with("ERROR:")
         || t.starts_with("ERROR ")
         || t.starts_with("Jest: ")
@@ -930,8 +1361,28 @@ fn go_detail(lines: &[&str], at: usize, header: &str, keep: &mut [bool]) {
     }
 }
 
+/// mocha's numbered failure list: `1) Suite name`.
+fn mocha_item(t: &str) -> bool {
+    let n = t.bytes().take_while(u8::is_ascii_digit).count();
+    n > 0 && t[n..].starts_with(") ")
+}
+
+/// mocha's `1 passing (5ms)` / `2 failing` counts.
+fn mocha_count(t: &str) -> bool {
+    let mut w = t.split_whitespace();
+    w.next().is_some_and(|n| n.parse::<u64>().is_ok()) && w.next().is_some_and(|k| matches!(k, "passing" | "failing" | "pending"))
+}
+
 fn summary_line(t: &str) -> bool {
     t.starts_with("test result:")
+        || mocha_count(t)
+        // dotnet `Failed!  - Failed: 1, Passed: 1 ...`; node:test `ℹ tests 3` / `ℹ pass 1` / `ℹ fail 2`
+        || t.starts_with("Failed!")
+        || t.starts_with("Passed!")
+        || t.strip_prefix('\u{2139}').is_some_and(|r| {
+            let r = r.trim_start();
+            r.starts_with("tests ") || r.starts_with("pass ") || r.starts_with("fail ")
+        })
         || t.starts_with("Tests:")
         || t.starts_with("Test Suites:")
         || t.starts_with("Snapshots:")
@@ -944,7 +1395,7 @@ fn summary_line(t: &str) -> bool {
         || t.starts_with("ok  ")
         || t.starts_with("failures:")
         || t.starts_with("error: test failed")
-        || t.starts_with("Finished ")
+        // `Finished` is routine: `diagnostic` keeps it only when nothing else survives.
         || t.starts_with("Compiled ")
         || t.starts_with("built in")
         || t.starts_with("Build complete")
@@ -968,20 +1419,21 @@ fn nonzero_tally(t: &str) -> bool {
 }
 
 /// Progress and bookkeeping a green test or build run prints: dropping it loses nothing.
-fn routine_line(t: &str) -> bool {
+pub(crate) fn routine_line(t: &str) -> bool {
     const STARTS: &[&str] = &[
         "Compiling ", "Checking ", "Finished ", "Running ", "Fresh ", "Downloaded ", "Downloading ", "Updating ",
         "Locking ", "Adding ", "Blocking ", "Installing ", "Installed ", "Replacing ", "Replaced ", "Doc-tests ",
-        "running ", "collecting ", "collected ", "platform ", "rootdir:", "cachedir:", "plugins:", "configfile:",
+        "running ", "collecting ", "collected ", "platform ", "rootdir:", "cachedir:", "plugins:", "configfile:", "asyncio: mode=",
         "Collecting ", "Using cached ", "Requirement already satisfied", "Building wheel", "Created wheel",
         "Stored in directory", "Preparing metadata", "Getting requirements", "Determining projects to restore",
         "All projects are up-to-date", "Restored ", "Time Elapsed", "Ran all test suites", "Test Suites:", "Tests",
         "Snapshots:", "Time:", "Duration", "Test Files", "Start at", "RUN ", "PASS ", "ok ", "--- PASS", "=== RUN",
         "=== PAUSE", "=== CONT", "npm warn deprecated", "up to date", "added ", "removed ", "changed ", "audited ",
         "found 0 vulnerabilities", "To address", "npm audit", "Run `npm audit", "npm fund", "run `npm fund`",
-        "Build succeeded", "0 Warning(s)", "0 Error(s)", "\u{2713}", "\u{221a}",
+        "Build succeeded", "0 Warning(s)", "0 Error(s)", "\u{2713}", "\u{221a}", "\u{2714}", "\u{2139}", "Passed ",
     ];
     t.is_empty()
+        || (t.starts_with('_') && t.chars().all(|c| c == '_'))
         // progress dots (`cargo test -q`, pytest) and pytest's `file.py .... [ 50%]`
         || t.chars().all(|c| matches!(c, '.' | 's' | 'x' | 'S' | 'X'))
         || t.ends_with("%]")
@@ -991,8 +1443,292 @@ fn routine_line(t: &str) -> bool {
         || t.ends_with("packages are looking for funding")
         || t.starts_with('=')
         || (t.starts_with('-') && t.chars().all(|c| c == '-'))
-        || t.contains(" -> ")
+        // `dotnet build`'s `App -> bin\App.dll`; any other arrow may be a result (`answer -> 42`).
+        || t.split_once(" -> ").is_some_and(|(_, out)| out.ends_with(".dll") || out.ends_with(".exe"))
         || STARTS.iter().any(|p| t.starts_with(p))
+}
+
+fn failure_word(t: &str) -> bool {
+    let t = t.to_ascii_lowercase();
+    // `fail` only opens a word, so a file named test_fail.py is not a failure.
+    ["error", "panic", "exception", "fatal"].iter().any(|w| t.contains(w)) || t.split_whitespace().any(|w| w.starts_with("fail"))
+}
+
+/// Lint name in rustc's `= note: `#[warn(clippy::x)]` on by default` or `= note: `-D clippy::x` implied by ...`.
+fn lint_name(t: &str) -> Option<&str> {
+    let t = t.strip_prefix("= note: `")?;
+    if let Some(r) = t.strip_prefix("#[") {
+        return r.split_once('(')?.1.split_once(")]").map(|(n, _)| n);
+    }
+    let n = t.strip_prefix("-D ")?.split('`').next()?;
+    (n != "warnings").then_some(n)
+}
+
+/// Text after the markers of a `|` row: `|   ^^^ help: x`, `|   help: x` or `|   ---- label`. None when the row is not a `|` row.
+fn pipe_row(u: &str) -> Option<&str> {
+    let r = u.strip_prefix('|')?.trim_start();
+    Some(r.trim_start_matches(['^', '-', '~']).trim_start())
+}
+
+/// `^^^ help: use `is_empty`: `v.is_empty()`` label (or a bare `help:` pipe row): the text after `help: `.
+fn inline_help(u: &str) -> Option<&str> {
+    pipe_row(u)?.strip_prefix("help: ")
+}
+
+/// `---- matches all the values already` span label: markers followed by text, not a help.
+fn span_label(u: &str) -> bool {
+    let Some(r) = u.strip_prefix('|') else { return false };
+    let r = r.trim_start();
+    let text = r.trim_start_matches(['^', '-', '~']);
+    text.len() < r.len() && !text.trim().is_empty() && !text.trim_start().starts_with("help: ")
+}
+
+/// `4 |   source` row: the line number and ` |` start it.
+fn source_line(u: &str) -> bool {
+    let n = u.bytes().take_while(u8::is_ascii_digit).count();
+    n > 0 && u[n..].starts_with(" |")
+}
+
+/// `5 +     v[0]` line of a rustc suggestion diff.
+fn plus_line(t: &str) -> bool {
+    let n = t.bytes().take_while(u8::is_ascii_digit).count();
+    n > 0 && t[n..].starts_with(" + ")
+}
+
+/// rustc/clippy blocks: the lint name moves onto the header line; the `= note`/`= help: ...visit` lines it
+/// came from, the source snippet and the suggestion diff are noise. A warning keeps its header, `-->`, and one
+/// fix (the inline `help:` label, else the suggestion's `help:` + `+` lines). Errors keep their whole block.
+fn fold_rustc(lines: &[&str], keep: &mut [bool], noise: &mut [bool], over: &mut [Option<String>]) {
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim_end();
+        let header = t.starts_with("warning:") || t.starts_with("error[") || t.starts_with("error:");
+        if !header || !lines.get(i + 1).is_some_and(|n| n.trim_start().starts_with("--> ")) {
+            i += 1;
+            continue;
+        }
+        let warn = t.starts_with("warning");
+        let end = (i + 1..lines.len()).take(200).find(|&k| lines[k].trim().is_empty()).unwrap_or(lines.len().min(i + 201));
+        let mut lint = None;
+        let mut inline = false;
+        let mut fix: Vec<usize> = Vec::new();
+        let mut last_src: Option<usize> = None;
+        let pin = |j: usize, keep: &mut [bool], noise: &mut [bool]| {
+            noise[j] = false;
+            keep[j] = true;
+        };
+        for j in i + 1..end {
+            let u = lines[j].trim();
+            if warn {
+                noise[j] = true;
+            }
+            if let Some(n) = lint_name(u) {
+                lint = lint.or(Some(n));
+                noise[j] = true;
+            } else if u.starts_with("= help: for further information visit") || u == "|" {
+                noise[j] = true;
+            } else if warn {
+                if source_line(u) {
+                    last_src = Some(j);
+                } else if u.starts_with("--> ") || u.starts_with("= note:") || u.starts_with("= help:") {
+                    pin(j, keep, noise);
+                } else if let Some(h) = inline_help(u) {
+                    over[j] = Some(format!("help: {h}"));
+                    inline = true;
+                    pin(j, keep, noise);
+                } else if span_label(u) {
+                    pin(j, keep, noise);
+                    if let Some(s) = last_src {
+                        pin(s, keep, noise);
+                    }
+                } else if lines[j].starts_with("help: ") || (!fix.is_empty() && plus_line(u)) {
+                    fix.push(j);
+                }
+            }
+        }
+        if !inline {
+            for j in fix {
+                pin(j, keep, noise);
+            }
+        }
+        if let Some(n) = lint {
+            if !t.ends_with(']') {
+                over[i] = Some(format!("{t} [{n}]"));
+            }
+        }
+        i = end;
+    }
+}
+
+/// cargo test prints a failing test three times: `test x ... FAILED`, its `---- x stdout ----` block, and the
+/// closing `failures:` list. The block carries the facts, so the other two are noise when it exists.
+fn fold_cargo_test(lines: &[&str], noise: &mut [bool]) {
+    let blocks: std::collections::HashSet<&str> =
+        lines.iter().filter_map(|l| l.trim().strip_prefix("---- ")?.strip_suffix(" stdout ----")).collect();
+    let results = lines.iter().filter(|l| l.trim().starts_with("test result:")).count();
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t.starts_with("note: run with `RUST_BACKTRACE") {
+            noise[i] = true;
+        } else if t.starts_with("error: test failed, to rerun pass") && results <= 1 {
+            // With several test binaries it is the only clue which one failed.
+            noise[i] = true;
+        } else if let Some(n) = t.strip_prefix("test ").and_then(|r| r.strip_suffix(" ... FAILED")) {
+            // `#[should_panic]` tests read `test x - should panic ... FAILED`; their block is `---- x stdout ----`.
+            noise[i] = blocks.contains(n.strip_suffix(" - should panic").unwrap_or(n));
+        } else if t == "failures:" {
+            let mut k = i + 1;
+            while lines.get(k).is_some_and(|v| v.trim().is_empty()) {
+                k += 1;
+            }
+            if lines.get(k).is_some_and(|v| v.trim().starts_with("---- ")) {
+                noise[i] = true;
+                continue;
+            }
+            let names: Vec<usize> = (i + 1..lines.len()).take_while(|&k| lines[k].starts_with("    ") && !lines[k].trim().is_empty()).collect();
+            if !names.is_empty() && names.iter().all(|&k| blocks.contains(lines[k].trim())) {
+                noise[i] = true;
+                names.iter().for_each(|&k| noise[k] = true);
+            }
+        }
+    }
+}
+
+/// pytest: `=====` banners carry no facts, the failure heading becomes `name:`, the closing counts lose their
+/// padding, long-style source context (indented, before a block's `>` line) is noise, and the short summary's
+/// `+  where` repeats the `E` lines. Native/short frames and captured output are content and stay.
+fn fold_pytest(lines: &[&str], keep: &mut [bool], noise: &mut [bool], over: &mut [Option<String>]) {
+    let where_text: std::collections::HashSet<&str> = lines
+        .iter()
+        .filter(|l| l.starts_with("E   "))
+        .filter_map(|l| l.strip_prefix('E'))
+        .map(str::trim)
+        .filter(|r| r.starts_with('+'))
+        .collect();
+    let mut in_fail = false;
+    // Inside a frame block, before its `>` line: the indented lines there are `def` and source context.
+    let mut context = false;
+    // Failure headings as (line, test key, has an `E` line), and `FAILED nodeid` lines of the short summary.
+    let mut heads: Vec<(usize, String, bool)> = Vec::new();
+    let mut failed: Vec<(usize, &str)> = Vec::new();
+    // Consecutive `>`/`E` lines, re-indented together.
+    let mut run: Vec<usize> = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim_end();
+        if t.starts_with("==") && t.ends_with("==") {
+            dedent_run(lines, &mut run, over);
+            let title = t.trim_matches('=').trim();
+            if ["test session starts", "FAILURES", "ERRORS", "short test summary info"].contains(&title) {
+                noise[i] = true;
+                in_fail = title == "FAILURES" || title == "ERRORS";
+                continue;
+            }
+            in_fail = false;
+            context = false;
+            let counts = ["passed", "failed", "error", "skipped", "no tests ran"].iter().any(|k| title.contains(k));
+            if counts && (title.contains(|c: char| c.is_ascii_digit()) || title == "no tests ran") {
+                over[i] = Some(title.to_string());
+            }
+            continue;
+        }
+        if let Some(id) = t.strip_prefix("FAILED ") {
+            failed.push((i, id.split(" - ").next().unwrap_or(id)));
+        }
+        if in_fail && !t.trim().is_empty() {
+            let u = t.trim();
+            if !l.starts_with(char::is_whitespace) {
+                let rest = t.find(".py:").map(|p| t[p + 4..].trim_start_matches(|c: char| c.is_ascii_digit()));
+                if pytest_heading(t) {
+                    heads.push((i, pytest_key(t.trim_matches('_').trim()), false));
+                }
+                if pytest_heading(t) || t.chars().all(|c| matches!(c, '_' | ' ')) {
+                    context = true;
+                } else if pytest_frame(t) {
+                    // `file.py:5: in f` is a --tb=short frame whose source line follows: content.
+                    context = !rest.is_some_and(|r| r.trim_start_matches(':').trim_start().starts_with("in "));
+                } else if t.starts_with("> ") || t.starts_with("---") || t.starts_with("Traceback") {
+                    context = false;
+                }
+                if t.starts_with("E   ") {
+                    if let Some(h) = heads.last_mut() {
+                        h.2 = true;
+                    }
+                }
+            } else if u.starts_with("File \"") {
+                context = false;
+                keep[i] = true;
+            } else if context || u.chars().all(|c| matches!(c, '^' | '~' | ' ')) {
+                noise[i] = true;
+            } else {
+                // --tb=native/short frames, captured stdout/log text: content.
+                keep[i] = true;
+            }
+            if t.starts_with("> ") || t.starts_with("E   ") || t == "E" {
+                run.push(i);
+            } else if !noise[i] {
+                dedent_run(lines, &mut run, over);
+            }
+        } else {
+            dedent_run(lines, &mut run, over);
+        }
+        if !l.starts_with('E') && t.trim_start().starts_with('+') && where_text.contains(t.trim()) {
+            noise[i] = true;
+        }
+    }
+    dedent_run(lines, &mut run, over);
+
+    // A failure block that was shown carries the node id; its `FAILED` line only repeats the first `E` line.
+    // A `FAILED` line whose test has no block here (summary-only, `-rA`) is the only record and stays.
+    let mut used = vec![false; heads.len()];
+    for (f, id) in failed {
+        let key = pytest_key_of_node(id);
+        if let Some(h) = (0..heads.len()).find(|&h| !used[h] && heads[h].2 && heads[h].1 == key) {
+            used[h] = true;
+            over[heads[h].0] = Some(format!("{id}:"));
+            noise[f] = true;
+            // The message's further lines (indented under it) repeat the block's `E` lines too.
+            for k in f + 1..lines.len() {
+                let l = lines[k];
+                if !l.trim().is_empty() && !l.starts_with(char::is_whitespace) {
+                    break;
+                }
+                noise[k] = true;
+            }
+        }
+    }
+}
+
+/// `TestX.test_y[1-2]` heading name to `test_y[1-2]`: the part a node id ends with.
+fn pytest_key(name: &str) -> String {
+    let (base, param) = name.split_once('[').map_or((name, String::new()), |(b, p)| (b, format!("[{p}")));
+    format!("{}{param}", base.rsplit('.').next().unwrap_or(base))
+}
+
+/// `a.py::TestX::test_y[1-2]` to `test_y[1-2]`.
+fn pytest_key_of_node(id: &str) -> String {
+    // A parameter id may contain `::`, so cut at the last `::` before any `[`.
+    let head = id.split('[').next().unwrap_or(id);
+    let start = head.rfind("::").map_or(0, |p| p + 2);
+    id[start..].to_string()
+}
+
+/// Remove the indent shared by a run of `>`/`E` lines so `>       assert` reads `> assert`, keeping each
+/// line's indent relative to the others (pytest's diffs depend on it). A bare `E` (a blank line of the
+/// message) has no indent to share and prints as `E`.
+fn dedent_run(lines: &[&str], run: &mut Vec<usize>, over: &mut [Option<String>]) {
+    let gap = |l: &str| l[1..].len() - l[1..].trim_start_matches(' ').len();
+    let min = run.iter().map(|&i| lines[i].trim_end()).filter(|l| l.len() > 1).map(gap).min();
+    if let Some(m) = min.filter(|&m| m > 1) {
+        for &i in run.iter() {
+            let l = lines[i].trim_end();
+            over[i] = Some(if l.len() > 1 {
+                format!("{}{}{}", &l[..1], " ".repeat(gap(l) - m + 1), l[1..].trim_start_matches(' '))
+            } else {
+                l.to_string()
+            });
+        }
+    }
+    run.clear();
 }
 
 fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool)> {
@@ -1001,6 +1737,22 @@ fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool
         return None;
     }
     let mut keep = vec![false; lines.len()];
+    // Lines that only repeat or decorate something kept (see `fold_*`): dropping them is not a loss.
+    let mut noise = vec![false; lines.len()];
+    let mut over: Vec<Option<String>> = vec![None; lines.len()];
+    fold_rustc(&lines, &mut keep, &mut noise, &mut over);
+    fold_cargo_test(&lines, &mut noise);
+    fold_pytest(&lines, &mut keep, &mut noise, &mut over);
+    // rustc's closing hints repeat the E-codes already on the `error[E....]` headers.
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t.starts_with("Some errors have detailed explanations:")
+            || t.starts_with("For more information about an error, try `rustc --explain")
+            || t.starts_with("For more information about this error, try `rustc --explain")
+        {
+            noise[i] = true;
+        }
+    }
     let mut hits = 0usize;
     let mut i = 0usize;
     let mut deprecated: Vec<&str> = Vec::new();
@@ -1080,11 +1832,43 @@ fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool
     if !build && lines.iter().any(|l| l.starts_with("E   ")) {
         for (i, l) in lines.iter().enumerate() {
             let t = l.trim_end();
-            if pytest_frame(t) || pytest_heading(t) {
+            if pytest_frame(t) {
                 keep[i] = true;
+            } else if pytest_heading(t) {
+                keep[i] = true;
+                if over[i].is_none() {
+                    over[i] = Some(format!("{}:", t.trim_matches('_').trim()));
+                }
             } else if l.starts_with("E   ") && (i == 0 || !lines[i - 1].starts_with("E   ")) {
                 if let Some(src) = (i.saturating_sub(2)..i).rev().find(|&k| lines[k].starts_with("> ")) {
                     keep[src] = true;
+                }
+            }
+        }
+    }
+    for (k, n) in keep.iter_mut().zip(&noise) {
+        *k &= !n;
+    }
+    // A green cargo run with nothing else to say still shows its `Finished` line.
+    if !keep.iter().any(|&k| k) {
+        if let Some(k) = lines.iter().rposition(|l| l.trim().starts_with("Finished ")) {
+            keep[k] = true;
+        }
+    }
+
+    // A red run keeps what it cannot call routine and an agent may need: a line at column 0 (a package, a
+    // log line, a compiler note) or one that names a failure. Indented detail stays cut, and is spooled.
+    // They only fill the room the recognised lines leave, failure words first, so they never push a
+    // recognised failure out of the 240-line window.
+    if code != 0 {
+        let mut room = 240usize.saturating_sub(keep.iter().filter(|&&k| k).count());
+        for words in [true, false] {
+            for (i, l) in lines.iter().enumerate() {
+                let t = l.trim();
+                let want = if words { failure_word(t) } else { !l.starts_with(char::is_whitespace) };
+                if room > 0 && !keep[i] && !noise[i] && !routine_line(t) && want {
+                    keep[i] = true;
+                    room -= 1;
                 }
             }
         }
@@ -1096,10 +1880,11 @@ fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool
     }
 
     let mut out = String::new();
-    let mut kept = 0usize;
+    // Lines the output shows, or repeats of ones it shows.
+    let mut shown = vec![false; lines.len()];
     // A green run that drops more than progress (prints, console.log, unknown notes) keeps the
     // full text on disk: the caller sees it was cut and where it went.
-    let mut clipped = lines.iter().zip(&keep).any(|(l, k)| !k && !routine_line(l.trim()));
+    let mut clipped = lines.iter().zip(keep.iter().zip(&noise)).any(|(l, (k, n))| !k && !n && !routine_line(l.trim()));
     // msbuild/tsc print each located error again in their summary; the location
     // makes an exact repeat a true duplicate (rustc headers repeat without one).
     let mut seen = std::collections::HashSet::new();
@@ -1108,13 +1893,13 @@ fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool
             clipped = true;
             continue;
         }
+        shown[idx] = true;
         let t = lines[idx].trim();
         if (t.contains("): error ") || t.contains("): warning ")) && !seen.insert(t) {
             continue;
         }
-        out.push_str(lines[idx]);
+        out.push_str(over[idx].as_deref().unwrap_or(lines[idx]));
         out.push('\n');
-        kept += 1;
     }
     if !deprecated.is_empty() {
         let shown = deprecated.iter().take(12).copied().collect::<Vec<_>>().join(", ");
@@ -1125,13 +1910,12 @@ fn diagnostic(text: &str, code: i32, build: bool) -> Option<(String, usize, bool
         }
         out.push('\n');
     }
+    // Only lines that carry content count as omitted: blank, decoration and folded lines do not.
+    let omitted = (0..lines.len()).filter(|&i| !shown[i] && !noise[i] && !routine_line(lines[i].trim())).count();
     if clipped {
-        out.push_str(&format!(
-            "[qx] {} diagnostic lines omitted; full text: {FULL}\n",
-            lines.len().saturating_sub(kept)
-        ));
+        out.push_str(&format!("[qx] {omitted} diagnostic lines omitted\n"));
     }
-    Some((out, lines.len().saturating_sub(kept), clipped))
+    Some((out, omitted, clipped))
 }
 
 /// `path:line:content`, else bare `path:content` (rg piped without line numbers).
@@ -1189,67 +1973,97 @@ fn split_numbered(line: &str) -> Option<(&str, &str, &str)> {
     None
 }
 
+/// Lines a search digest gives its file names and matches: with its total and trailer lines it stays
+/// under the 400-line bound of `digest`, whose compaction would otherwise cut files out of the middle.
+const GREP_LINES: usize = 380;
+
+/// `rg --heading` shape: each file's path on its own line, then its matches as `12:text`. A file
+/// whose matches were capped says how many it had (`path (25 of 40)`). The same text on several
+/// lines of one file (a `#[cfg]` twin, a repeated call) shows once with every line number: `12,40:text`.
 fn grep(text: &str) -> Option<(String, usize, bool)> {
-    // (path, matches seen, matches kept): the caps are per file (25) and overall
-    // (300), and a capped file still shows its true count.
-    type Group = (String, usize, Vec<(String, String)>);
-    let mut groups: Vec<Group> = Vec::new();
-    let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    let mut parsed = 0usize;
-    let mut kept = 0usize;
-    let mut clipped = false;
-
+    let mut matches = Vec::new();
     for line in text.lines() {
-        let Some((path, num, content)) = split_match(line) else {
-            // Context lines (`-A`), `Binary file x matches` and the like cannot be placed in a group,
-            // so a digest would drop them without a trace: leave the output to generic compaction.
-            if line.trim().is_empty() || line == "--" {
-                continue;
-            }
-            return None;
-        };
-        parsed += 1;
-        let g = *index.entry(path).or_insert_with(|| {
-            groups.push((path.to_string(), 0, Vec::new()));
-            groups.len() - 1
-        });
-        groups[g].1 += 1;
-        if groups[g].2.len() >= 25 || kept >= 300 {
-            clipped = true;
-            continue;
+        match split_match(line) {
+            Some(m) => matches.push(m),
+            // `--` alone is a group separator. Context lines (`-A`), `Binary file x matches` and the like
+            // cannot be placed in a group, so a digest would drop them without a trace: leave the output
+            // to generic compaction.
+            None if line.trim().is_empty() || line == "--" => {}
+            None => return None,
         }
-        let content = content.trim_end();
-        let content = if content.len() > 500 {
-            format!("{}…", &content[..(0..=500).rev().find(|&i| content.is_char_boundary(i)).unwrap_or(0)])
-        } else {
-            content.to_string()
-        };
-        groups[g].2.push((num.to_string(), content));
-        kept += 1;
     }
-
+    let parsed = matches.len();
     if parsed < 3 {
         return None;
     }
+    // Every file is named while that takes at most half the budget (the file list is the map of the
+    // answer); the matches get the rest.
+    let names = matches.iter().map(|m| m.0).collect::<std::collections::HashSet<_>>().len().min(GREP_LINES / 2);
+    // (path, matches seen, matches kept, kept lines as (numbers, text)): the caps are per file (25)
+    // and overall, and a capped file still shows its true count. Once one match is past the overall
+    // cap none after it is kept, so the files without a shown match are the tail of `groups`.
+    type Group = (String, usize, usize, Vec<(String, String)>);
+    let mut groups: Vec<Group> = Vec::new();
+    let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut kept = 0usize;
+    let mut clipped = false;
+    let mut cut_lines = 0usize;
 
-    let mut out = String::new();
-    for (shown, (path, seen, items)) in groups.iter().enumerate() {
-        if shown >= 200 && items.is_empty() {
-            let rest = groups[shown..].iter().filter(|g| g.2.is_empty()).count();
+    for (path, num, content) in matches {
+        let g = *index.entry(path).or_insert_with(|| {
+            groups.push((path.to_string(), 0, 0, Vec::new()));
+            groups.len() - 1
+        });
+        groups[g].1 += 1;
+        if groups[g].2 >= 25 || kept >= GREP_LINES - names {
+            clipped = true;
+            continue;
+        }
+        groups[g].2 += 1;
+        kept += 1;
+        // Indentation is nesting depth, not content: the match keeps its text and its line number.
+        let content = content.trim();
+        // A minified line is cut in the middle, not at the end: its tail (where a stack, a path or the
+        // match often sits) stays, and the flag spools the whole line.
+        let content = if content.len() > 500 {
+            let head = (0..=250).rev().find(|&i| content.is_char_boundary(i)).unwrap_or(0);
+            let tail = (content.len() - 250..=content.len()).find(|&i| content.is_char_boundary(i)).unwrap_or(content.len());
+            cut_lines += 1;
+            format!("{} … {}", &content[..head], &content[tail..])
+        } else {
+            content.to_string()
+        };
+        // Without line numbers a repeat has nothing to be told apart by: it stays a line of its own.
+        let items = &mut groups[g].3;
+        match items.iter_mut().find(|(n, c)| !num.is_empty() && !n.is_empty() && *c == content) {
+            Some((n, _)) => {
+                n.push(',');
+                n.push_str(num);
+            }
+            None => items.push((num.to_string(), content)),
+        }
+    }
+
+    // The per-file counts alone make the agent add them up; one total survives the grouping.
+    let mut out = format!("{parsed} matches in {} files\n", groups.len());
+    for (shown, (path, seen, kept_here, items)) in groups.iter().enumerate() {
+        // Files past the overall cap are still named, with their counts, up to the name budget.
+        if shown >= names && items.is_empty() {
+            let rest = groups.len() - shown;
             out.push_str(&format!("[qx] +{rest} more files with matches (cap reached)\n"));
             break;
         }
         out.push_str(path);
-        if *seen > items.len() {
-            out.push_str(&format!(" ({} of {seen})\n", items.len()));
-        } else {
-            out.push_str(&format!(" ({seen})\n"));
+        if seen > kept_here {
+            out.push_str(&format!(" ({kept_here} of {seen})"));
         }
+        out.push('\n');
         for (num, content) in items {
-            out.push_str("  ");
-            if !num.is_empty() {
+            if num.is_empty() {
+                out.push_str("  ");
+            } else {
                 out.push_str(num);
-                out.push_str(": ");
+                out.push(':');
             }
             out.push_str(content);
             out.push('\n');
@@ -1259,25 +2073,31 @@ fn grep(text: &str) -> Option<(String, usize, bool)> {
     if clipped {
         out.push_str(&format!("[qx] match cap reached: {hidden} matches not shown\n"));
     }
-    Some((out, hidden, clipped))
+    if cut_lines > 0 {
+        out.push_str(&format!("[qx] {cut_lines} long lines cut to their first and last 250 bytes\n"));
+    }
+    Some((out, hidden, clipped || cut_lines > 0))
 }
 
-/// Minify a JSON reply. Never a file the agent asked to read: `cat package.json` is read to be edited.
-fn json_min(label: &str, text: &str) -> Option<(String, usize)> {
-    let t = text.trim();
-    if !(t.starts_with('{') || t.starts_with('[')) {
-        return None;
-    }
-    let reader = label.split_whitespace().next().unwrap_or("");
-    if matches!(reader, "cat" | "type" | "jq" | "get-content" | "gc" | "bat" | "head" | "tail" | "less" | "more") {
-        return None;
-    }
-    // Validate, then strip whitespace only: numbers and key order stay byte-exact.
-    serde_json::from_str::<serde_json::Value>(t).ok()?;
+/// A JSON array of objects shows at most this many bytes of records (minified JSON; a table of them is
+/// smaller), split 3:1 between its first and last records (the tail shows what the list ends with).
+const JSON_RECORD_BYTES: usize = 2000;
+
+/// A file the agent reads whole is shown by plain compaction up to this many lines; only a longer one
+/// (which would be cut to its first and last lines anyway) is shown as records.
+const JSON_READ_LINES: usize = 200;
+
+/// Whitespace-stripped JSON and, for the first array of objects in it, the byte range of each element.
+/// Only whitespace outside strings goes: numbers and key order stay byte-exact.
+fn minify_json(t: &str) -> (String, Vec<(usize, usize)>) {
     let mut out = String::with_capacity(t.len());
-    let mut in_str = false;
-    let mut esc = false;
-    for ch in t.chars() {
+    let mut recs: Vec<(usize, usize)> = Vec::new();
+    let (mut in_str, mut esc) = (false, false);
+    let mut depth = 0usize;
+    // Depth of the record array while it is open (its elements' commas are at this depth).
+    let mut rec_depth: Option<usize> = None;
+    let mut found = false;
+    for (at, ch) in t.char_indices() {
         if in_str {
             out.push(ch);
             if esc {
@@ -1287,22 +2107,220 @@ fn json_min(label: &str, text: &str) -> Option<(String, usize)> {
             } else if ch == '"' {
                 in_str = false;
             }
-        } else if ch == '"' {
-            in_str = true;
-            out.push(ch);
-        } else if !ch.is_whitespace() {
-            out.push(ch);
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_str = true;
+                out.push(ch);
+            }
+            '[' | '{' => {
+                out.push(ch);
+                depth += 1;
+                if ch == '[' && !found && t[at + 1..].trim_start().starts_with('{') {
+                    found = true;
+                    rec_depth = Some(depth);
+                    recs.push((out.len(), 0));
+                }
+            }
+            ']' | '}' => {
+                if ch == ']' && rec_depth == Some(depth) {
+                    if let Some(last) = recs.last_mut() {
+                        last.1 = out.len();
+                    }
+                    rec_depth = None;
+                }
+                depth = depth.saturating_sub(1);
+                out.push(ch);
+            }
+            ',' => {
+                if rec_depth == Some(depth) {
+                    if let Some(last) = recs.last_mut() {
+                        last.1 = out.len();
+                    }
+                    out.push(ch);
+                    recs.push((out.len(), 0));
+                } else {
+                    out.push(ch);
+                }
+            }
+            c if c.is_whitespace() => {}
+            c => out.push(c),
         }
     }
-    if out.len() + 1 >= t.len() {
+    (out, recs)
+}
+
+/// Minify a JSON reply. A file the agent asked to read (`cat package.json`) is read to be edited, so it
+/// stays whole unless it is long enough for plain compaction to cut it. An array of objects is shown one
+/// minified record per line (the text stays valid JSON), so the byte budget keeps more records than the
+/// pretty-printed lines would, from the head and the tail; the rest is counted, and spooled by the
+/// caller as an omission. Once records are left out (the text is no longer the whole JSON anyway),
+/// records of one shape are shown as a table (`json_table`): the keys once, not on every record.
+fn json_min(label: &str, text: &str) -> Option<(String, usize)> {
+    let t = text.trim();
+    if !(t.starts_with('{') || t.starts_with('[')) {
         return None;
     }
-    Some((format!("{out}\n"), 0))
+    let reader = label.split_whitespace().next().unwrap_or("");
+    let reads = matches!(reader, "cat" | "type" | "jq" | "get-content" | "gc" | "bat" | "head" | "tail" | "less" | "more");
+    if reads && t.lines().count() <= JSON_READ_LINES {
+        return None;
+    }
+    // Validate, then strip whitespace only. A raw value is checked without building the tree, which for
+    // a 16 MiB reply would be ten times its size.
+    serde_json::from_str::<&serde_json::value::RawValue>(t).ok()?;
+    let (out, recs) = minify_json(t);
+    if recs.len() < 2 {
+        if reads || out.len() + 1 >= t.len() {
+            return None;
+        }
+        return Some((format!("{out}\n"), 0));
+    }
+    let n = recs.len();
+    let len = |k: usize| recs[k].1 - recs[k].0 + 1;
+    // The first and the last record always show (a cut one is spooled); more while the budget lasts.
+    let (mut head, mut head_used) = (1, len(0));
+    while head + 1 < n && head_used + len(head) <= JSON_RECORD_BYTES * 3 / 4 {
+        head_used += len(head);
+        head += 1;
+    }
+    let (mut tail, mut tail_used) = (1, len(n - 1));
+    while head + tail < n && tail_used + len(n - 1 - tail) <= JSON_RECORD_BYTES / 4 {
+        tail_used += len(n - 1 - tail);
+        tail += 1;
+    }
+    let hidden = n - head - tail;
+    let shown: Vec<usize> = (0..head).chain(n - tail..n).collect();
+    let table = if hidden > 0 { json_table(shown.iter().map(|&k| &out[recs[k].0..recs[k].1])) } else { None };
+    let mut s = String::with_capacity(head_used + tail_used + 128);
+    s.push_str(&out[..recs[0].0]);
+    s.push('\n');
+    if let Some((header, _)) = &table {
+        s.push_str(header);
+    }
+    for (i, &k) in shown.iter().enumerate() {
+        if k == n - tail && hidden > 0 {
+            s.push_str(&format!("[qx] {hidden} of {n} records not shown\n"));
+        }
+        match &table {
+            Some((_, rows)) => s.push_str(&rows[i]),
+            None => {
+                s.push_str(&out[recs[k].0..recs[k].1]);
+                if k + 1 < n {
+                    s.push(',');
+                }
+            }
+        }
+        s.push('\n');
+    }
+    s.push_str(&out[recs[n - 1].1..]);
+    s.push('\n');
+    if s.len() >= t.len() {
+        return None;
+    }
+    Some((s, hidden))
+}
+
+/// Records of one shape as a table: a header line `[qx] records as rows: id,name,address.zip`, then one
+/// row per record of its minified JSON values (`1,"ann","Z1"`). Every record must be an object with
+/// the same keys in the same order; an object value is flattened one level (`address.zip`), and a
+/// column with one value in each of 3+ rows is said once in the header: `(every row shown: tags=[])`.
+/// `None` keeps the records as JSON lines.
+fn json_table<'a>(records: impl Iterator<Item = &'a str>) -> Option<(String, Vec<String>)> {
+    let mut rows: Vec<Vec<(String, &str)>> = Vec::new();
+    for r in records {
+        let mut cells = Vec::new();
+        for (k, v) in json_members(r)? {
+            match json_members(v).filter(|m| !m.is_empty()) {
+                Some(sub) => cells.extend(sub.into_iter().map(|(s, sv)| (format!("{k}.{s}"), sv))),
+                None => cells.push((k.to_string(), v)),
+            }
+        }
+        if rows.first().is_some_and(|f| f.len() != cells.len() || f.iter().zip(&cells).any(|(a, b)| a.0 != b.0)) {
+            return None;
+        }
+        rows.push(cells);
+    }
+    let first = rows.first()?;
+    let fixed: Vec<bool> = (0..first.len()).map(|c| rows.len() >= 3 && rows.iter().all(|r| r[c].1 == first[c].1)).collect();
+    if fixed.iter().all(|&f| f) {
+        return None;
+    }
+    let pick = |row: &[(String, &'a str)], want: bool| -> Vec<(String, &'a str)> {
+        row.iter().zip(&fixed).filter(|(_, f)| **f == want).map(|(c, _)| c.clone()).collect()
+    };
+    let cols: Vec<String> = pick(first, false).into_iter().map(|(k, _)| k).collect();
+    let mut header = format!("[qx] records as rows: {}", cols.join(","));
+    let same: Vec<String> = pick(first, true).into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+    if !same.is_empty() {
+        header.push_str(&format!(" (every row shown: {})", same.join(", ")));
+    }
+    header.push('\n');
+    let rows = rows.iter().map(|r| pick(r, false).into_iter().map(|(_, v)| v).collect::<Vec<_>>().join(",")).collect();
+    Some((header, rows))
+}
+
+/// The `"key":value` members of a minified JSON object; `None` when `t` is not an object or a key is
+/// not a plain name a table header can show (empty, escaped, or holding `,.=` or a space).
+fn json_members(t: &str) -> Option<Vec<(&str, &str)>> {
+    let body = t.strip_prefix('{')?.strip_suffix('}')?;
+    let mut members = Vec::new();
+    if body.is_empty() {
+        return Some(members);
+    }
+    let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+    let mut cuts = Vec::new();
+    for (i, c) in body.bytes().enumerate() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.checked_sub(1)?,
+            b',' if depth == 0 => cuts.push(i),
+            _ => {}
+        }
+    }
+    cuts.push(body.len());
+    let mut from = 0;
+    for to in cuts {
+        let m = body[from..to].strip_prefix('"')?;
+        let q = m.find('"')?;
+        let (key, value) = (&m[..q], m[q + 1..].strip_prefix(':')?);
+        if key.is_empty() || key.contains(['\\', ',', '.', '=', ' ']) || value.is_empty() {
+            return None;
+        }
+        members.push((key, value));
+        from = to + 1;
+    }
+    Some(members)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_invalid_assignment_word_is_not_stripped() {
+        assert_eq!(core_label("1X=foo cargo test"), "1X=foo cargo test");
+        assert_eq!(core_label("CI=1 cargo test"), "cargo test");
+    }
+
+    #[test]
+    fn only_build_artifact_arrows_are_routine() {
+        assert!(routine_line(r"App -> C:\src\App\bin\Debug\net8.0\App.dll"));
+        assert!(!routine_line("answer -> 42"));
+        assert!(is_build("cargo build") && is_build("cargo build --release") && !is_build("cargo buildx"));
+    }
 
     #[test]
     fn a_cut_stderr_marks_the_digest_lossy_so_it_is_spooled() {
@@ -1331,11 +2349,21 @@ mod tests {
     fn status_drops_hints_keeps_files() {
         let raw = "On branch main\nYour branch is up to date with 'origin/main'.\n\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n\tmodified:   src/main.rs\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tnew.txt\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n";
         let (out, omitted) = git_status(raw).unwrap();
-        assert!(out.contains("branch main"));
+        assert!(out.starts_with("## main...origin/main\n"));
         assert!(out.contains("src/main.rs"));
         assert!(out.contains("new.txt"));
         assert!(!out.contains("use \"git add"));
         assert!(omitted > 0);
+    }
+
+    #[test]
+    fn a_diff_that_fits_is_not_cut_at_the_plain_budget() {
+        let (max, head, tail) = plain_budget("git diff", (200, 80, 60));
+        assert!(max >= DIFF_WHOLE && head + tail < max);
+        let body: String = (0..DIFF_WHOLE).map(|i| format!("+line {i} {}\n", "x".repeat(i % 7))).collect();
+        assert!(digest("git diff", &body, "", 0).is_none());
+        assert!(!compact::compact(&body, max, head, tail).1);
+        assert_eq!(plain_budget("ls", (200, 80, 60)), (200, 80, 60));
     }
 
     #[test]
@@ -1349,6 +2377,139 @@ mod tests {
         assert!(!clipped);
     }
 
+    const CRLF_WARN: &str = "warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'src/util.py', CRLF will be replaced by LF the next time Git touches it\n";
+
+    fn short_diff() -> String {
+        let mut s = String::from("diff --git a/README.md b/README.md\nindex e5ad4d9..7a3f716 100644\n--- a/README.md\n+++ b/README.md\n@@ -3,7 +3,7 @@\n # README line 3\n-retries = 3\n+retries = 5\n # README line 7\n");
+        s.push_str("diff --git a/old.txt b/old.txt\ndeleted file mode 100644\nindex fe33913..0000000\n--- a/old.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-# old line 1\n-# old line 2\n");
+        s.push_str("diff --git a/new.txt b/new.txt\nnew file mode 100755\nindex 0000000..fe33913\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello\n");
+        s
+    }
+
+    #[test]
+    fn a_short_diff_folds_headers_and_keeps_every_hunk_line() {
+        let raw = short_diff();
+        let d = digest("git diff", &raw, "", 0).expect("short diff trims");
+        let out = &d.stdout;
+        assert!(!d.lossy(), "{out}");
+        assert!(out.starts_with("diff README.md\n@@ -3,7 +3,7 @@\n # README line 3\n-retries = 3\n+retries = 5\n # README line 7\n"), "{out}");
+        assert!(out.contains("diff old.txt (deleted 100644)\n@@ -1,2 +0,0 @@\n-# old line 1\n-# old line 2\n"), "{out}");
+        assert!(out.contains("diff new.txt (new 100755)\n@@ -0,0 +1 @@\n+hello\n"), "{out}");
+        assert!(!out.contains("index ") && !out.contains("--- ") && !out.contains("+++ ") && !out.contains("diff --git"), "{out}");
+    }
+
+    #[test]
+    fn a_short_diff_of_a_minified_line_is_still_held_to_the_line_cap() {
+        let raw = format!("diff --git a/m.js b/m.js\nindex 1..2 100644\n--- a/m.js\n+++ b/m.js\n@@ -1 +1 @@\n-{}\n+{}\n", "x".repeat(50_000), "y".repeat(50_000));
+        let d = digest("git diff", &raw, "", 0).unwrap();
+        assert!(d.stdout.len() < 10_000 && d.lossy() && d.stdout.starts_with("diff m.js\n@@ -1 +1 @@\n"), "{}", d.stdout.len());
+    }
+
+    #[test]
+    fn diff_folds_rename_and_keeps_mode_change_and_odd_headers() {
+        let raw = "diff --git a/a.rs b/b.rs\nsimilarity index 95%\nrename from a.rs\nrename to b.rs\nindex 111..222 100644\n--- a/a.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\ndiff --git a/img.png b/img.png\nindex 1..2 100644\nBinary files a/img.png and b/img.png differ\ndiff --git i/odd.txt w/odd.txt\nindex 1..2 100644\n--- i/odd.txt\n+++ w/odd.txt\n@@ -1 +1 @@\n-p\n+q\n";
+        let (out, folded) = trim_diff_headers(raw).unwrap();
+        assert!(!folded, "headers only: nothing lost");
+        assert!(out.starts_with("diff a.rs -> b.rs (renamed 95%)\n@@ -1 +1 @@\n-x\n+y\n"), "{out}");
+        assert!(out.contains("diff run.sh\nold mode 100644\nnew mode 100755\n"), "{out}");
+        assert!(out.contains("diff img.png\nBinary files a/img.png and b/img.png differ\n"), "{out}");
+        assert!(out.contains("diff --git i/odd.txt w/odd.txt\n--- i/odd.txt\n+++ w/odd.txt\n@@ -1 +1 @@\n-p\n+q\n"), "{out}");
+    }
+
+    #[test]
+    fn show_keeps_the_commit_header_and_body() {
+        let raw = "commit d1d3fe3f1d7521048c3411ef8fcc3a8aacbbefa1\nAuthor: T <t@example.test>\nDate:   Wed Nov 18 19:35:24 2026 +0000\n\n    fix(core): switch to safe mode\n    \n    Body: fast mode corrupted the cache under load.\n\ndiff --git a/src/core.py b/src/core.py\nindex e350f92..c549c17 100644\n--- a/src/core.py\n+++ b/src/core.py\n@@ -7,7 +7,7 @@\n # core line 9\n-mode = fast\n+mode = safe\n # core line 11\n";
+        let d = digest("git show", raw, "", 0).unwrap();
+        assert!(d.stdout.starts_with(&raw[..raw.find("diff --git").unwrap()]), "{}", d.stdout);
+        assert!(d.stdout.contains("diff src/core.py\n@@ -7,7 +7,7 @@\n # core line 9\n-mode = fast\n+mode = safe\n # core line 11\n"), "{}", d.stdout);
+        assert!(!d.lossy());
+    }
+
+    #[test]
+    fn git_line_ending_warnings_are_dropped_from_git_commands_only() {
+        let mut err = format!("{CRLF_WARN}fatal: pathspec 'x' did not match\n");
+        drop_git_eol_warnings("git add x", &mut err);
+        assert_eq!(err, "fatal: pathspec 'x' did not match\n");
+        // Other commands keep their stderr as is.
+        let mut other = CRLF_WARN.to_string();
+        drop_git_eol_warnings("echo hi", &mut other);
+        assert_eq!(other, CRLF_WARN);
+    }
+
+    #[test]
+    fn status_uses_the_short_encoding_and_merges_staged_with_modified() {
+        let raw = "On branch main\nChanges to be committed:\n  (use \"git restore --staged <file>...\" to unstage)\n\tmodified:   src/core.py\n\tnew file:   src/new_feature.py\n\trenamed:    src/legacy.py -> src/renamed.py\n\tmodified:   src/util.py\n\nChanges not staged for commit:\n  (use \"git add/rm <file>...\" to update what will be committed)\n  (use \"git restore <file>...\" to discard changes in working directory)\n\tmodified:   README.md\n\tmodified:   docs/guide.md\n\tdeleted:    old.txt\n\tmodified:   src/util.py\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tbuild.log\n\tnotes.tmp\n\tscratch/\n";
+        let (out, _) = git_status(raw).unwrap();
+        assert_eq!(
+            out,
+            "## main\nM  src/core.py\nA  src/new_feature.py\nR  src/legacy.py -> src/renamed.py\nMM src/util.py\n M README.md docs/guide.md\n D old.txt\n?? build.log notes.tmp scratch/\n"
+        );
+    }
+
+    #[test]
+    fn status_header_carries_upstream_ahead_behind_detached_and_no_commits() {
+        let head = |raw: &str| git_status(raw).unwrap().0.lines().next().unwrap().to_string();
+        assert_eq!(head("On branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean\n"), "## main...origin/main");
+        assert_eq!(head("On branch main\nYour branch is ahead of 'origin/main' by 2 commits.\n  (use \"git push\" to publish your local commits)\n\nnothing to commit, working tree clean\n"), "## main...origin/main [ahead 2]");
+        assert_eq!(head("On branch main\nYour branch is behind 'origin/main' by 1 commit, and can be fast-forwarded.\n  (use \"git pull\" to update your local branch)\n\nnothing to commit, working tree clean\n"), "## main...origin/main [behind 1]");
+        assert_eq!(
+            head("On branch main\nYour branch and 'origin/main' have diverged,\nand have 2 and 1 different commits each, respectively.\n  (use \"git pull\" to merge the remote branch into yours)\n\nnothing to commit, working tree clean\n"),
+            "## main...origin/main [ahead 2, behind 1]"
+        );
+        assert_eq!(head("On branch main\nYour branch is based on 'origin/gone', but the upstream is gone.\n\nnothing to commit, working tree clean\n"), "## main...origin/gone [gone]");
+        assert_eq!(head("HEAD detached at abc1234\nnothing to commit, working tree clean\n"), "## HEAD (detached at abc1234)");
+        let (out, _) = git_status("On branch main\n\nNo commits yet\n\nChanges to be committed:\n  (use \"git rm --cached <file>...\" to unstage)\n\tnew file:   a.rs\n").unwrap();
+        assert_eq!(out, "## No commits yet on main\nA  a.rs\n");
+        let (out, _) = git_status("On branch main\nnothing to commit, working tree clean\n").unwrap();
+        assert_eq!(out, "## main\nclean\n");
+    }
+
+    #[test]
+    fn status_maps_conflicts_to_their_two_letter_codes() {
+        let raw = "On branch main\ninteractive rebase in progress; onto abc1234\n";
+        assert!(git_status(raw).is_none(), "an unknown notice declines");
+        // As git prints a merge with conflicts: the notice stays, its hints go.
+        let raw = "On branch main\nYou have unmerged paths.\n  (fix conflicts and run \"git commit\")\n  (use \"git merge --abort\" to abort the merge)\n\nUnmerged paths:\n  (use \"git add <file>...\" to mark resolution)\n\tboth modified:   a.rs\n\tboth added:      b.rs\n\tboth deleted:    c.rs\n\tadded by us:     d.rs\n\tadded by them:   e.rs\n\tdeleted by us:   f.rs\n\tdeleted by them: g.rs\n\tboth modified:   h.rs\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n";
+        let (out, _) = git_status(raw).unwrap();
+        assert_eq!(out, "## main\nYou have unmerged paths.\nUU a.rs h.rs\nAA b.rs\nDD c.rs\nAU d.rs\nUA e.rs\nDU f.rs\nUD g.rs\n");
+    }
+
+    #[test]
+    fn a_long_status_group_wraps_with_its_code_repeated_and_loses_no_path() {
+        let paths: Vec<String> = (0..200).map(|i| format!("src/deep/module{i}/file_{i}.rs")).collect();
+        let raw = format!("On branch main\nChanges not staged for commit:\n{}", paths.iter().map(|p| format!("\tmodified:   {p}\n")).collect::<String>());
+        let (out, _) = git_status(&raw).unwrap();
+        assert!(out.lines().all(|l| l.len() <= 260 && l.len() < compact::MAX_LINE_CHARS), "{out}");
+        assert!(out.lines().skip(1).all(|l| l.starts_with(" M src/")), "{out}");
+        assert!(out.lines().count() > 3, "{out}");
+        let tokens: Vec<&str> = out.split_whitespace().filter(|t| t.starts_with("src/")).collect();
+        assert_eq!(tokens, paths.iter().map(String::as_str).collect::<Vec<_>>());
+        let (b, cut) = bound(out, 400);
+        assert!(!cut && b.contains("src/deep/module199/file_199.rs"));
+    }
+
+    #[test]
+    fn status_group_with_a_space_in_a_path_goes_one_path_per_line() {
+        let raw = "On branch main\nChanges not staged for commit:\n\tmodified:   ok.rs\n\tmodified:   a b.txt\n\tdeleted:    gone.rs\n\nUntracked files:\n\tx.txt\n\ty.txt\n";
+        let (out, _) = git_status(raw).unwrap();
+        assert_eq!(out, "## main\n M ok.rs\n M a b.txt\n D gone.rs\n?? x.txt y.txt\n");
+    }
+
+    #[test]
+    fn old_git_line_ending_warnings_are_filtered_too() {
+        let old = "warning: CRLF will be replaced by LF in a.txt.\nThe file will have its original line endings in your working directory\nwarning: LF will be replaced by CRLF in b.txt.\nThe file will have its original line endings in your working directory\nfatal: boom\n";
+        let mut old = old.to_string();
+        drop_git_eol_warnings("git add .", &mut old);
+        assert_eq!(old, "fatal: boom\n");
+    }
+
+    #[test]
+    fn grep_states_the_total_match_count() {
+        let raw = "src/a.rs:12:let x = 1;\nsrc/a.rs:40:let y = 2;\nsrc/b.rs:7:fn z() {}\n";
+        let (out, _, _) = grep(raw).unwrap();
+        assert!(out.starts_with("3 matches in 2 files\n"), "{out}");
+    }
+
     #[test]
     fn test_pass_keeps_only_summary() {
         let raw = "running 43 tests\n....................................\ntest result: ok. 43 passed; 0 failed; 0 ignored\n";
@@ -1360,8 +2521,8 @@ mod tests {
     fn pytest_failure_keeps_source_line_and_frames() {
         let raw = "collected 2 items\n\n=== FAILURES ===\n____ test_boom ____\n\n    def test_boom():\n        def inner(x):\n            return 1 / x\n>       inner(0)\n\ntest_fail.py:14: \n_ _ _ _ _\n\nx = 0\n\n    def inner(x):\n>       return 1 / x\n               ^^^^^\nE       ZeroDivisionError: division by zero\n\ntest_fail.py:13: ZeroDivisionError\n=== warnings summary ===\ntest_fail.py::test_warn\n  C:\\p\\test_fail.py:5: DeprecationWarning: old api\n=== short test summary info ===\nFAILED test_fail.py::test_boom - ZeroDivisionError\n=== 1 failed, 1 passed in 0.5s ===\n";
         let (out, _, _) = diagnostic(raw, 1, false).unwrap();
-        assert!(out.contains("____ test_boom ____"), "{out}");
-        assert!(out.contains(">       return 1 / x"), "{out}");
+        assert!(out.contains("test_boom:") && !out.contains("____"), "{out}");
+        assert!(out.contains("> return 1 / x") && out.contains("E ZeroDivisionError"), "{out}");
         assert!(out.contains("test_fail.py:14:") && out.contains("test_fail.py:13: ZeroDivisionError"));
         assert!(!out.contains("DeprecationWarning: old api")); // indented warning path is noise
         assert!(!out.contains("def inner"));
@@ -1406,22 +2567,182 @@ mod tests {
         assert!(!out.contains("test a ... ok"));
     }
 
+    fn assert_has(out: &str, wants: &[&str]) {
+        for w in wants {
+            assert!(out.contains(w), "{w}: {out}");
+        }
+    }
+
     #[test]
-    fn python_traceback_drops_noise() {
+    fn clippy_warnings_show_the_lint_on_the_header_and_drop_the_rest() {
+        let raw = "    Checking lintcrate v0.1.0 (C:\\x\\lintcrate)\nwarning: unneeded `return` statement\n --> src\\lib.rs:5:5\n  |\n5 |     return v[0];\n  |     ^^^^^^^^^^^\n  |\n  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#needless_return\n  = note: `#[warn(clippy::needless_return)]` on by default\nhelp: remove `return`\n  |\n5 -     return v[0];\n5 +     v[0]\n  |\n\nwarning: writing `&Vec` instead of `&[_]` involves a new object where a slice will do\n --> src\\lib.rs:1:17\n  |\n1 | pub fn first(v: &Vec<i32>) -> i32 {\n  |                 ^^^^^^^^^\n  |\n  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#ptr_arg\n  = note: `#[warn(clippy::ptr_arg)]` on by default\nhelp: change this to\n  |\n1 - pub fn first(v: &Vec<i32>) -> i32 {\n1 + pub fn first(v: &[i32]) -> i32 {\n  |\n\nwarning: length comparison to zero\n --> src\\lib.rs:2:8\n  |\n2 |     if v.len() == 0 {\n  |        ^^^^^^^^^^^^ help: using `is_empty` is clearer and more explicit: `v.is_empty()`\n  |\n  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#len_zero\n  = note: `#[warn(clippy::len_zero)]` on by default\n\nwarning: `lintcrate` (lib) generated 3 warnings (run `cargo clippy --fix --lib -p lintcrate -- ` to apply 2 suggestions)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s\n";
+        let (out, omitted, clipped) = diagnostic(raw, 0, true).unwrap();
+        assert_has(&out, &[
+            "warning: unneeded `return` statement [clippy::needless_return]",
+            "warning: length comparison to zero [clippy::len_zero]",
+            "[clippy::ptr_arg]",
+            "--> src\\lib.rs:5:5",
+            "--> src\\lib.rs:1:17",
+            "--> src\\lib.rs:2:8",
+            "help: using `is_empty` is clearer and more explicit: `v.is_empty()`",
+            "5 +     v[0]",
+            "1 + pub fn first(v: &[i32]) -> i32 {",
+            "generated 3 warnings",
+        ]);
+        for gone in ["for further information", "on by default", "Finished", "Checking", "return v[0]", "5 -", "^^^"] {
+            assert!(!out.contains(gone), "{gone}: {out}");
+        }
+        assert!(!clipped && omitted == 0 && !out.contains("omitted"), "{out}");
+    }
+
+    #[test]
+    fn rustc_warnings_keep_span_labels_and_their_source_line() {
+        let raw = "warning: unreachable pattern\n --> src/main.rs:5:9\n  |\n4 |         Some(_) => 1,\n  |         ------- matches all the values already\n5 |         Some(1) => 2,\n  |         ^^^^^^^ no value can reach this\n  |\n  = note: `#[warn(unreachable_patterns)]` on by default\n";
+        let (out, _, _) = diagnostic(raw, 0, true).unwrap();
+        assert_has(&out, &[
+            "[unreachable_patterns]",
+            "--> src/main.rs:5:9",
+            "4 |         Some(_) => 1,",
+            "matches all the values already",
+            "5 |         Some(1) => 2,",
+            "no value can reach this",
+        ]);
+        assert!(!out.lines().any(|l| l.trim() == "|"), "{out}");
+    }
+
+    #[test]
+    fn rustc_pipe_row_help_survives() {
+        let raw = "warning: variable does not need to be mutable\n --> src/main.rs:2:9\n  |\n2 |     let mut x = 1;\n  |         ----^\n  |         |\n  |         help: remove this `mut`\n  |\n  = note: `#[warn(unused_mut)]` on by default\n";
+        let (out, _, _) = diagnostic(raw, 0, true).unwrap();
+        assert_has(&out, &["[unused_mut]", "help: remove this `mut`"]);
+    }
+
+    #[test]
+    fn clippy_implied_lint_note_names_the_lint() {
+        let raw = "error: unneeded `return` statement\n --> a.rs:1:1\n  |\n1 | x\n  |\n  = note: `-D clippy::needless_return` implied by `-D warnings`\n  = help: to override `-D warnings` add `#[allow(clippy::needless_return)]`\n";
+        let (out, _, _) = diagnostic(raw, 1, true).unwrap();
+        assert!(out.contains("[clippy::needless_return]") && out.contains("--> a.rs:1:1"), "{out}");
+        assert!(!out.contains("implied by"), "{out}");
+    }
+
+    #[test]
+    fn rustc_errors_keep_codes_snippets_and_locations() {
+        let raw = "   Compiling errcrate v0.1.0 (C:\\x)\nerror[E0308]: mismatched types\n --> src\\lib.rs:2:18\n  |\n2 |     let n: i32 = s;\n  |            ---   ^ expected `i32`, found `&str`\n  |            |\n  |            expected due to this\n\nerror[E0425]: cannot find function `undefined_fn` in this scope\n --> src\\lib.rs:7:5\n  |\n7 |     undefined_fn(3)\n  |     ^^^^^^^^^^^^ not found in this scope\n\nSome errors have detailed explanations: E0308, E0425.\nFor more information about an error, try `rustc --explain E0308`.\nerror: could not compile `errcrate` (lib) due to 2 previous errors\n";
+        let (out, _, _) = diagnostic(raw, 101, true).unwrap();
+        assert_has(&out, &[
+            "error[E0308]: mismatched types",
+            "error[E0425]: cannot find function `undefined_fn` in this scope",
+            "--> src\\lib.rs:2:18",
+            "--> src\\lib.rs:7:5",
+            "expected `i32`, found `&str`",
+            "expected due to this",
+            "not found in this scope",
+            "could not compile `errcrate` (lib) due to 2 previous errors",
+        ]);
+        assert!(!out.contains("Compiling") && !out.contains("detailed explanations") && !out.contains("--explain"), "{out}");
+    }
+
+    #[test]
+    fn cargo_test_failure_shows_the_stdout_block_and_the_result_once() {
+        let raw = "\nrunning 7 tests\ntest tests::adds_ok_0 ... ok\ntest tests::adds_broken ... FAILED\ntest tests::adds_ok_3 ... ok\n\nfailures:\n\n---- tests::adds_broken stdout ----\n\nthread 'tests::adds_broken' (19364) panicked at src\\lib.rs:41:9:\nassertion `left == right` failed: math is hard\n  left: 4\n right: 5\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    tests::adds_broken\n\ntest result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n   Compiling okcrate v0.1.0 (C:\\x)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s\n     Running unittests src\\lib.rs (C:\\x\\okcrate-3.exe)\nerror: test failed, to rerun pass `--lib`\n";
+        let (out, omitted, clipped) = diagnostic(raw, 101, false).unwrap();
+        assert_has(&out, &[
+            "---- tests::adds_broken stdout ----",
+            "panicked at src\\lib.rs:41:9",
+            "math is hard",
+            "left: 4",
+            "right: 5",
+            "test result: FAILED. 6 passed; 1 failed",
+        ]);
+        assert_eq!(out.matches("adds_broken").count(), 2, "{out}"); // block heading + panic line
+        for gone in ["... FAILED", "RUST_BACKTRACE", "failures:", "error: test failed", "Finished", "Running"] {
+            assert!(!out.contains(gone), "{gone}: {out}");
+        }
+        assert!(!clipped && omitted == 0 && !out.contains("omitted"), "{out}");
+    }
+
+    #[test]
+    fn cargo_test_without_stdout_block_keeps_the_failed_line_and_binary_clue() {
+        let raw = "running 1 test\ntest slow ... FAILED\n\nfailures:\n    slow\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n\ntest result: ok. 3 passed; 0 failed; 0 ignored\nerror: test failed, to rerun pass `--test it`\n";
+        let (out, _, _) = diagnostic(raw, 101, false).unwrap();
+        assert_has(&out, &["test slow ... FAILED", "failures:", "    slow", "error: test failed, to rerun pass `--test it`"]);
+    }
+
+    #[test]
+    fn pytest_failure_drops_banners_and_repeated_where_but_keeps_facts() {
+        let raw = "============================= test session starts =============================\nplatform win32 -- Python 3.12.6, pytest-9.0.2, pluggy-1.6.0\nrootdir: C:\\x\\py\nplugins: anyio-4.12.1, asyncio-1.3.0\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None\ncollected 24 items\n\ntest_calc.py .......................F                                    [100%]\n\n================================== FAILURES ===================================\n_______________________________ test_total_bad ________________________________\n\n    def test_total_bad():\n>       assert total([1, 2, 3]) == 7\nE       assert 6 == 7\nE        +  where 6 = total([1, 2, 3])\n\ntest_calc.py:75: AssertionError\n=========================== short test summary info ===========================\nFAILED test_calc.py::test_total_bad - assert 6 == 7\n +  where 6 = total([1, 2, 3])\n======================== 1 failed, 23 passed in 0.30s =========================\n";
+        let (out, omitted, clipped) = diagnostic(raw, 1, false).unwrap();
+        assert_has(&out, &[
+            "test_calc.py::test_total_bad:",
+            "> assert total([1, 2, 3]) == 7",
+            "E assert 6 == 7",
+            "E  +  where 6 = total([1, 2, 3])",
+            "test_calc.py:75: AssertionError",
+            "1 failed, 23 passed in 0.30s",
+        ]);
+        assert_eq!(out.matches("where 6 = total").count(), 1, "{out}");
+        for gone in ["platform", "rootdir", "plugins", "asyncio", "collected", "====", "____", "[100%]", "short test summary"] {
+            assert!(!out.contains(gone), "{gone}: {out}");
+        }
+        assert!(!clipped && omitted == 0 && !out.contains("omitted"), "{out}");
+    }
+
+    #[test]
+    fn pytest_native_and_short_tracebacks_keep_every_frame_line() {
+        let native = "=== FAILURES ===\n____ test_x ____\nTraceback (most recent call last):\n  File \"C:\\\\p\\\\test_x.py\", line 5, in test_x\n    assert f() == 2\nAssertionError: assert 1 == 2\n=== short test summary info ===\nFAILED test_x.py::test_x - AssertionError: assert 1 == 2\n=== 1 failed in 0.1s ===\n";
+        let (out, omitted, clipped) = diagnostic(native, 1, false).unwrap();
+        assert_has(&out, &["Traceback (most recent call last):", "File \"C:\\\\p\\\\test_x.py\", line 5, in test_x", "    assert f() == 2", "AssertionError: assert 1 == 2"]);
+        assert!(!clipped && omitted == 0, "{out}");
+        let short = "=== FAILURES ===\n____ test_y ____\ntest_y.py:7: in test_y\n    helper(2)\ntest_y.py:3: in helper\n    assert n == 3\nE   assert 2 == 3\n=== 1 failed in 0.1s ===\n";
+        let (out, _, _) = diagnostic(short, 1, false).unwrap();
+        assert_has(&out, &["test_y.py:7: in test_y", "    helper(2)", "test_y.py:3: in helper", "    assert n == 3", "E assert 2 == 3"]);
+    }
+
+    #[test]
+    fn pytest_failed_line_stays_when_its_test_has_no_block_and_e_indent_is_relative() {
+        let raw = "=== FAILURES ===\n____ TestC.test_a[1-2] ____\n\n    def test_a(self):\n>       assert x == y\nE       assert 1 == 2\nE         + extra\nE       - more\n\ntest_c.py:9: AssertionError\n=== short test summary info ===\nFAILED test_c.py::TestC::test_a[1-2] - assert 1 == 2\nFAILED test_c.py::test_other - boom\n=== 2 failed in 0.1s ===\n";
+        let (out, _, _) = diagnostic(raw, 1, false).unwrap();
+        assert_has(&out, &["test_c.py::TestC::test_a[1-2]:", "> assert x == y", "E assert 1 == 2", "E   + extra", "E - more", "FAILED test_c.py::test_other - boom"]);
+        assert!(!out.contains("FAILED test_c.py::TestC"), "{out}");
+    }
+
+    #[test]
+    fn should_panic_and_multiline_summary_failures_show_once() {
+        let cargo = "test boom - should panic ... FAILED\n\nfailures:\n\n---- boom stdout ----\n\nthread 'boom' panicked at src/lib.rs:3:5:\nwrong\nnote: panic did not contain expected string\n\nfailures:\n    boom\n\ntest result: FAILED. 0 passed; 1 failed\n";
+        let (out, _, _) = diagnostic(cargo, 101, false).unwrap();
+        assert!(!out.contains("should panic ... FAILED") && out.contains("---- boom stdout ----"), "{out}");
+        let py = "=== FAILURES ===\n____ test_d ____\n>       assert a == b\nE       AssertionError: assert {'b': 2} == {'b': 3}\nE         \nE         Differing items:\nE           {'b': 2} != {'b': 3}\n\ntest_d.py:6: AssertionError\n=== short test summary info ===\nFAILED test_d.py::test_d - AssertionError: assert {'b': 2} == {'b': 3}\n  \n  Differing items:\n    {'b': 2} != {'b': 3}\nSKIPPED [1] test_d.py:9: later\n=== 1 failed, 1 skipped in 0.1s ===\n";
+        let (out, omitted, _) = diagnostic(py, 1, false).unwrap();
+        assert_eq!(out.matches("Differing items").count(), 1, "{out}");
+        // A blank `E` line stays in the run, so the explanation keeps its indent under the message.
+        assert_has(&out, &["E AssertionError: assert {'b': 2} == {'b': 3}\nE\nE   Differing items:\nE     {'b': 2} != {'b': 3}\n", "SKIPPED [1] test_d.py:9: later"]);
+        assert_eq!(omitted, 0, "{out}");
+    }
+
+    #[test]
+    fn pytest_captured_stdout_stays() {
+        let raw = "=== FAILURES ===\n____ test_p ____\n\n    def test_p():\n        print('hello from test')\n>       assert 0\nE       assert 0\n\ntest_p.py:4: AssertionError\n----- Captured stdout call -----\n  hello from test\n=== 1 failed in 0.1s ===\n";
+        let (out, _, _) = diagnostic(raw, 1, false).unwrap();
+        assert_has(&out, &["----- Captured stdout call -----", "  hello from test", "test_p.py:4: AssertionError"]);
+        assert!(!out.contains("def test_p"), "{out}");
+    }
+
+    #[test]
+    fn python_traceback_keeps_the_log_line_before_it() {
         let raw = "warning: something\nTraceback (most recent call last):\n  File \"a.py\", line 3, in <module>\n    boom()\nValueError: bad\n";
         let (out, _, _) = traceback(raw).unwrap();
         assert!(out.contains("Traceback"));
         assert!(out.contains("ValueError: bad"));
-        assert!(!out.contains("warning:"));
+        assert!(out.contains("warning: something"));
     }
 
     #[test]
-    fn node_stack_drops_noise() {
+    fn node_stack_keeps_the_log_line_before_it() {
         let raw = "log line\nTypeError: x is not a function\n    at foo (a.js:1:2)\n    at bar (b.js:3:4)\n";
         let (out, _, _) = traceback(raw).unwrap();
         assert!(out.contains("TypeError"));
         assert!(out.contains("at foo"));
-        assert!(!out.contains("log line"));
+        assert!(out.contains("log line"));
     }
 
     #[test]
@@ -1439,12 +2760,23 @@ mod tests {
     }
 
     #[test]
+    fn json_min_refuses_text_that_is_not_json() {
+        // Padded so the whitespace saving is large: only the validity check can say no.
+        let hole = format!("{{\"a\":{}}}", " ".repeat(200));
+        let trailing = format!("{{\"a\":1{}}} x", " ".repeat(200));
+        let truncated = format!("[1,{}2,", " ".repeat(200));
+        for bad in [hole, trailing, truncated] {
+            assert!(json_min("curl http://x", &bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn grep_groups_by_file() {
         let raw = "src/a.rs:12:let x = 1;\nsrc/a.rs:40:let y = 2;\nsrc/b.rs:7:fn z() {}\n";
         let (out, _, _) = grep(raw).unwrap();
         assert_eq!(out.matches("src/a.rs").count(), 1);
-        assert!(out.contains("12: let x = 1;"));
-        assert!(out.contains("7: fn z() {}"));
+        assert!(out.contains("\n12:let x = 1;\n"), "{out}");
+        assert!(out.contains("src/b.rs\n7:fn z() {}\n"), "{out}");
     }
 
     #[test]
@@ -1453,11 +2785,51 @@ mod tests {
         assert!(!is_pathlist("find . -exec rm {} ;") && !is_pathlist("rg fn src") && !is_pathlist("git status"));
         let mut raw: String = (0..20).map(|i| format!("src/mod/f{i}.rs\n")).collect();
         raw.push_str("src/a b.rs\nsrc/c,d.rs\ndocs\\x.md\ndocs\\y.md\nsrc/mod/\nsingle.rs/x\n");
-        let (out, hidden) = paths(&raw).unwrap();
-        assert!(out.starts_with("src/mod/{f0.rs,f1.rs,"), "{out}");
+        let (out, hidden) = paths(&raw, true).unwrap();
+        assert!(out.starts_with("src/mod/{f0,f1,f2,"), "{out}");
+        assert!(out.contains("f19}.rs\n"), "{out}");
         assert!(out.contains("\nsrc/a b.rs\nsrc/c,d.rs\n") && out.contains("docs\\{x.md,y.md}\n"));
         assert!(out.contains("single.rs/x") && out.contains("\nsrc/mod/\n") && hidden == 20);
-        assert!(paths("a/b\nc/d\n").is_none() && paths(&"plain\n".repeat(20)).is_none());
+        assert!(paths("a/b\nc/d\n", true).is_none() && paths(&"plain\n".repeat(20), true).is_none());
+    }
+
+    #[test]
+    fn paths_of_one_directory_share_one_line_even_when_subdirs_interleave() {
+        let mut raw = String::new();
+        for (d, names) in [("src", &["a.rs", "b.rs", "c.rs"][..]), ("src/sub", &["m.rs", "n.rs", "o.rs"][..]), ("src", &["d.rs", "e.rs"][..])] {
+            for n in names {
+                raw.push_str(&format!("{d}/{n}\n"));
+            }
+        }
+        raw.push_str("x/1\nx/2\nx/3\nx/4\nx/5\nx/6\n");
+        let (out, _) = paths(&raw, true).unwrap();
+        assert!(out.starts_with("src/{a,b,c,d,e}.rs\nsrc/sub/{m,n,o}.rs\n"), "{out}");
+        // Sorted output keeps its order: only consecutive paths of one directory share a line.
+        let (out, _) = paths(&raw, false).unwrap();
+        assert!(out.starts_with("src/{a,b,c}.rs\nsrc/sub/{m,n,o}.rs\nsrc/{d.rs,e.rs}\n"), "{out}");
+        let d = digest("rg --files --sort modified", &raw, "", 0).unwrap();
+        assert!(d.stdout.starts_with("src/{a,b,c}.rs\nsrc/sub/"), "{}", d.stdout);
+    }
+
+    #[test]
+    fn paths_do_not_factor_an_extension_that_is_missing_mixed_or_unsafe() {
+        let mut raw = String::from("a/Makefile\na/x.rs\na/y.rs\nb/x.rs\nb/y.rs\nb/z.md\nc/.hidden\nc/.other\nc/{q}.rs\nc/r.rs\nc/s.rs\nd/p.rs\nd/q.rs\nd/r.rs\n");
+        raw.push_str("e/a.b.rs\ne/c.rs\ne/d.rs\n");
+        let (out, _) = paths(&raw, true).unwrap();
+        assert!(out.contains("a/{Makefile,x.rs,y.rs}\n"), "{out}");
+        assert!(out.contains("b/{x.rs,y.rs,z.md}\n"), "{out}");
+        assert!(out.contains("c/.hidden\nc/.other\nc/{q}.rs\nc/r.rs\nc/s.rs\n"), "{out}");
+        assert!(out.contains("d/{p,q,r}.rs\n") && out.contains("e/{a.b,c,d}.rs\n"), "{out}");
+    }
+
+    #[test]
+    fn paths_factor_a_shared_ending_that_starts_at_a_separator() {
+        let mut raw: String = ["a-x1.md", "b-x1.md", "c-x1.md"].iter().map(|n| format!("notes/{n}\n")).collect();
+        raw.push_str("t/a_test.rs\nt/b_test.rs\nt/c_test.rs\nv/a.rs\nv/ba.rs\nv/ca.rs\nw/x.y\nw/z.y\nw/.y\n");
+        let (out, _) = paths(&raw, true).unwrap();
+        assert!(out.contains("notes/{a,b,c}-x1.md\n") && out.contains("t/{a,b,c}_test.rs\n"), "{out}");
+        // The ending starts at a separator and leaves every stem a name.
+        assert!(out.contains("v/{a,ba,ca}.rs\n") && out.contains("w/{x.y,z.y,.y}\n"), "{out}");
     }
 
     #[test]
@@ -1469,12 +2841,13 @@ mod tests {
         raw.push_str("late.rs:3:needle\nlate2.rs:9:needle\n");
         let (out, hidden, clipped) = grep(&raw).unwrap();
         assert!(clipped && hidden == 15, "{out}");
-        assert!(out.contains("big.rs (25 of 40)") && out.contains("late.rs (1)") && out.contains("9: needle"));
-        // past the overall cap, files are still named with their counts
+        assert!(out.contains("big.rs (25 of 40)") && out.contains("\nlate.rs\n3:needle\n") && out.contains("9:needle"), "{out}");
+        // The cap counts file names too, so the digest stays under the 400-line bound that would cut its middle.
         let many: String = (0..400).map(|i| format!("f{i}.rs:1:x\n")).collect();
         let (out, hidden, _) = grep(&many).unwrap();
-        assert_eq!(hidden, 100);
-        assert!(out.contains("f399.rs (1)") || out.contains("more files with matches"), "{out}");
+        assert_eq!(hidden, 400 - GREP_LINES / 2);
+        assert!(out.contains(&format!("\nf{}.rs\n1:x\n[qx] +{hidden} more files with matches (cap reached)\n", GREP_LINES / 2 - 1)), "{out}");
+        assert!(out.lines().count() < 400, "{out}");
     }
 
     #[test]
@@ -1492,8 +2865,8 @@ mod tests {
     fn grep_groups_rg_output_without_line_numbers() {
         let raw = "src\\a.rs:let x = 1; // a: b\nsrc\\a.rs:let y = 2;\nC:\\w\\b.rs:fn z() {}\nsrc\\a.rs:  \n";
         let (out, _, _) = grep(raw).unwrap();
-        assert_eq!(out.matches("src\\a.rs (").count(), 1, "{out}");
-        assert!(out.contains("  let x = 1; // a: b") && out.contains("C:\\w\\b.rs (1)"));
+        assert_eq!(out.matches("src\\a.rs\n").count(), 1, "{out}");
+        assert!(out.contains("  let x = 1; // a: b") && out.contains("C:\\w\\b.rs\n  fn z() {}\n"), "{out}");
         // `grep -c` / `-l` / prose are not matches
         assert!(split_match("src/a.rs:12").is_none() && split_match("src/a.rs").is_none());
         assert!(split_match("note: build failed").is_none() && split_match("é:é").is_none());
@@ -1512,8 +2885,8 @@ mod tests {
     fn git_status_keeps_ignored_files_out_of_untracked() {
         let raw = "On branch main\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tnew.txt\n\nIgnored files:\n  (use \"git add -f <file>...\" to include in what will be committed)\n\ttarget/\n";
         let (out, _) = git_status(raw).unwrap();
-        assert!(out.contains("untracked (1):\n  new.txt"), "{out}");
-        assert!(out.contains("ignored (1):\n  target/"), "{out}");
+        assert!(out.contains("?? new.txt"), "{out}");
+        assert!(out.contains("!! target/"), "{out}");
         assert!(!out.contains("Ignored files:"), "{out}");
     }
 
@@ -1521,8 +2894,8 @@ mod tests {
     fn git_status_keeps_the_kind_of_change() {
         let raw = "On branch main\nChanges to be committed:\n\tnew file:   a.rs\n\trenamed:    b.rs -> c.rs\n\nChanges not staged for commit:\n\tmodified:   d.rs\n\tdeleted:    old.rs\n";
         let (out, _) = git_status(raw).unwrap();
-        assert!(out.contains("staged (2):\n  new file: a.rs\n  renamed: b.rs -> c.rs"), "{out}");
-        assert!(out.contains("modified (2):\n  d.rs\n  deleted: old.rs"), "{out}");
+        assert!(out.contains("A  a.rs\nR  b.rs -> c.rs\n"), "{out}");
+        assert!(out.contains(" M d.rs\n D old.rs\n"), "{out}");
     }
 
     #[test]
@@ -1699,14 +3072,16 @@ mod tests {
         }
         assert!(is_git_status("git status") && is_git_status("git status -uno"));
         assert!(git_status(" M src/a.rs\n?? b.txt\n").is_none());
-        assert!(git_status("On branch main\nUnmerged paths:\n\tdeleted by us:   x.rs\n").is_none());
+        assert!(git_status("On branch main\nYou are currently rebasing.\n\tmodified:   x.rs\n").is_none());
+        // A listed path before any section header has no known column.
+        assert!(git_status("On branch main\n\tmodified:   x.rs\n").is_none());
     }
 
     #[test]
     fn status_nothing_added_is_not_an_untracked_file() {
         let raw = "On branch main\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tnew.txt\n\nnothing added to commit but untracked files present (use \"git add\" to track)\n";
         let (out, _) = git_status(raw).unwrap();
-        assert!(out.contains("untracked (1):"), "{out}");
+        assert!(out.contains("?? new.txt"), "{out}");
         assert!(!out.contains("  nothing added"), "{out}");
     }
 
@@ -1742,11 +3117,11 @@ mod tests {
         }
         pass.push_str("test result: ok. 30 passed; 0 failed\n");
         let green = digest("cargo test", &pass, "", 0).unwrap();
-        assert!(green.omitted > 0 && !green.lossy(), "a green run drops only `... ok` noise: no spool file");
+        assert!(!green.lossy(), "a green run drops only `... ok` noise: no spool file");
         let mut red = pass.replace("test t3 ... ok", "test t3 ... FAILED");
         red.push_str("---- t3 stdout ----\nthread 't3' panicked at src/lib.rs:3:5:\nassertion failed: x\n\nfailures:\n    t3\n");
         let d = digest("cargo test", &red, "", 101).unwrap();
-        assert!(d.omitted > 0 && d.lossy(), "a failing run keeps the full text on disk");
+        assert!(!d.lossy() && d.omitted == 0, "the FAILED line and failures list repeat the stdout block: nothing lost");
         for l in ["cargo test -- --nocapture", "pytest -s", "cargo test --message-format=json", "vitest --reporter=json", "go test -v ./..."] {
             assert!(digest(l, &pass, "", 0).is_none(), "{l}");
         }
@@ -1797,7 +3172,7 @@ mod tests {
     #[test]
     fn braces_in_a_directory_name_keep_paths_plain() {
         let raw: String = (0..14).map(|i| format!("a,b/f{i}.txt\n")).collect();
-        let (out, _) = paths(&raw).unwrap();
+        let (out, _) = paths(&raw, true).unwrap();
         assert!(out.contains("a,b/f0.txt") && !out.contains('{'), "{out}");
     }
 
@@ -1810,15 +3185,395 @@ mod tests {
     }
 
     #[test]
-    fn a_condensed_git_log_names_the_way_back_for_both_transports() {
-        let mut raw = String::new();
-        for i in 0..6 {
-            raw.push_str(&format!(
-                "commit {:040x}\nAuthor: A <a@b.c>\nDate:   Mon Oct 19 10:0{i}:00 2026 +0000\n\n    subject {i}\n\n    a long body line one\n    a long body line two\n\n",
-                i + 1
-            ));
+    fn git_log_says_a_shared_author_and_date_once() {
+        let c = |h: &str, who: &str, day: &str, s: &str| format!("commit {h}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nAuthor: {who} <x@y.z>\nDate:   {day} 12:00:00 2026 +0000\n\n    {s}\n\n");
+        let same = c("1111111", "T", "Tue Oct 14", "one") + &c("2222222", "T", "Tue Oct 14", "two");
+        let (out, _) = git_log(&same).unwrap();
+        assert!(out.starts_with("all by T, Oct 14 2026\n1111111 one\n2222222 two\n"), "{out}");
+        assert!(!out.contains("(T,"), "{out}");
+        // A different author or a different day keeps `(who, date)` on every line.
+        let other_who = c("1111111", "T", "Tue Oct 14", "one") + &c("2222222", "U", "Tue Oct 14", "two");
+        let other_day = c("1111111", "T", "Tue Oct 14", "one") + &c("2222222", "T", "Mon Oct 13", "two");
+        for raw in [other_who, other_day] {
+            let (out, _) = git_log(&raw).unwrap();
+            assert!(!out.contains("all by") && out.contains("1111111 one (T, Oct 14 2026)"), "{out}");
+            assert!(out.contains("2222222 two ("), "{out}");
         }
-        let d = digest("git log", &raw, "", 0).unwrap();
-        assert!(d.stdout.contains("--raw (CLI)") && d.stdout.contains("mode:\"full\" (MCP)"), "{}", d.stdout);
+        // One entry has nothing to share.
+        let (out, _) = git_log(&c("1111111", "T", "Tue Oct 14", "one")).unwrap();
+        assert!(out.starts_with("1111111 one (T, Oct 14 2026)\n"), "{out}");
+    }
+
+    #[test]
+    fn git_ls_files_groups_folders_even_with_root_files_between() {
+        let mut raw = String::from(".gitignore\nCargo.toml\nREADME.md\n");
+        raw.extend((0..4).map(|i| format!("docs/review/r{i}.md\n")));
+        raw.extend((0..6).map(|i| format!("src/m{i}.rs\n")));
+        let expect = ".gitignore\nCargo.toml\nREADME.md\ndocs/review/{r0,r1,r2,r3}.md\nsrc/{m0,m1,m2,m3,m4,m5}.rs\n";
+        let d = digest("git ls-files", &raw, "", 0).expect("the path digest fires");
+        assert_eq!((d.profile, d.stdout.as_str()), ("paths", expect));
+        // Root names have no folder to share: they stay plain lines, never `{a,b}`.
+        assert!(!d.stdout.starts_with('{') && !d.stdout.contains("\n{"), "{}", d.stdout);
+        // Mostly plain names are still not a path list.
+        assert!(paths(&format!("{}a/b\n", "plain\n".repeat(20)), true).is_none());
+    }
+
+    #[test]
+    fn a_deleted_file_body_is_one_line() {
+        let deleted: String = "diff --git a/old.txt b/old.txt\ndeleted file mode 100644\nindex fe33913..0000000\n--- a/old.txt\n+++ /dev/null\n@@ -1,40 +0,0 @@\n".to_string()
+            + &(1..=40).map(|i| format!("-# old line {i}\n")).collect::<String>();
+        let tail = "diff --git a/b.txt b/b.txt\nindex 1..2 100644\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-x\n+y\n";
+        let raw = format!("{deleted}{tail}");
+        let want = "deleted old.txt (40 lines)\ndiff b.txt\n@@ -1 +1 @@\n-x\n+y\n";
+        assert_eq!(trim_diff_headers(&raw).unwrap(), (want.to_string(), true));
+        let d = digest("git diff", &raw, "", 0).unwrap();
+        assert_eq!(d.stdout, want);
+        assert!(d.clipped && d.lossy(), "a folded body is lossy, so the caller spools the full text");
+        // The condensing path of a long diff folds it the same way, and counts it as a change.
+        let (out, omitted, clipped) = git_diff(&raw).unwrap();
+        assert!(out.starts_with("deleted old.txt (40 lines)\ndiff b.txt\n") && !out.contains("old line 7"), "{out}");
+        assert!(omitted >= 40 && clipped, "{omitted}");
+        assert!(git_diff(&deleted).is_some(), "a diff of only a deleted file still has a change");
+        // A small deleted file stays whole, and loses nothing.
+        let small = "diff --git a/s.txt b/s.txt\ndeleted file mode 100644\nindex fe33913..0000000\n--- a/s.txt\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-a\n-b\n-c\n";
+        let (out, folded) = trim_diff_headers(small).unwrap();
+        assert!(out.contains("diff s.txt (deleted 100644)\n@@ -1,3 +0,0 @@\n-a\n-b\n-c\n") && !folded);
+        // A body that does not match its hunk header is not touched.
+        let torn = deleted.replace("-# old line 40\n", "");
+        assert!(trim_diff_headers(&torn).unwrap().0.contains("-# old line 39\n"));
+    }
+
+    #[test]
+    fn a_new_file_over_20_lines_keeps_its_first_5() {
+        let new = |n: usize| {
+            format!("diff --git a/n.txt b/n.txt\nnew file mode 100644\nindex 0000000..e69de29\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1,{n} @@\n")
+                + &(0..n).map(|i| format!("+line {i}\n")).collect::<String>()
+        };
+        let want = "diff n.txt (new 100644)\n@@ -0,0 +1,30 @@\n+line 0\n+line 1\n+line 2\n+line 3\n+line 4\n… 25 more lines\n";
+        assert_eq!(trim_diff_headers(&new(30)).unwrap(), (want.to_string(), true));
+        let (out, _, clipped) = git_diff(&new(30)).unwrap();
+        assert!(out == want && clipped);
+        let (twenty, folded) = trim_diff_headers(&new(20)).unwrap();
+        assert!(twenty.contains("+line 19\n") && !twenty.contains("more lines") && !folded, "{twenty}");
+    }
+
+    #[test]
+    fn a_diff_with_folded_whole_files_is_lossy_and_names_no_route() {
+        let deleted = "diff --git a/old.txt b/old.txt\ndeleted file mode 100644\nindex fe33913..0000000\n--- a/old.txt\n+++ /dev/null\n@@ -1,40 +0,0 @@\n".to_string()
+            + &(1..=40).map(|i| format!("-# old line {i}\n")).collect::<String>();
+        let new = "diff --git a/n.txt b/n.txt\nnew file mode 100644\nindex 0000000..e69de29\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1,51 @@\n".to_string()
+            + &(0..51).map(|i| format!("+line {i}\n")).collect::<String>();
+        let d = digest("git diff", &format!("{deleted}{new}"), "", 0).unwrap();
+        assert!(d.clipped && d.lossy(), "{}", d.stdout);
+        assert!(d.stdout.contains("deleted old.txt (40 lines)\n") && d.stdout.contains("… 46 more lines\n"), "{}", d.stdout);
+        assert!(!d.stdout.contains("full:"), "{}", d.stdout);
+    }
+
+    #[test]
+    fn a_json_array_of_objects_shows_one_record_per_line() {
+        let pretty = |n: usize, wrap: bool| {
+            let v: Vec<serde_json::Value> = (0..n).map(|i| serde_json::json!({"id": i, "name": format!("user-{i:04}"), "tags": ["a", "b"]})).collect();
+            if wrap { serde_json::to_string_pretty(&serde_json::json!({ "items": v })).unwrap() } else { serde_json::to_string_pretty(&v).unwrap() }
+        };
+        let (out, hidden) = json_min("curl http://x", &pretty(300, false)).unwrap();
+        assert!(out.starts_with("[\n[qx] records as rows: id,name (every row shown: tags=[\"a\",\"b\"])\n0,\"user-0000\"\n"), "{out}");
+        assert!(out.contains("\n7,\"user-0007\"\n"), "{out}");
+        assert!(out.ends_with("\n299,\"user-0299\"\n]\n"), "{out}");
+        assert!(hidden > 0 && out.contains(&format!("[qx] {hidden} of 300 records not shown\n")), "{out}");
+        assert!(!out.contains("\n150,") && out.len() <= JSON_RECORD_BYTES + 200, "{} bytes", out.len());
+        assert_eq!(out.lines().filter(|l| l.starts_with(|c: char| c.is_ascii_digit())).count() + hidden, 300);
+        // Few records all show, and the text is still the same valid JSON.
+        let (out, hidden) = json_min("curl http://x", &pretty(3, true)).unwrap();
+        assert!(out.starts_with("{\"items\":[\n{\"id\":0,") && out.ends_with("]}\n") && hidden == 0, "{out}");
+        let (a, b): (serde_json::Value, serde_json::Value) = (serde_json::from_str(&out).unwrap(), serde_json::from_str(&pretty(3, true)).unwrap());
+        assert_eq!(a, b);
+        // The digest spools what the budget cut.
+        let d = digest("curl http://x", &pretty(300, true), "", 0).unwrap();
+        assert!(d.profile == "json" && d.lossy() && d.stdout.contains("\n299,\"user-0299\"\n"), "{}", d.stdout);
+    }
+
+    #[test]
+    fn records_left_out_show_as_a_table_of_one_shape() {
+        let rec = |i: usize| serde_json::json!({"id": i, "addr": {"city": "X", "zip": format!("Z{i}")}, "on": i % 2 == 0});
+        let raw = serde_json::to_string_pretty(&(0..300).map(rec).collect::<Vec<_>>()).unwrap();
+        let (out, hidden) = json_min("curl http://x", &raw).unwrap();
+        assert!(out.starts_with("[\n[qx] records as rows: addr.zip,id,on (every row shown: addr.city=\"X\")\n\"Z0\",0,true\n"), "{out}");
+        assert!(out.ends_with("\n\"Z299\",299,false\n]\n") && hidden > 0, "{out}");
+        // Records of another shape, or a key a header cannot name, stay JSON lines.
+        for other in [raw.replacen("\"on\": true", "\"off\": true", 1), raw.replace("\"on\"", "\"o.n\"")] {
+            let (out, _) = json_min("curl http://x", &other).unwrap();
+            assert!(out.starts_with("[\n{\"addr\":{\"city\":\"X\",\"zip\":\"Z0\"},\"id\":0,"), "{out}");
+        }
+        let m = json_members("{\"a\":[1,{\"b\":2}],\"c\":\"x,y\"}").unwrap();
+        assert_eq!(m, vec![("a", "[1,{\"b\":2}]"), ("c", "\"x,y\"")]);
+    }
+
+    #[test]
+    fn a_long_file_read_shows_its_records_and_a_short_one_stays_whole() {
+        let recs = |n: usize| serde_json::to_string_pretty(&(0..n).map(|i| serde_json::json!({"id": i, "tags": ["a", "b"]})).collect::<Vec<_>>()).unwrap();
+        let (out, hidden) = json_min("cat data.json", &recs(300)).unwrap();
+        assert!(hidden > 0 && out.contains("\n299\n"), "{out}");
+        assert!(json_min("cat data.json", &recs(3)).is_none());
+        // Long but not records (one array of numbers): `cat` keeps its plain compaction.
+        let numbers = serde_json::to_string_pretty(&serde_json::json!({ "a": (0..300).collect::<Vec<_>>() })).unwrap();
+        assert!(numbers.lines().count() > JSON_READ_LINES && json_min("cat a.json", &numbers).is_none());
+    }
+
+    #[test]
+    fn grep_drops_the_indentation_of_a_match_but_keeps_its_line_number() {
+        let raw = "src/a.rs:12:        let x = 1;\nsrc/a.rs:40:\tlet y = 2;\nsrc/b.rs:7:    fn z() {}\n";
+        let (out, _, _) = grep(raw).unwrap();
+        assert!(out.contains("\n12:let x = 1;\n") && out.contains("\n40:let y = 2;\n") && out.contains("\n7:fn z() {}\n"), "{out}");
+    }
+
+    #[test]
+    fn grep_shows_the_same_text_of_one_file_once_with_every_line_number() {
+        let raw = "src/a.rs:3:fn twin() {\nsrc/a.rs:9:let x = 1;\nsrc/a.rs:20:    fn twin() {\nsrc/b.rs:4:fn twin() {\nsrc/a.rs:31:fn twin() {\n";
+        let (out, hidden, clipped) = grep(raw).unwrap();
+        assert_eq!(out, "5 matches in 2 files\nsrc/a.rs\n3,20,31:fn twin() {\n9:let x = 1;\nsrc/b.rs\n4:fn twin() {\n");
+        assert!(hidden == 0 && !clipped);
+        // Without line numbers there is nothing to merge into: each repeat stays a line.
+        let (out, _, _) = grep("a.txt:dup\na.txt:dup\na.txt:other\n").unwrap();
+        assert_eq!(out, "3 matches in 1 files\na.txt\n  dup\n  dup\n  other\n");
+    }
+
+    /// What the caller sees: the digest's two streams, or `None` (generic compaction keeps the text).
+    fn reply(d: Option<Digest>) -> Option<String> {
+        d.map(|d| format!("{}{}", d.stdout, d.stderr))
+    }
+
+    #[test]
+    fn go_test_keeps_the_package_that_did_not_build_and_its_compiler_error() {
+        let so = "--- FAIL: TestAdd (0.00s)\n    a_test.go:8: got 3, want 4\nFAIL\nFAIL\texample.com/m/a\t0.003s\nok  \texample.com/m/b\t(cached)\nFAIL\texample.com/m/c [build failed]\n";
+        let se = "# example.com/m/c [example.com/m/c.test]\nc\\c_test.go:6:14: undefined: nope\n";
+        let (out, _, _) = diagnostic(&merge(so, se), 1, false).unwrap();
+        for want in ["--- FAIL: TestAdd", "FAIL\texample.com/m/a", "FAIL\texample.com/m/c [build failed]", "c_test.go:6:14: undefined: nope"] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
+        // Whatever the digest does with it, the reply must still say both packages failed.
+        if let Some(r) = reply(digest("go test ./...", so, se, 1)) {
+            assert!(r.contains("[build failed]") && r.contains("undefined: nope"), "{r}");
+        }
+    }
+
+    #[test]
+    fn node_test_runner_keeps_failing_test_names_and_the_counts() {
+        let raw = "\n> demo@1.0.0 test\n> node --test\n\n\u{2714} passes (0.5ms)\n\u{2716} adds numbers (1.2ms)\n  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n  \n  3 !== 4\n  \n      at TestContext.<anonymous> (a.test.js:5:10)\n\u{2716} also fails (0.3ms)\n  Error: nope\n      at TestContext.<anonymous> (a.test.js:9:10)\n\u{2139} tests 3\n\u{2139} suites 0\n\u{2139} pass 1\n\u{2139} fail 2\n\u{2139} cancelled 0\n\u{2139} skipped 0\n\u{2139} todo 0\n\u{2139} duration_ms 45.1\n\n\u{2716} failing tests:\n\ntest at a.test.js:3:1\n\u{2716} adds numbers (1.2ms)\n  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n";
+        let (out, _, _) = diagnostic(raw, 1, false).unwrap();
+        for want in ["\u{2716} adds numbers", "test at a.test.js:3:1", "\u{2139} tests 3", "\u{2139} fail 2", "a.test.js:5:10"] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
+        assert!(!out.contains("passes (0.5ms)") && !out.contains("duration_ms"), "{out}");
+    }
+
+    #[test]
+    fn mocha_dotnet_and_maven_failures_keep_names_counts_and_places() {
+        let mocha = "\n> demo@1.0.0 test\n> mocha\n\n\n  Calculator\n    \u{2714} adds\n    1) subtracts\n\n\n  1 passing (5ms)\n  1 failing\n\n  1) Calculator\n       subtracts:\n\n      AssertionError: expected 1 to equal 2\n      + expected - actual\n\n      -1\n      +2\n      \n      at Context.<anonymous> (test/calc.js:9:30)\n";
+        let (out, _, _) = diagnostic(mocha, 1, false).unwrap();
+        for want in ["1) subtracts", "1 failing", "1 passing", "1) Calculator", "test/calc.js:9:30"] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
+        let dotnet = "  Passed Adds [2 ms]\n  Failed Subtracts [3 ms]\n  Error Message:\n   Assert.Equal() Failure\n  Stack Trace:\n     at CalcTests.Subtracts() in /src/CalcTests.cs:line 14\n\nFailed!  - Failed:     1, Passed:     1, Skipped:     0, Total:     2\n";
+        let (out, _, _) = diagnostic(dotnet, 1, false).unwrap();
+        for want in ["Failed Subtracts [3 ms]", "CalcTests.cs:line 14", "Failed!  - Failed:     1"] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
+        let mvn = "[INFO] Running com.x.CalcTest\n[ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.05 s <<< FAILURE!\n[ERROR] subtracts  Time elapsed: 0.01 s  <<< FAILURE!\norg.opentest4j.AssertionFailedError: expected: <2> but was: <1>\n\tat com.x.CalcTest.subtracts(CalcTest.java:12)\n[INFO] Results:\n[ERROR] Failures: \n[ERROR]   CalcTest.subtracts:12 expected: <2> but was: <1>\n";
+        let (out, _, _) = diagnostic(mvn, 1, false).unwrap();
+        for want in ["Tests run: 3, Failures: 1", "CalcTest.java:12", "CalcTest.subtracts:12"] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
+    }
+
+    #[test]
+    fn a_red_run_keeps_a_line_nobody_taught_the_digest_to_recognise() {
+        // A made-up runner: the only line it knows is `FAILED`, yet the line naming the cause must stay.
+        let raw = "Compiling x v0.1.0\nrunning 2 tests\nFAILED t1\nlib.rs:9:5: left != right (3, 4)\nconnection to db:5432 refused\n\tdetail: error code 7\n";
+        let (out, _, _) = diagnostic(raw, 3, false).unwrap();
+        for want in ["lib.rs:9:5: left != right", "connection to db:5432 refused", "error code 7"] {
+            assert!(out.contains(want), "{want}: {out}");
+        }
+        assert!(!out.contains("Compiling x"), "{out}");
+    }
+
+    #[test]
+    fn unknown_lines_of_a_red_run_never_push_out_the_failure() {
+        let log = |a: usize, b: usize| (a..b).map(|i| format!("log {i}\n")).collect::<String>();
+        let raw = format!("{}thread 't1' panicked at src/lib.rs:9:5\n{}", log(0, 300), log(300, 330));
+        let (out, _, clipped) = diagnostic(&raw, 101, false).unwrap();
+        assert!(out.contains("panicked at src/lib.rs:9:5"), "{out}");
+        assert!(clipped);
+    }
+    #[test]
+    fn a_log_line_before_a_python_traceback_is_kept() {
+        let se = "INFO:root:connecting\nERROR:root:database refused connection at 10.0.0.7:5432 (attempt 3 of 3)\nTraceback (most recent call last):\n  File \"job.py\", line 9, in <module>\n    run()\nRuntimeError: job aborted\n";
+        let (_, e, _, _) = runtime_digest("", se, 1).unwrap();
+        assert!(e.contains("ERROR:root:database refused connection"), "{e}");
+        assert!(e.contains("RuntimeError: job aborted"), "{e}");
+        // Many log lines: the traceback and the nearest lines stay, and the cut says so (so it is spooled).
+        let many: String = (0..100u8)
+            .map(|i| format!("log {}{} of the batch\n", (b'a' + i % 26) as char, (b'a' + i / 26) as char))
+            .collect();
+        let (_, e, _, clipped) = runtime_digest("", &format!("{many}{se}"), 1).unwrap();
+        assert!(e.contains("database refused") && e.contains("RuntimeError: job aborted"), "{e}");
+        assert!(clipped, "a cut that is not flagged is never spooled");
+        assert!(e.lines().count() < 100, "{}", e.lines().count());
+    }
+
+    #[test]
+    fn a_search_hit_cut_at_500_chars_is_flagged_and_keeps_its_tail() {
+        let hit = |n: usize| format!("src/a.rs:{n}:{}needle_here{}", "x".repeat(1215), "y".repeat(300));
+        let raw = format!("{}\n{}\nsrc/b.rs:3:short\n", hit(1), hit(2));
+        let (out, _, clipped) = grep(&raw).unwrap();
+        assert!(clipped, "a cut hit must make the digest lossy so it is spooled");
+        assert!(out.contains(&"x".repeat(200)) && out.contains(&"y".repeat(200)) && out.contains(" … "), "head and tail stay: {out}");
+        assert!(out.contains("long lines cut") && !out.contains("full text"), "{out}");
+        let d = digest("rg -n needle_here .", &raw, "", 0).unwrap();
+        assert!(d.lossy());
+    }
+
+    #[test]
+    fn git_log_with_a_patch_stat_reflog_or_parents_is_left_alone() {
+        let head = "commit 1111111111111111111111111111111111111111\nAuthor: A <a@b.c>\nDate:   Mon Oct 19 10:00:00 2026 +0000\n\n    subject one\n";
+        let patch = format!("{head}\ndiff --git a/x.txt b/x.txt\nindex 111..222 100644\n--- a/x.txt\n+++ b/x.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+c\n d\n");
+        assert!(git_log(&patch).is_none(), "-U1 patch");
+        let stat = format!("{head}\n x.txt | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\ndiff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-b\n+c\n");
+        assert!(git_log(&stat).is_none(), "--patch-with-stat");
+        let reflog = "commit 1111111111111111111111111111111111111111 (HEAD -> main)\nReflog: HEAD@{0} (A <a@b.c>)\nReflog message: commit: subject one\nAuthor: A <a@b.c>\nDate:   Mon Oct 19 10:00:00 2026 +0000\n\n    subject one\n".to_string();
+        assert!(git_log(&reflog).is_none(), "-g");
+        let parents = "commit 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222\nAuthor: A <a@b.c>\nDate:   Mon Oct 19 10:00:00 2026 +0000\n\n    subject one\n".to_string();
+        assert!(git_log(&parents).is_none(), "--parents");
+        // The default shape (decorations, Merge:, message bodies) still condenses.
+        let plain = "commit 1111111111111111111111111111111111111111 (HEAD -> main, origin/main)\nMerge: 222 333\nAuthor: A <a@b.c>\nDate:   Mon Oct 19 10:00:00 2026 +0000\n\n    subject one\n\n    body line\n";
+        assert!(git_log(plain).is_some());
+        // Each of the four commands reaches the reply whole: the digest declines, generic compaction keeps the patch.
+        for (label, text) in [("git log -2 -U1", &patch), ("git log -2 --patch-with-stat", &stat), ("git log -g -3", &reflog), ("git log -2 --parents", &parents)] {
+            assert!(digest(label, text, "", 0).is_none(), "{label}");
+        }
+    }
+
+    #[test]
+    fn a_status_note_is_not_an_untracked_file() {
+        let raw = "On branch main\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n\tmodified:   a.txt\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tnew1.txt\n\tnew2.txt\n\nYour stash currently has 1 entry\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n";
+        let (out, _) = git_status(raw).expect("the stash note is state, not a reason to decline");
+        assert!(out.contains("?? new1.txt new2.txt") && !out.contains("new3"), "{out}");
+        assert!(out.contains("Your stash currently has 1 entry"), "{out}");
+        assert!(!out.contains("  Your stash"), "{out}");
+        // A note this digest does not know declines rather than becoming a file.
+        let slow = raw.replace("Your stash currently has 1 entry", "It took 5.12 seconds to enumerate untracked files.");
+        assert!(git_status(&slow).is_none());
+    }
+
+    /// Every path a `paths` digest line stands for: `dir/{a,b}.rs` -> `dir/a.rs`, `dir/b.rs`.
+    fn expand_paths(out: &str) -> Vec<String> {
+        let mut all = Vec::new();
+        for l in out.lines() {
+            match (l.find('{'), l.rfind('}')) {
+                (Some(a), Some(b)) => all.extend(l[a + 1..b].split(',').map(|n| format!("{}{n}{}", &l[..a], &l[b + 1..]))),
+                _ => all.push(l.to_string()),
+            }
+        }
+        all.sort();
+        all
+    }
+
+    /// A `find` listing of a TypeScript tree: root files beside 60 folders of 1-30 files, every third
+    /// folder with nested subfolders. About 1300 lines, like a real `find . -name '*.ts'`.
+    fn ts_tree(prefix: &str) -> String {
+        let mut raw = String::new();
+        for d in 0..60 {
+            if d % 4 == 0 {
+                raw.push_str(&format!("{prefix}root-file-{d}.ts\n"));
+            }
+            for n in 0..1 + (d * 7) % 30 {
+                raw.push_str(&format!("{prefix}feature-area-{d}/module-{n}-handler.ts\n"));
+            }
+            if d % 3 == 0 {
+                for s in 0..3 {
+                    for n in 0..8 {
+                        raw.push_str(&format!("{prefix}feature-area-{d}/nested-{s}/part-{n}.ts\n"));
+                    }
+                }
+            }
+        }
+        raw
+    }
+
+    #[test]
+    fn a_long_find_listing_with_or_without_dot_slash_groups_by_directory_losslessly() {
+        for prefix in ["./", ""] {
+            let raw = ts_tree(prefix);
+            assert!(raw.lines().count() > 1000, "{}", raw.lines().count());
+            let d = digest("find . -name '*.ts'", &raw, "", 0).expect(prefix);
+            assert_eq!(d.profile, "paths");
+            assert!(!d.lossy() && !d.clipped, "{prefix}: a regrouped list loses nothing");
+            assert!(d.stdout.len() * 2 < raw.len(), "{prefix}: {} of {} bytes\n{}", d.stdout.len(), raw.len(), d.stdout);
+            let mut want: Vec<String> = raw.lines().map(str::to_string).collect();
+            want.sort();
+            assert_eq!(expand_paths(&d.stdout), want, "{prefix}: every path comes back from the groups");
+            // One line per folder (plus the root files): the folder name is said once, not per file.
+            assert!(d.stdout.lines().count() < 150, "{}", d.stdout);
+            assert!(d.stdout.contains(&format!("{prefix}feature-area-21/{{module-0,module-1,")), "{}", d.stdout);
+        }
+    }
+
+    /// `rg -n` over a Windows tree: `tools\modK\file-F.ts:LINE:  export function ...`, `per_file(f)`
+    /// matches in each of `files` files.
+    fn ts_matches(files: usize, per_file: impl Fn(usize) -> usize) -> String {
+        let mut raw = String::new();
+        for f in 0..files {
+            for i in 0..per_file(f) {
+                raw.push_str(&format!("tools\\mod{}\\file-{f}.ts:{}:  export function handler{f}x{i}(arg: string): string {{\n", f % 7, 10 * i + 3));
+            }
+        }
+        raw
+    }
+
+    #[test]
+    fn a_long_grep_groups_by_file_and_counts_every_match_it_cuts() {
+        let raw = ts_matches(130, |f| 1 + (f * 7) % 9 + if f % 29 == 0 { 30 } else { 0 });
+        let total = raw.lines().count();
+        assert!(total > 600, "{total}");
+        let d = digest("rg -n handler", &raw, "", 0).unwrap();
+        assert_eq!(d.profile, "search");
+        let out = &d.stdout;
+        assert!(out.starts_with(&format!("{total} matches in 130 files\n")), "{out}");
+        // Every file is named once, a capped one with how many of its matches show: 130 names fit the budget.
+        let mut shown_by_header = 0;
+        for f in 0..130 {
+            let path = format!("tools\\mod{}\\file-{f}.ts", f % 7);
+            let heads: Vec<&str> = out.lines().filter(|l| *l == path || l.starts_with(&format!("{path} ("))).collect();
+            assert_eq!(heads.len(), 1, "{path}\n{out}");
+            let n = raw.lines().filter(|l| l.starts_with(&format!("{path}:"))).count();
+            shown_by_header += match heads[0].strip_prefix(&format!("{path} (")) {
+                Some(rest) => {
+                    let (kept, of) = rest.trim_end_matches(')').split_once(" of ").unwrap();
+                    assert_eq!(of.parse::<usize>().unwrap(), n, "{}", heads[0]);
+                    kept.parse::<usize>().unwrap()
+                }
+                None => n,
+            };
+        }
+        // Under the 400-line bound: no file is cut out of the middle by compaction.
+        assert!(out.lines().count() < 400 && !out.contains("omitted"), "{out}");
+        let match_lines = out.lines().filter(|l| l.as_bytes()[0].is_ascii_digit()).count() - 1;
+        assert_eq!(match_lines, shown_by_header, "{out}");
+        assert!(out.contains(&format!("[qx] match cap reached: {} matches not shown\n", total - match_lines)), "{out}");
+        assert!(d.clipped && d.lossy(), "a cut digest must be spooled");
+        assert!(out.len() * 2 < raw.len(), "{} of {}", out.len(), raw.len());
+    }
+
+    #[test]
+    fn a_grep_under_the_caps_keeps_every_match_under_its_file() {
+        let raw = ts_matches(60, |f| 1 + f % 8);
+        assert!(raw.lines().count() > 250);
+        let d = digest("rg -n handler", &raw, "", 0).unwrap();
+        assert!(!d.lossy() && d.omitted == 0, "{}", d.stdout);
+        for l in raw.lines() {
+            let (path, num, text) = split_numbered(l).unwrap();
+            let file = d.stdout.split(&format!("{path}\n")).nth(1).expect(path);
+            assert!(file.lines().take_while(|x| !x.starts_with("tools\\")).any(|x| x == format!("{num}:{}", text.trim())), "{l}\n{}", d.stdout);
+        }
+        assert!(d.stdout.len() * 10 < raw.len() * 8, "{} of {}", d.stdout.len(), raw.len());
     }
 }

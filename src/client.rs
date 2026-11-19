@@ -16,6 +16,8 @@ pub enum Client {
     OpenCode,
     Hermes,
     Pi,
+    Cursor,
+    Omp,
     Generic,
 }
 
@@ -69,18 +71,18 @@ impl Native {
 
 impl Client {
     // Used by `qx setup` to walk every client it can register.
-    #[allow(dead_code)]
-    pub const ALL: [Client; 6] = [
+    pub const ALL: [Client; 8] = [
         Client::Dsh,
         Client::ClaudeCode,
         Client::Codex,
         Client::OpenCode,
         Client::Hermes,
         Client::Pi,
+        Client::Cursor,
+        Client::Omp,
     ];
 
     // Used by `qx setup` to name each client in its own config.
-    #[allow(dead_code)]
     pub fn key(self) -> &'static str {
         match self {
             Client::Dsh => "dsh",
@@ -89,6 +91,8 @@ impl Client {
             Client::OpenCode => "opencode",
             Client::Hermes => "hermes",
             Client::Pi => "pi",
+            Client::Cursor => "cursor",
+            Client::Omp => "omp",
             Client::Generic => "generic",
         }
     }
@@ -101,6 +105,8 @@ impl Client {
             "opencode" | "open-code" => Client::OpenCode,
             "hermes" => Client::Hermes,
             "pi" => Client::Pi,
+            "cursor" => Client::Cursor,
+            "omp" | "oh-my-pi" => Client::Omp,
             "generic" => Client::Generic,
             _ => return None,
         })
@@ -119,6 +125,8 @@ impl Client {
                 "codex-mcp-client" => Some(Client::Codex),
                 "opencode" => Some(Client::OpenCode),
                 "pi" => Some(Client::Pi),
+                "cursor-vscode" => Some(Client::Cursor),
+                "omp-coding-agent" => Some(Client::Omp),
                 _ => None,
             };
             if let Some(c) = named {
@@ -136,6 +144,10 @@ impl Client {
     pub fn tool_id(self, tool: &str) -> String {
         match self {
             Client::OpenCode => format!("qx_{tool}"),
+            // omp joins server and tool with one underscore (`mcp/tool-bridge.ts`).
+            Client::Omp => format!("mcp__qx_{tool}"),
+            // Cursor hides MCP tools behind one meta-tool; a server in ~/.cursor/mcp.json is `user-<name>`.
+            Client::Cursor => format!("`CallMcpTool` (server `user-qx`, toolName `{tool}`)"),
             Client::Generic => format!("the qx `{tool}` tool"),
             _ => format!("mcp__qx__{tool}"),
         }
@@ -166,6 +178,15 @@ impl Client {
                 "`search_files`",
             ],
             Client::Pi => ["`bash`", "`read`", "`write`", "`edit`", "`bash`", "`bash`"],
+            Client::Omp => ["`bash`", "`read`", "`write`", "`edit`", "`glob`", "`grep`"],
+            Client::Cursor => [
+                "`run_terminal_cmd`",
+                "`read_file`",
+                "`edit_file`",
+                "`edit_file`",
+                "`file_search`",
+                "`grep_search`",
+            ],
             Client::Generic => ["shell", "read", "write", "edit", "glob", "grep"],
         };
         named[n.index() as usize]
@@ -183,7 +204,8 @@ impl Client {
 
     pub fn structured(self) -> Structured {
         match self {
-            Client::ClaudeCode | Client::Codex => Structured::Off,
+            // omp appends `structuredContent` to the text as JSON, so the model would read it twice.
+            Client::ClaudeCode | Client::Codex | Client::Cursor | Client::Omp => Structured::Off,
             Client::Hermes => Structured::Meta,
             Client::Dsh | Client::OpenCode | Client::Pi | Client::Generic => Structured::Full,
         }
@@ -192,19 +214,38 @@ impl Client {
     /// Server instructions, kept under 1024 bytes: Codex reads the first 512, Claude
     /// Code truncates at 4096, dsh fails above 32 KiB, and all three are paid per request.
     pub fn instructions(self) -> String {
-        let (shell, read, write) = (
-            self.native(Native::Shell),
-            self.native(Native::Read),
-            self.native(Native::Write),
-        );
+        if self == Client::Omp {
+            // `qx setup omp` hooks omp's own `bash` (integrations/omp/qx.js), and omp's file tools
+            // are as lean as `fs`, so the model keeps them; omp itself lists the `xd://` routes.
+            return format!(
+                "omp's `bash` already runs through qx, which compacts its output: keep using `bash` and \
+                 omp's file tools. Reach for {} only for what `bash` lacks: `program` + `args` with no \
+                 shell, or a command that outlives `timeout_ms` and becomes a job (`job`, `wait_ms`, \
+                 `kill`). {} batches several reads or greps in one call (`paths`, `ops`). Always pass \
+                 `cwd`. A cut output names a `full_output` file. If a qx call fails, fall back to `bash`.",
+                self.tool_id("run"),
+                self.tool_id("fs"),
+            );
+        }
+        let (shell, read) = (self.native(Native::Shell), self.native(Native::Read));
+        // Naming Edit/Glob/Grep too keeps the model off its own tools: native Edit waited a median
+        // 7 s on a permission prompt and wanted a prior Read. Codex maps several roles to one tool.
+        let mut names: Vec<&str> = Vec::new();
+        for n in [Native::Shell, Native::Read, Native::Write, Native::Edit, Native::Glob, Native::Grep] {
+            if !names.contains(&self.native(n)) {
+                names.push(self.native(n));
+            }
+        }
+        let last = names.pop().unwrap_or_default();
+        let replaced = if names.is_empty() { last.to_string() } else { format!("{} and {last}", names.join(", ")) };
         format!(
-            "qx replaces {shell}, {read} and {write} for this session. Call {} for every command \
-             (PowerShell lines, `a; b` and pipes work; `program` + `args` is fastest; keep \
-             `mode: \"compact\"`) and {} for files (`op=read|write|edit|glob|grep|list|stat`; \
-             grep takes a regex; batch with `ops`/`paths`/`edits` to save round trips). Always pass the session `cwd`. A command still running after \
-             `timeout_ms` keeps going as a background job: follow it with `job`, `wait_ms`, \
-             `kill`. A non-zero exit is a result, not a fault. A cut output has a `full_output` \
-             file to read. Only for images or sandbox escalation, fall back to {shell}/{read}.",
+            "qx replaces {replaced} for this session. Call {} for every command \
+             (shell lines and pipes work; `program` + `args` is fastest; default `mode: \"compact\"`) \
+             and {} for files (`op=read|write|edit|glob|grep|list|stat`; batch with \
+             `ops`/`paths`/`edits`). Always pass the session `cwd`. A command still running after \
+             `timeout_ms` becomes a background job: follow it with `job`, `wait_ms`, `kill`. \
+             A non-zero exit is a result, not a fault. A cut output has a `full_output` file. \
+             For images or sandbox escalation only, fall back to {shell}/{read}.",
             self.tool_id("run"),
             self.tool_id("fs"),
         )
@@ -217,7 +258,9 @@ impl Client {
             Client::OpenCode => 3,
             Client::Hermes => 4,
             Client::Pi => 5,
-            Client::Generic => 6,
+            Client::Cursor => 6,
+            Client::Omp => 7,
+            Client::Generic => 8,
         }
     }
 
@@ -229,6 +272,8 @@ impl Client {
             3 => Client::OpenCode,
             4 => Client::Hermes,
             5 => Client::Pi,
+            6 => Client::Cursor,
+            7 => Client::Omp,
             _ => Client::Generic,
         }
     }
@@ -236,7 +281,7 @@ impl Client {
 
 /// The current session's client. Set from `QX_CLIENT` at startup and from
 /// `clientInfo.name` on `initialize`; one process serves one session.
-static CURRENT: AtomicU8 = AtomicU8::new(6);
+static CURRENT: AtomicU8 = AtomicU8::new(8);
 
 thread_local! {
     /// A per-thread override for tests: the global is process-wide and tests run in parallel.
@@ -282,6 +327,9 @@ mod tests {
         let none = |_: &str| None;
         assert_eq!(Client::detect(Some("codex-mcp-client"), none), Client::Codex);
         assert_eq!(Client::detect(Some("dsh-mcp-client"), none), Client::Dsh);
+        assert_eq!(Client::detect(Some("cursor-vscode"), none), Client::Cursor);
+        assert_eq!(Client::detect(Some("omp-coding-agent"), none), Client::Omp);
+        assert_eq!(Client::Omp.tool_id("run"), "mcp__qx_run");
         assert_eq!(Client::detect(Some("mcp"), none), Client::Generic);
         assert_eq!(
             Client::detect(Some("mcp"), |k| (k == "QX_CLIENT").then(|| "hermes".into())),
@@ -327,6 +375,10 @@ mod tests {
         }
         assert_eq!(Client::OpenCode.tool_id("run"), "qx_run");
         assert!(Client::Codex.instructions().contains("apply_patch"));
+        assert!(Client::ClaudeCode.instructions().contains("`Write`, `Edit`, `Glob` and `Grep`"));
+        assert!(Client::Codex.instructions().starts_with("qx replaces `exec_command` and `apply_patch`"));
+        // omp's bash is hooked, so its text keeps the model on `bash` instead of replacing it.
+        assert!(!Client::Omp.instructions().contains("replaces"));
     }
 
     #[test]

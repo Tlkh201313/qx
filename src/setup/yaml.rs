@@ -77,7 +77,9 @@ pub fn edit_dsh(text: Option<&str>, exe: &Path, a: Action) -> Edit {
     };
     // An item spelled some other way (flow mapping, quoted id) is not ours to rewrite:
     // appending a second mcp-qx registration would give dsh two qx servers.
-    if block.is_none() && text.is_some_and(|t| t.contains("mcp-qx")) {
+    // A comment that mentions it is not an item.
+    let mentions = |t: &str| t.lines().any(|l| !l.trim_start().starts_with('#') && l.split(" #").next().unwrap_or("").contains("mcp-qx"));
+    if block.is_none() && text.is_some_and(mentions) {
         return Edit::Refuse(refusal_dsh(
             exe,
             "this file already has an mcp-qx item in a shape qx does not rewrite",
@@ -114,7 +116,11 @@ pub fn edit_dsh(text: Option<&str>, exe: &Path, a: Action) -> Edit {
                         }
                         break;
                     }
+                    let last = end == lines.len();
                     lines.drain(from..end);
+                    if last && from > 0 && lines[from - 1].trim().is_empty() {
+                        lines.remove(from - 1);
+                    }
                     verdict(finish(lines, had_newline, eol), text)
                 }
                 Action::Install => {
@@ -133,7 +139,7 @@ pub fn edit_dsh(text: Option<&str>, exe: &Path, a: Action) -> Edit {
                     let ci = indent_of(lines[command].as_str());
                     lines[command] = format!("{}command: '{}'", " ".repeat(ci), yaml_path(exe));
 
-                    let after = lines[env].trim()["env:".len()..].trim().to_string();
+                    let after = after_key(&lines[env], "env:");
                     if !after.is_empty() && after != "{}" {
                         return Edit::Refuse(refusal_dsh(exe, "config.env is a flow-style mapping"));
                     }
@@ -223,6 +229,23 @@ fn verdict(out: String, original: Option<&str>) -> Edit {
 }
 
 pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
+    // A BOM is not part of the first line: set it aside and put it back on what is written.
+    match text.and_then(|t| t.strip_prefix('\u{feff}')) {
+        Some(body) => match edit_hermes_body(Some(body), exe, a) {
+            Edit::Changed(out) if !out.is_empty() => Edit::Changed(format!("\u{feff}{out}")),
+            other => other,
+        },
+        None => edit_hermes_body(text, exe, a),
+    }
+}
+
+/// `'qx':` or `"qx":`, with or without a value after the colon.
+fn quoted_qx_key(line: &str) -> bool {
+    let t = line.trim();
+    ["'qx'", "\"qx\""].iter().any(|k| t.strip_prefix(k).is_some_and(|r| r.trim_start().starts_with(':')))
+}
+
+fn edit_hermes_body(text: Option<&str>, exe: &Path, a: Action) -> Edit {
     let source = text.unwrap_or("");
     if has_tab_indent(source) {
         return Edit::Refuse(refusal_hermes(exe, "config.yaml uses tab indentation"));
@@ -243,13 +266,13 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
                     lines.push(String::new());
                 }
                 lines.push("mcp_servers:".to_string());
-                lines.push(hermes_block(exe, "  ", &[]));
+                lines.push(hermes_block(exe, "  ", &Kept::default()));
                 verdict(finish(expand(lines), had_newline, eol), text)
             }
         };
     };
     // A flow-style mapping hides the whole server list on one line.
-    let inline = lines[servers].trim()["mcp_servers:".len()..].trim().to_string();
+    let inline = after_key(&lines[servers], "mcp_servers:");
     if !inline.is_empty() && inline != "{}" {
         return Edit::Refuse(refusal_hermes(exe, "mcp_servers is a flow-style mapping"));
     }
@@ -259,17 +282,21 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
 
     // The qx child of `mcp_servers`, at the indent its siblings use.
     let child_indent = (servers + 1..end)
+        .filter(|i| !is_noise(lines[*i].as_str()))
         .map(|i| indent_of(lines[i].as_str()))
         .filter(|i| *i > 0)
         .min()
         .unwrap_or(2);
-    let qx = (servers + 1..end).find(|i| {
-        indent_of(lines[*i].as_str()) == child_indent && lines[*i].trim().starts_with("qx:")
-    });
+    let at_child = |i: &usize| indent_of(lines[*i].as_str()) == child_indent;
+    let qx = (servers + 1..end).find(|i| at_child(i) && lines[*i].trim().starts_with("qx:"));
+    // `'qx':` and `"qx":` name the same server; qx does not rewrite those spellings.
+    if qx.is_none() && (servers + 1..end).any(|i| at_child(&i) && quoted_qx_key(&lines[i])) {
+        return Edit::Refuse(refusal_hermes(exe, "the qx server key is quoted"));
+    }
     match (qx, a) {
         (None, Action::Remove) => Edit::Unchanged,
         (None, Action::Install) => {
-            let block = hermes_block(exe, &" ".repeat(child_indent), &[]);
+            let block = hermes_block(exe, &" ".repeat(child_indent), &Kept::default());
             let last_child = (servers + 1..end).rfind(|i| !is_noise(lines[*i].as_str()));
             let insert_at = last_child
                 .map(|i| {
@@ -288,15 +315,29 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
             match action {
                 Action::Remove => {
                     lines.drain(start..qend);
+                    // `mcp_servers:` left with nothing under it goes too, with the blank line before it.
+                    let left = end - (qend - start);
+                    if (servers + 1..left).all(|i| lines[i].trim().is_empty()) {
+                        lines.drain(servers..left);
+                        if servers > 0 && lines[servers - 1].trim().is_empty() {
+                            lines.remove(servers - 1);
+                        }
+                    }
                     verdict(finish(lines, had_newline, eol), text)
                 }
                 Action::Install => {
                     // `qx: {…}` keeps the user's keys on one line; rewriting it would drop them.
-                    let inline = lines[start].trim()["qx:".len()..].trim().to_string();
+                    let inline = after_key(&lines[start], "qx:");
                     if !inline.is_empty() && inline != "{}" {
                         return Edit::Refuse(refusal_hermes(exe, "the qx server is a flow-style mapping"));
                     }
-                    let kept = kept_env(&lines, start, qend);
+                    // `env: {…}` hides the user's variables the same way.
+                    if lines[start + 1..qend].iter().any(|l| {
+                        l.trim().starts_with("env:") && !matches!(after_key(l, "env:").as_str(), "" | "{}")
+                    }) {
+                        return Edit::Refuse(refusal_hermes(exe, "the qx env is a flow-style mapping"));
+                    }
+                    let kept = kept(&lines, start, qend);
                     let block = hermes_block(exe, &" ".repeat(child_indent), &kept);
                     lines.splice(start..qend, std::iter::once(block));
                     verdict(finish(expand(lines), had_newline, eol), text)
@@ -304,6 +345,13 @@ pub fn edit_hermes(text: Option<&str>, exe: &Path, a: Action) -> Edit {
             }
         }
     }
+}
+
+/// What follows `key` on its line, without a trailing ` # comment`: `env:  # vars` has nothing after it.
+fn after_key(line: &str, key: &str) -> String {
+    let rest = line.trim()[key.len()..].trim();
+    let cut = if rest.starts_with('#') { Some(0) } else { rest.find(" #") };
+    cut.map_or(rest, |i| rest[..i].trim_end()).to_string()
 }
 
 /// Split any multi-line element back into one element per line.
@@ -315,42 +363,79 @@ fn expand(lines: Vec<String>) -> Vec<String> {
 }
 
 /// `qx:` at `indent`, with the matrix keys.
-fn hermes_block(exe: &Path, indent: &str, kept: &[String]) -> String {
-    let deeper = format!("{indent}  ");
+fn hermes_block(exe: &Path, indent: &str, kept: &Kept) -> String {
+    let deeper = format!("{indent}{}", " ".repeat(kept.step));
     let mut out = format!(
-        "{indent}qx:\n{deeper}command: '{}'\n{deeper}args: [mcp]\n{deeper}env:\n{deeper}  QX_CLIENT: hermes\n{deeper}timeout: 600\n{deeper}connect_timeout: 60",
+        "{indent}qx:\n{deeper}command: '{}'\n{deeper}args: [mcp]\n{deeper}env:\n{deeper}  QX_CLIENT: hermes",
         yaml_scalar_path(exe)
     );
-    for line in kept {
+    for line in &kept.env {
+        out.push_str(&format!("\n{deeper}  {line}"));
+    }
+    for line in &kept.extra {
         out.push('\n');
-        out.push_str(&format!("{deeper}  {line}"));
+        out.push_str(line);
+    }
+    // A timeout the user tuned stays; a fresh entry gets ours.
+    for (key, default) in [("timeout", 600), ("connect_timeout", 60)] {
+        if !kept.extra.iter().any(|l| l.trim().starts_with(&format!("{key}:"))) {
+            out.push_str(&format!("\n{deeper}{key}: {default}"));
+        }
     }
     out
 }
 
-/// `KEY: value` lines under the child's `env:`, which the user may have set.
-fn kept_env(lines: &[String], start: usize, end: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut env_indent = None;
-    for line in lines.iter().take(end).skip(start) {
+/// What a rewrite of the `qx:` entry must not lose.
+struct Kept {
+    /// `KEY: value` lines under the entry's `env:`.
+    env: Vec<String>,
+    /// The entry's other keys (`enabled`, `tools:` with its children, ...), verbatim.
+    extra: Vec<String>,
+    /// Indent the entry's own keys use below `qx:`.
+    step: usize,
+}
+
+impl Default for Kept {
+    fn default() -> Self {
+        Kept { env: Vec::new(), extra: Vec::new(), step: 2 }
+    }
+}
+
+fn kept(lines: &[String], start: usize, end: usize) -> Kept {
+    let mut out = Kept::default();
+    let Some(ci) = (start + 1..end).find(|i| !is_noise(&lines[*i])).map(|i| indent_of(&lines[i])) else {
+        return out;
+    };
+    out.step = ci.saturating_sub(indent_of(&lines[start])).max(1);
+    let (mut keep, mut env) = (false, false);
+    for line in &lines[start + 1..end] {
         let t = line.trim();
-        if t == "env:" {
-            env_indent = Some(indent_of(line.as_str()));
+        // A `- item` at the key's own indent still belongs to that key.
+        let own = !is_noise(line) && indent_of(line) == ci && !t.starts_with("- ");
+        if own {
+            let key = t.split(':').next().unwrap_or("").trim();
+            env = key == "env";
+            keep = !matches!(key, "command" | "args" | "env");
+        }
+        if t.is_empty() || own && env {
             continue;
         }
-        if let Some(ei) = env_indent {
-            if indent_of(line.as_str()) > ei && !t.is_empty() && !t.starts_with("QX_CLIENT:") {
-                out.push(t.to_string());
+        if env {
+            if !t.starts_with("QX_CLIENT:") && !t.starts_with('#') {
+                out.env.push(t.to_string());
             }
+        } else if keep {
+            out.extra.push(line.clone());
         }
     }
     out
 }
 
 pub fn hermes_command(text: &str) -> Option<String> {
-    let lines: Vec<&str> = text.lines().collect();
+    let lines: Vec<&str> = text.trim_start_matches('\u{feff}').lines().collect();
     let (servers, end) = top_child(&lines, "mcp_servers")?;
     let child_indent = (servers + 1..end)
+        .filter(|i| !is_noise(lines[*i]))
         .map(|i| indent_of(lines[i]))
         .filter(|i| *i > 0)
         .min()
@@ -361,15 +446,29 @@ pub fn hermes_command(text: &str) -> Option<String> {
     (qx..qend).find_map(|i| yaml_scalar(lines[i], "command"))
 }
 
-/// The value of a `key: value` line, single quotes stripped.
+/// The value of a `key: value` line, single quotes stripped, a trailing ` # comment` dropped.
 fn yaml_scalar(line: &str, key: &str) -> Option<String> {
     let t = line.trim();
     let rest = t.strip_prefix(&format!("{key}:"))?.trim();
-    let quoted = rest.starts_with('\'');
-    let rest = rest.strip_prefix('\'').unwrap_or(rest);
-    let rest = rest.strip_suffix('\'').unwrap_or(rest);
-    // Inside a single-quoted scalar a doubled quote is one quote.
-    (!rest.is_empty()).then(|| if quoted { rest.replace("''", "'") } else { rest.to_string() })
+    let value = match rest.strip_prefix('\'') {
+        // Inside a single-quoted scalar a doubled quote is one quote; the first lone one ends it.
+        Some(body) => {
+            let mut out = String::new();
+            let mut chars = body.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\'' {
+                    if chars.peek() != Some(&'\'') {
+                        break;
+                    }
+                    chars.next();
+                }
+                out.push(c);
+            }
+            out
+        }
+        None => after_key(rest, ""),
+    };
+    (!value.is_empty()).then_some(value)
 }
 
 fn finish(lines: Vec<String>, trailing_newline: bool, eol: &str) -> String {
@@ -390,25 +489,25 @@ fn refusal_dsh(exe: &Path, why: &str) -> String {
 fn refusal_hermes(exe: &Path, why: &str) -> String {
     format!(
         "{why}. Edit it by hand, or paste this under `mcp_servers:`:\n{}",
-        hermes_block(exe, "  ", &[])
+        hermes_block(exe, "  ", &Kept::default())
     )
 }
 
 /// Delete `dsh_home\bin\qx*.exe` files that no patch file under `dsh_home` references.
-pub fn prune_dsh_binaries(dsh_home: &Path) -> usize {
+pub fn prune_dsh_binaries(dsh_home: &Path) -> Vec<String> {
     let bin = dsh_home.join("bin");
     let Ok(entries) = std::fs::read_dir(&bin) else {
-        return 0;
+        return Vec::new();
     };
     let referenced = dsh_references(dsh_home);
-    let mut removed = 0;
+    let mut removed = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default();
-        if !path.is_file() || !name.starts_with("qx") || !name.ends_with(".exe") {
+        if !path.is_file() || !is_qx_build(&name) {
             continue;
         }
         // Match on the file name anywhere in the patch text: a config may spell the copy
@@ -419,10 +518,19 @@ pub fn prune_dsh_binaries(dsh_home: &Path) -> usize {
         }
         // A running server holds its image open; that copy is not ours to remove.
         if std::fs::remove_file(&path).is_ok() {
-            removed += 1;
+            removed.push(name);
         }
     }
     removed
+}
+
+/// `qx.exe`, or `qx` + a separator + a hex build id (`qx-1a2b3c4d5e6f.exe`): not `qxl-viewer.exe`, `qx-lint.exe`.
+pub(crate) fn is_qx_build(lower_name: &str) -> bool {
+    let Some(stem) = lower_name.strip_suffix(".exe") else { return false };
+    stem == "qx"
+        || stem.strip_prefix("qx").and_then(|r| r.strip_prefix(|c: char| !c.is_ascii_alphanumeric())).is_some_and(|id| {
+            id.len() >= 6 && id.bytes().all(|b| b.is_ascii_hexdigit())
+        })
 }
 
 fn dsh_references(dsh_home: &Path) -> Vec<String> {
@@ -523,6 +631,19 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_after_a_key_is_not_a_flow_mapping() {
+        assert_eq!(after_key("  env:  # vars", "env:"), "");
+        assert_eq!(after_key("mcp_servers: {}  # none", "mcp_servers:"), "{}");
+        assert_eq!(after_key("env: {A: b}", "env:"), "{A: b}");
+        let exe = Path::new(r"C:\q\qx.exe");
+        let src = "model: x\nmcp_servers:  # servers\n  codegraph:\n    command: cg\n";
+        let out = changed(edit_hermes(Some(src), exe, Action::Install));
+        assert!(out.contains("mcp_servers:  # servers\n") && out.contains("  qx:\n"), "{out}");
+        let dsh = DSH.replacen("env:", "env:  # vars", 1);
+        assert!(!matches!(edit_dsh(Some(&dsh), exe, Action::Install), Edit::Refuse(_)));
+    }
+
+    #[test]
     fn yaml_paths_with_an_apostrophe_are_escaped() {
         // A quote in the install path must be doubled, or the YAML stops parsing.
         let exe = Path::new(r"C:\Users\O'Brien\qx.exe");
@@ -555,6 +676,22 @@ mod tests {
         assert!(!refusal.contains("- insert:"), "{refusal}");
         assert!(!refusal.contains("QX_CLIENT: dsh"), "{refusal}");
         assert!(refusal.contains("qx:"), "{refusal}");
+    }
+
+    #[test]
+    fn hermes_install_keeps_the_users_own_keys() {
+        let src = "mcp_servers:\n  qx:\n    command: old\n    args:\n      - mcp\n    tools:\n      include:\n        - run\n    enabled: false\n    timeout: 90\n    env:\n      QX_GUARD: safe\n  other:\n    command: x\n";
+        let out = match edit_hermes(Some(src), Path::new(r"C:\q\qx.exe"), Action::Install) {
+            Edit::Changed(t) => t,
+            _ => panic!("expected a change"),
+        };
+        for keep in ["    tools:\n      include:\n        - run\n", "    enabled: false\n", "    timeout: 90\n", "      QX_GUARD: safe\n", "  other:\n    command: x\n"] {
+            assert!(out.contains(keep), "{keep:?} lost:\n{out}");
+        }
+        assert!(out.contains("command: 'C:\\q\\qx.exe'") && !out.contains("command: old"), "{out}");
+        assert_eq!(out.matches("timeout:").count(), 2, "{out}"); // timeout + connect_timeout
+        assert!(!out.contains("timeout: 600"), "{out}");
+        assert!(matches!(edit_hermes(Some(&out), Path::new(r"C:\q\qx.exe"), Action::Install), Edit::Unchanged), "{out}");
     }
 
     #[test]
@@ -635,18 +772,90 @@ mod tests {
         let root = std::env::temp_dir().join(format!("qx-dshbin-{}", std::process::id()));
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        for name in ["qx.exe", "qx-aaa.exe", "qx-bbb.exe"] {
+        for name in ["qx.exe", "qx-aaaaaa.exe", "qx-bbbbbb.exe"] {
             std::fs::write(bin.join(name), "x").unwrap();
         }
         std::fs::write(
             root.join("cordis.patch.yml"),
-            "        command: 'C:/q/.dsh/bin/qx-bbb.exe'\n",
+            "        command: 'C:/q/.dsh/bin/qx-bbbbbb.exe'\n",
         )
         .unwrap();
-        assert_eq!(prune_dsh_binaries(&root), 2);
-        assert!(bin.join("qx-bbb.exe").is_file());
-        assert!(!bin.join("qx-aaa.exe").exists());
+        assert_eq!(prune_dsh_binaries(&root).len(), 2);
+        assert!(bin.join("qx-bbbbbb.exe").is_file());
+        assert!(!bin.join("qx-aaaaaa.exe").exists());
         assert!(!bin.join("qx.exe").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dsh_cleanup_spares_programs_that_only_start_with_qx() {
+        let root = std::env::temp_dir().join(format!("qx-dshbin2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for name in ["qx.exe", "qx-0a1b2c3d4e5f.exe", "qx_1a2b3c.exe", "qxl-viewer.exe", "QXtool.exe", "qx-keep.txt", "qx-lint.exe", "qx-cache.exe"] {
+            std::fs::write(bin.join(name), "x").unwrap();
+        }
+        std::fs::write(root.join("cordis.patch.yml"), "# nothing references a copy\n").unwrap();
+        let mut removed = prune_dsh_binaries(&root);
+        removed.sort();
+        assert_eq!(removed, ["qx-0a1b2c3d4e5f.exe", "qx.exe", "qx_1a2b3c.exe"]);
+        for spared in ["qxl-viewer.exe", "QXtool.exe", "qx-keep.txt", "qx-lint.exe", "qx-cache.exe"] {
+            assert!(bin.join(spared).is_file(), "{spared} is not a qx build and must stay");
+        }
+        for gone in ["qx.exe", "qx-0a1b2c3d4e5f.exe", "qx_1a2b3c.exe"] {
+            assert!(!bin.join(gone).exists(), "{gone} is an unreferenced qx copy");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hermes_indent_follows_the_servers_not_comments_or_blank_lines() {
+        let exe = Path::new(r"C:\q\qx.exe");
+        let qx_indent = |text: &str| -> Vec<usize> {
+            text.lines().filter(|l| l.trim() == "qx:").map(indent_of).collect()
+        };
+        // A comment less indented than the servers must not set the indent.
+        let src = "mcp_servers:\n  # servers\n    other:\n        command: o\n";
+        let out = changed(edit_hermes(Some(src), exe, Action::Install));
+        assert_eq!(qx_indent(&out), vec![4], "{out}");
+        // Nor a whitespace-only line: the existing 4-space `qx:` is rewritten in place, not doubled.
+        let src = "mcp_servers:\n  \n    qx:\n      command: old\n";
+        let out = changed(edit_hermes(Some(src), exe, Action::Install));
+        assert_eq!(qx_indent(&out), vec![4], "{out}");
+        assert_eq!(hermes_command(&out).as_deref(), Some(r"C:\q\qx.exe"));
+        assert_eq!(hermes_command(src).as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn hermes_bom_does_not_add_a_second_servers_key() {
+        let exe = Path::new(r"C:\q\qx.exe");
+        let src = "\u{feff}mcp_servers:\n  other:\n    command: o\n";
+        let out = changed(edit_hermes(Some(src), exe, Action::Install));
+        assert!(out.starts_with(src), "{out}");
+        assert_eq!(out.matches("mcp_servers:").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn hermes_quoted_qx_key_is_refused() {
+        let exe = Path::new(r"C:\q\qx.exe");
+        let src = "mcp_servers:\n  'qx':\n    command: old\n";
+        assert!(matches!(edit_hermes(Some(src), exe, Action::Install), Edit::Refuse(_)));
+    }
+
+    #[test]
+    fn yaml_command_drops_a_trailing_comment() {
+        assert_eq!(yaml_scalar("  command: 'C:\\qx.exe' # canonical", "command").as_deref(), Some("C:\\qx.exe"));
+        assert_eq!(yaml_scalar("  command: 'it''s' # c", "command").as_deref(), Some("it's"));
+        assert_eq!(yaml_scalar("  command: C:/qx.exe # c", "command").as_deref(), Some("C:/qx.exe"));
+    }
+
+    #[test]
+    fn dsh_comment_mentioning_mcp_qx_is_not_an_item() {
+        let exe = Path::new(r"C:\q\qx.exe");
+        let src = "# old mcp-qx entry removed\n";
+        assert!(matches!(edit_dsh(Some(src), exe, Action::Remove), Edit::Unchanged));
+        let out = changed(edit_dsh(Some(src), exe, Action::Install));
+        assert!(out.starts_with(src), "{out}");
     }
 }

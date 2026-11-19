@@ -11,13 +11,16 @@ permissions:
 jobs:
   test:
     runs-on: windows-latest
+    # A hung test must not hold the runner for the 6-hour default.
+    timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
       # The GNU grep/sed parity tests must run here, not skip.
       QX_REQUIRE_ORACLE: "1"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned: a new stable adds clippy lints and turns -D warnings red without a code change.
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -25,6 +28,9 @@ jobs:
         run: cargo clippy --release --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --release --locked
+      # Dev profile keeps overflow checks and debug asserts on, which release turns off.
+      - name: Tests (dev profile)
+        run: cargo test --locked
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -33,9 +39,15 @@ jobs:
           cargo build --release --locked
           node integrations/pi/bridge.test.mjs
           node integrations/pi/smoke.mjs target/release/qx.exe
+      # Spawned timings are printed only; an in-process median over 10 ms (target 2 ms; runners are noisy) fails the job.
+      - name: Bench table (Goal.md)
+        env:
+          QX_BENCH_MAX_INPROC_MS: "10"
+        run: python scripts/bench_mcp.py "$env:GITHUB_WORKSPACE\target\release\qx.exe" "$env:GITHUB_WORKSPACE"
 
   msrv:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.82

@@ -46,7 +46,16 @@ pub fn try_exec(program: &str, args: &[String], cwd: Option<&Path>, envs: &[(Str
         }
         None => args,
     };
-    if PATHY.contains(&name.as_str()) && args.iter().any(|a| a.starts_with('/')) {
+    // grep checks its own operands: a pattern such as `/api/users` is not a path.
+    if name != "grep" && PATHY.contains(&name.as_str()) && args.iter().any(|a| a.starts_with('/')) {
+        return None;
+    }
+    // `Test-Path env:FOO`, `ls HKCU:\`: a PowerShell provider path, not a file under the cwd.
+    // grep and sed take patterns and scripts, where a colon is ordinary text.
+    if !matches!(name.as_str(), "grep" | "sed" | "echo" | "write-output" | "write-host")
+        && (PATHY.contains(&name.as_str()) || name == "test-path")
+        && args.iter().any(|a| !a.starts_with('-') && a.find(':').is_some_and(|i| i >= 2))
+    {
         return None;
     }
     let mut out = match name.as_str() {
@@ -336,6 +345,7 @@ struct LsEntry {
     is_dir: bool,
     len: u64,
     modified: Option<SystemTime>,
+    readonly: bool,
 }
 
 struct LsWalk {
@@ -343,6 +353,7 @@ struct LsWalk {
     limit: usize,
     capped: bool,
     depth_capped: bool,
+    err: String,
 }
 
 fn cmd_ls(args: &[String], cwd: Option<&Path>, full: bool) -> Option<BuiltinOut> {
@@ -366,11 +377,8 @@ fn cmd_ls(args: &[String], cwd: Option<&Path>, full: bool) -> Option<BuiltinOut>
         if !literal && a.starts_with('-') && a.len() > 1 {
             if a.starts_with("--") {
                 match a.as_str() {
-                    "--color"
-                    | "--color=auto"
-                    | "--color=always"
-                    | "--color=never"
-                    | "--group-directories-first" => continue,
+                    "--color" | "--color=auto" | "--color=never" => continue,
+                    // Colours and directory grouping are not produced here: the real ls answers.
                     _ => return None,
                 }
             }
@@ -397,22 +405,27 @@ fn cmd_ls(args: &[String], cwd: Option<&Path>, full: bool) -> Option<BuiltinOut>
     if paths.is_empty() {
         paths.push(".");
     }
+    // A long listing would show the target's type and size instead of the link: the real ls answers.
+    if opts.long && paths.iter().any(|p| fs::symlink_metadata(path_of(cwd, p)).is_ok_and(|m| m.file_type().is_symlink())) {
+        return None;
+    }
 
     let mut out = String::new();
     if opts.dirs_as_files {
+        let mut rows = Vec::new();
         for p in paths {
             let path = path_of(cwd, p);
             match fs::metadata(&path) {
-                Ok(md) => write_entry(
-                    &mut out,
-                    p,
-                    md.is_dir(),
-                    md.len(),
-                    md.modified().ok(),
-                    opts.long,
-                ),
+                Ok(md) => rows.push((p, md.is_dir(), md.len(), md.modified().ok(), md.permissions().readonly())),
                 Err(e) => return Some(fail(format!("ls: {}: {e}", path.display()))),
             }
+        }
+        let style = LongStyle::new(opts.full, rows.iter().map(|r| (r.2, r.3, r.1)));
+        if opts.long && !rows.is_empty() {
+            out.push_str(&style.header());
+        }
+        for (p, is_dir, len, modified, readonly) in rows {
+            write_entry(&mut out, p, is_dir, len, modified, readonly, opts.long, &style);
         }
         return Some(ok(out));
     }
@@ -423,13 +436,14 @@ fn cmd_ls(args: &[String], cwd: Option<&Path>, full: bool) -> Option<BuiltinOut>
             limit: LS_R_LINE_CAP,
             capped: false,
             depth_capped: false,
+            err: String::new(),
         };
         for p in &paths {
             let path = path_of(cwd, p);
             if let Err(e) = fs::metadata(&path) {
                 return Some(fail(format!("ls: {}: {e}", path.display())));
             }
-            list_recursive(&path, p, &opts, &mut out, &mut walk, 0);
+            list_recursive(&path, p, &opts, &mut out, &mut walk, 0)?;
         }
         if walk.capped {
             let _ = writeln!(out, "[qx] -R capped at {LS_R_LINE_CAP} displayed entries");
@@ -437,43 +451,59 @@ fn cmd_ls(args: &[String], cwd: Option<&Path>, full: bool) -> Option<BuiltinOut>
         if walk.depth_capped {
             let _ = writeln!(out, "[qx] -R depth capped at {LS_MAX_DEPTH}");
         }
-        return Some(ok(out));
+        // An unreadable subdirectory is an error, not a quiet gap in an otherwise successful listing.
+        return Some(BuiltinOut { code: i32::from(!walk.err.is_empty()), stdout: out, stderr: walk.err, elapsed: Duration::ZERO });
     }
 
+    // Like ls: the file operands first, as one listing, then each directory under a `name:` header, so a
+    // file named after a directory is never read as one of its entries. One bad operand does not hide
+    // the others: its error goes to stderr and the exit code is 1.
     let multiple = paths.len() > 1;
-    let mut first = true;
+    let mut err = String::new();
+    let mut files: Vec<(&str, fs::Metadata)> = Vec::new();
+    let mut dirs: Vec<(&str, PathBuf)> = Vec::new();
     for p in paths {
         let path = path_of(cwd, p);
+        match fs::metadata(&path) {
+            Ok(md) if md.is_dir() => dirs.push((p, path)),
+            Ok(md) => files.push((p, md)),
+            Err(e) => {
+                let _ = writeln!(err, "ls: {}: {e}", path.display());
+            }
+        }
+    }
+    if opts.long && !files.is_empty() {
+        let style = LongStyle::new(opts.full, files.iter().map(|(_, md)| (md.len(), md.modified().ok(), false)));
+        out.push_str(&style.header());
+        for (p, md) in &files {
+            write_entry(&mut out, p, false, md.len(), md.modified().ok(), md.permissions().readonly(), true, &style);
+        }
+    } else {
+        for (p, _) in &files {
+            out.push_str(p);
+            out.push('\n');
+        }
+    }
+    for (p, path) in dirs {
         if multiple {
-            if !first {
+            if !out.is_empty() {
                 out.push('\n');
             }
             let _ = writeln!(out, "{p}:");
         }
-        first = false;
-        match list_one(&path, &opts) {
+        match list_dir(&path, &opts) {
             Ok(s) => out.push_str(&s),
-            Err(e) => return Some(fail(format!("ls: {}: {e}", path.display()))),
+            // A symlink in a long listing (see `collect_entries`): the real ls answers.
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => return None,
+            Err(e) => {
+                let _ = writeln!(err, "ls: {}: {e}", path.display());
+            }
         }
     }
-    Some(ok(out))
+    Some(BuiltinOut { code: i32::from(!err.is_empty()), stdout: out, stderr: err, elapsed: Duration::ZERO })
 }
 
-fn list_one(path: &Path, opts: &LsOpts) -> std::io::Result<String> {
-    let md = fs::metadata(path)?;
-    if !md.is_dir() {
-        let mut out = String::new();
-        write_entry(
-            &mut out,
-            &path.file_name().unwrap_or_default().to_string_lossy(),
-            false,
-            md.len(),
-            md.modified().ok(),
-            opts.long,
-        );
-        return Ok(out);
-    }
-
+fn list_dir(path: &Path, opts: &LsOpts) -> std::io::Result<String> {
     let (mut entries, total, dirs, files, capped) = collect_entries(path, opts)?;
     sort_entries(&mut entries, opts);
     let mut walk = LsWalk {
@@ -481,12 +511,14 @@ fn list_one(path: &Path, opts: &LsOpts) -> std::io::Result<String> {
         limit: usize::MAX,
         capped: false,
         depth_capped: false,
+        err: String::new(),
     };
     let mut out = String::new();
     write_listing(&mut out, &entries, total, dirs, files, capped, opts, &mut walk);
     Ok(out)
 }
 
+/// `None` declines the whole command (a symlink in a long listing).
 fn list_recursive(
     path: &Path,
     display: &str,
@@ -494,27 +526,28 @@ fn list_recursive(
     out: &mut String,
     walk: &mut LsWalk,
     depth: usize,
-) {
+) -> Option<()> {
     if walk.capped {
-        return;
+        return Some(());
     }
     if depth > LS_MAX_DEPTH {
         walk.depth_capped = true;
-        return;
+        return Some(());
     }
 
     let (mut entries, total, dirs, files, capped) = match collect_entries(path, opts) {
         Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => return None,
         Err(e) => {
-            let _ = writeln!(out, "ls: {}: {e}", path.display());
-            return;
+            let _ = writeln!(walk.err, "ls: {}: {e}", path.display());
+            return Some(());
         }
     };
     sort_entries(&mut entries, opts);
     let _ = writeln!(out, "{display}:");
     write_listing(out, &entries, total, dirs, files, capped, opts, walk);
     if walk.capped {
-        return;
+        return Some(());
     }
 
     let children: Vec<String> = entries
@@ -524,12 +557,13 @@ fn list_recursive(
         .collect();
     for name in children {
         if walk.capped {
-            return;
+            return Some(());
         }
         let child = path.join(&name);
         let child_display = Path::new(display).join(&name).display().to_string();
-        list_recursive(&child, &child_display, opts, out, walk, depth + 1);
+        list_recursive(&child, &child_display, opts, out, walk, depth + 1)?;
     }
+    Some(())
 }
 
 fn collect_entries(
@@ -548,7 +582,12 @@ fn collect_entries(
             continue;
         }
         total += 1;
-        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let ft = e.file_type().ok();
+        // `-l` would show the target's size and type, not the link: `Unsupported` makes ls decline.
+        if opts.long && ft.is_some_and(|t| t.is_symlink()) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        }
+        let is_dir = ft.is_some_and(|t| t.is_dir());
         if is_dir {
             dirs += 1;
         } else {
@@ -561,12 +600,14 @@ fn collect_entries(
         let md = if need_meta { e.metadata().ok() } else { None };
         let len = md.as_ref().map(|m| m.len()).unwrap_or(0);
         let modified = md.as_ref().and_then(|m| m.modified().ok());
+        let readonly = md.as_ref().is_some_and(|m| m.permissions().readonly());
         entries.push(LsEntry {
             lower: name.to_ascii_lowercase(),
             name,
             is_dir,
             len,
             modified,
+            readonly,
         });
     }
     Ok((entries, total, dirs, files, capped))
@@ -603,19 +644,23 @@ fn write_listing(
     }
 
     let n = entries.len();
+    let style = LongStyle::new(full, entries.iter().map(|e| (e.len, e.modified, e.is_dir)));
+    if opts.long && n > 0 {
+        out.push_str(&style.header());
+    }
     if full || n <= LS_SAMPLE_HEAD + LS_SAMPLE_TAIL {
         for e in entries {
             if !take_line(walk) {
                 break;
             }
-            write_entry(out, &e.name, e.is_dir, e.len, e.modified, opts.long);
+            write_entry(out, &e.name, e.is_dir, e.len, e.modified, e.readonly, opts.long, &style);
         }
     } else {
         for e in &entries[..LS_SAMPLE_HEAD] {
             if !take_line(walk) {
                 break;
             }
-            write_entry(out, &e.name, e.is_dir, e.len, e.modified, opts.long);
+            write_entry(out, &e.name, e.is_dir, e.len, e.modified, e.readonly, opts.long, &style);
         }
         if !walk.capped {
             // Directories are navigation anchors: never drop one silently.
@@ -639,7 +684,7 @@ fn write_listing(
                 if !take_line(walk) {
                     break;
                 }
-                write_entry(out, &e.name, e.is_dir, e.len, e.modified, opts.long);
+                write_entry(out, &e.name, e.is_dir, e.len, e.modified, e.readonly, opts.long, &style);
             }
         }
     }
@@ -694,13 +739,67 @@ fn write_header(
     out.push('\n');
 }
 
+/// Layout of one long listing. Compact (default): no synthetic mode string, size padded to the
+/// widest file size (directories print none), zone plus any shared date and minute stated once in a
+/// header line. `full` keeps the classic `-rw-r--r-- <size:10> <date time UTC> name` rows.
+struct LongStyle {
+    full: bool,
+    width: usize,
+    /// Date shared by every entry; rows then carry only `HH:MM`.
+    date: Option<String>,
+    /// `HH:MM` shared by every entry (implies a shared date); rows then carry no time at all.
+    minute: Option<String>,
+}
+
+impl LongStyle {
+    fn new<I: IntoIterator<Item = (u64, Option<SystemTime>, bool)>>(full: bool, items: I) -> LongStyle {
+        let mut width = 1;
+        let mut date: Option<String> = None;
+        let mut minute: Option<String> = None;
+        let (mut same_date, mut same_minute) = (true, true);
+        for (len, modified, is_dir) in items {
+            if !is_dir {
+                width = width.max(len.to_string().len());
+            }
+            let t = modified.unwrap_or(UNIX_EPOCH);
+            let (d, m) = (ymd_string(t), hm_string(t));
+            match &date {
+                None => date = Some(d),
+                Some(prev) if *prev != d => same_date = false,
+                _ => {}
+            }
+            match &minute {
+                None => minute = Some(m),
+                Some(prev) if *prev != m => same_minute = false,
+                _ => {}
+            }
+        }
+        let date = if same_date { date } else { None };
+        let minute = if same_date && same_minute { minute } else { None };
+        LongStyle { full, width, date, minute }
+    }
+
+    /// One line stating what the rows omit; empty in full mode.
+    fn header(&self) -> String {
+        match (&self.date, &self.minute, self.full) {
+            (_, _, true) => String::new(),
+            (Some(d), Some(m), false) => format!("(UTC {d} {m})\n"),
+            (Some(d), None, false) => format!("(UTC {d})\n"),
+            (None, _, false) => "(times UTC)\n".to_string(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_entry(
     out: &mut String,
     name: &str,
     is_dir: bool,
     len: u64,
     modified: Option<SystemTime>,
+    readonly: bool,
     long: bool,
+    style: &LongStyle,
 ) {
     if !long {
         out.push_str(name);
@@ -712,17 +811,50 @@ fn write_entry(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let mode = if is_dir {
-        "drwxr-xr-x"
-    } else if matches!(ext.as_str(), "exe" | "cmd" | "bat" | "ps1" | "com") {
-        "-rwxr-xr-x"
+    let exec = !is_dir && matches!(ext.as_str(), "exe" | "cmd" | "bat" | "ps1" | "com");
+    let t = modified.unwrap_or(UNIX_EPOCH);
+    if style.full {
+        // On Windows a folder's read-only attribute is only a marker; it does not stop writes into it.
+        let w = if readonly && !is_dir { '-' } else { 'w' };
+        let mode = if is_dir {
+            format!("dr{w}xr-xr-x")
+        } else if exec {
+            format!("-r{w}xr-xr-x")
+        } else {
+            format!("-r{w}-r--r--")
+        };
+        let _ = write!(out, "{mode} {len:>10} ");
+        write_time(out, t);
+        out.push(' ');
+        out.push_str(name);
+        out.push('\n');
+        return;
+    }
+    // A directory's size is always 0 on Windows: it carries nothing, so the column shows `-`. Never empty:
+    // with the time hoisted into the header, `2024 notes/` would read as a 2024-byte entry `notes/`.
+    if is_dir {
+        let _ = write!(out, "{:>w$} ", "-", w = style.width);
     } else {
-        "-rw-r--r--"
-    };
-    let _ = write!(out, "{mode} {len:>10} ");
-    write_time(out, modified.unwrap_or(UNIX_EPOCH));
-    out.push(' ');
+        let _ = write!(out, "{len:>w$} ", w = style.width);
+    }
+    if style.minute.is_none() {
+        if style.date.is_none() {
+            out.push_str(&ymd_string(t));
+            out.push(' ');
+        }
+        out.push_str(&hm_string(t));
+        out.push(' ');
+    }
     out.push_str(name);
+    // ls -F style markers: `/` directory, `*` executable; ` [ro]` only for a set read-only bit.
+    if is_dir {
+        out.push('/');
+    } else if exec {
+        out.push('*');
+    }
+    if readonly && !is_dir {
+        out.push_str(" [ro]");
+    }
     out.push('\n');
 }
 
@@ -730,19 +862,29 @@ fn write_time(out: &mut String, t: SystemTime) {
     out.push_str(&format_time(t));
 }
 
-pub(crate) fn format_time(t: SystemTime) -> String {
+fn ymd_hm(t: SystemTime) -> (i64, u32, u32, u64, u64) {
     let secs = t
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
+    let rem = secs.rem_euclid(86_400) as u64;
     let (y, m, d) = civil_from_days(days);
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
-        rem / 3600,
-        (rem % 3600) / 60
-    )
+    (y, m, d, rem / 3600, (rem % 3600) / 60)
+}
+
+fn ymd_string(t: SystemTime) -> String {
+    let (y, m, d, _, _) = ymd_hm(t);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn hm_string(t: SystemTime) -> String {
+    let (_, _, _, h, mi) = ymd_hm(t);
+    format!("{h:02}:{mi:02}")
+}
+
+pub(crate) fn format_time(t: SystemTime) -> String {
+    format!("{} {} UTC", ymd_string(t), hm_string(t))
 }
 
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -770,7 +912,45 @@ fn read_text_capped(path: &Path) -> std::io::Result<(String, bool)> {
     if cut {
         buf.truncate(READ_CAP as usize);
     }
-    Ok((crate::exec::decode(&buf), cut))
+    Ok((crate::exec::decode_owned(buf), cut))
+}
+
+/// A whole file for `cat`. Past the cap it keeps the start and the last 2 MiB (a log's failure is at its
+/// end) with a marker for the middle, as a command's captured output does; the flag says it did.
+fn read_text_ends(path: &Path) -> std::io::Result<(String, bool)> {
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    let mut bom = [0u8; 2];
+    let got = f.read(&mut bom)?;
+    f.seek(SeekFrom::Start(0))?;
+    // UTF-16 has to be decoded from its start, so it keeps the plain cap.
+    if len <= READ_CAP || (got == 2 && (bom == [0xFF, 0xFE] || bom == [0xFE, 0xFF])) {
+        drop(f);
+        let (mut text, cut) = read_text_capped(path)?;
+        if cut {
+            text.push_str("\n[qx] cat truncated at 32 MiB\n");
+        }
+        return Ok((text, cut));
+    }
+    let tail_len = READ_CAP / 16;
+    let mut head = Vec::new();
+    // 256 bytes of room for the marker line, so the joined text always fits under the cap `cat` enforces
+    // afterwards (that cut would otherwise take the end this function exists to keep).
+    f.by_ref().take(READ_CAP - tail_len - 256).read_to_end(&mut head)?;
+    let mut tail = Vec::new();
+    f.seek(SeekFrom::Start(len - tail_len))?;
+    f.take(tail_len).read_to_end(&mut tail)?;
+    // Whole lines on both sides of the gap.
+    if let Some(i) = head.iter().rposition(|&b| b == b'\n') {
+        head.truncate(i + 1);
+    }
+    if let Some(i) = tail.iter().position(|&b| b == b'\n') {
+        tail.drain(..=i);
+    }
+    let omitted = len - head.len() as u64 - tail.len() as u64;
+    head.extend_from_slice(format!("[qx] ... {omitted} bytes omitted (cat reads at most 32 MiB) ...\n").as_bytes());
+    head.extend_from_slice(&tail);
+    Ok((crate::exec::decode_owned(head), true))
 }
 
 fn cmd_cat(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
@@ -795,20 +975,20 @@ fn cmd_cat(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut n = 0usize;
     for f in files {
         let path = path_of(cwd, f);
-        match read_text_capped(&path) {
-            Ok((text, cut)) => {
+        match read_text_ends(&path) {
+            Ok((text, _cut)) => {
                 if number {
-                    for line in text.lines() {
+                    // Each line keeps its own terminator: CRLF stays CRLF, a missing final newline stays missing.
+                    for line in text.split_inclusive('\n') {
                         n += 1;
-                        out.push_str(&format!("{n:>6}\t{line}\n"));
+                        let _ = write!(out, "{n:>6}\t{line}");
                     }
+                } else if out.is_empty() {
+                    out = text; // the common case: one file, no second copy
                 } else {
                     out.push_str(&text);
-                    if !text.ends_with('\n') && !text.is_empty() {
-                        out.push('\n');
-                    }
                 }
-                if cut || out.len() > READ_CAP as usize {
+                if out.len() > READ_CAP as usize {
                     let mut end = READ_CAP as usize;
                     while end > 0 && !out.is_char_boundary(end) {
                         end -= 1;
@@ -895,13 +1075,12 @@ fn cmd_head(args: &[String], cwd: Option<&Path>, tail: bool) -> Option<BuiltinOu
         };
     }
     let Window::Lines(count) = window else { return None };
-    let text = match read_head_tail(&path, count, tail) {
-        Ok(t) => t,
-        Err(e) => {
-            return Some(fail(format!("{tool}: {}: {e}", path.display())))
-        }
-    };
-    Some(ok(text))
+    match read_head_tail(&path, count, tail) {
+        Ok(Some(t)) => Some(ok(t)),
+        // Too big for the 32 MiB window: the real tool prints all of it.
+        Ok(None) => None,
+        Err(e) => Some(fail(format!("{tool}: {}: {e}", path.display()))),
+    }
 }
 
 /// `-c`: a byte window, text only. A window that is binary or not valid UTF-8 is left to the
@@ -928,16 +1107,28 @@ fn read_bytes_window(path: &Path, n: usize, tail: bool) -> std::io::Result<Optio
     Ok(String::from_utf8(buf).ok())
 }
 
-/// Read only what `head`/`tail` needs. Large files are bounded to the first or
-/// last 32 MiB instead of falling back to a binary that may not exist on
-/// Windows.
-fn read_head_tail(path: &Path, count: usize, tail: bool) -> std::io::Result<String> {
+/// Read only what `head`/`tail` needs, from a 32 MiB window. `None` when the window is too small
+/// to hold the answer, so the real tool answers instead of a silently short result.
+fn read_head_tail(path: &Path, count: usize, tail: bool) -> std::io::Result<Option<String>> {
     if count == 0 && tail {
-        return Ok(String::new());
+        return Ok(Some(String::new()));
     }
     let mut f = File::open(path)?;
     if count == 0 {
-        return Ok(String::new());
+        return Ok(Some(String::new()));
+    }
+    // UTF-16 (PowerShell 5.1 `>`) has to be decoded whole: a line slice or a mid-file window has no BOM.
+    let mut bom = [0u8; 2];
+    let got = f.read(&mut bom)?;
+    f.seek(SeekFrom::Start(0))?;
+    if got == 2 && (bom == [0xFF, 0xFE] || bom == [0xFE, 0xFF]) {
+        let (text, cut) = read_text_capped(path)?;
+        if cut {
+            return Ok(None);
+        }
+        let lines: Vec<&str> = text.split_inclusive('\n').collect();
+        let pick = if tail { &lines[lines.len().saturating_sub(count)..] } else { &lines[..lines.len().min(count)] };
+        return Ok(Some(pick.concat()));
     }
     let len = f.metadata()?.len();
     if !tail {
@@ -953,17 +1144,13 @@ fn read_head_tail(path: &Path, count: usize, tail: bool) -> std::io::Result<Stri
                 break;
             }
             seen += 1;
-            let mut line = crate::exec::decode(&buf);
-            if line.ends_with('\n') {
-                line.pop();
-                if line.ends_with('\r') {
-                    line.pop();
-                }
-            }
-            out.push_str(&line);
-            out.push('\n');
+            // Verbatim: output can be redirected to a file, so CRLF and a missing final newline survive.
+            out.push_str(&crate::exec::decode(&buf));
         }
-        return Ok(out);
+        if seen < count && len > READ_CAP && reader.get_ref().limit() == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(out));
     }
 
     // Walk backwards in small chunks until enough line breaks are found. The
@@ -985,6 +1172,9 @@ fn read_head_tail(path: &Path, count: usize, tail: bool) -> std::io::Result<Stri
             break;
         }
     }
+    if pos > 0 && newlines <= count {
+        return Ok(None);
+    }
     let mut buf = Vec::with_capacity(total);
     for chunk in chunks.iter().rev() {
         buf.extend_from_slice(chunk);
@@ -999,19 +1189,14 @@ fn read_head_tail(path: &Path, count: usize, tail: bool) -> std::io::Result<Stri
         text
     };
 
-    let mut out = String::new();
     let mut ring: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
-    for line in text.lines() {
+    for line in text.split_inclusive('\n') {
         if ring.len() == count {
             ring.pop_front();
         }
         ring.push_back(line);
     }
-    for line in ring {
-        out.push_str(line);
-        out.push('\n');
-    }
-    Ok(out)
+    Ok(Some(ring.into_iter().collect()))
 }
 
 fn cmd_wc(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
@@ -1039,11 +1224,15 @@ fn cmd_wc(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         return None;
     }
     let path = path_of(cwd, files[0]);
-    let (lines, words, bytes) = match count_file(&path) {
+    let (lines, words, bytes, ascii) = match count_file(&path) {
         Ok(v) => v,
         Err(e) => return Some(fail(format!("wc: {}: {e}", path.display()))),
     };
     let any = lines_f || words_f || bytes_f;
+    // GNU counts words by locale whitespace (U+00A0 and friends in UTF-8); only ASCII is exact here.
+    if !ascii && (words_f || !any) {
+        return None;
+    }
     let mut parts: Vec<String> = Vec::new();
     if lines_f || !any {
         parts.push(lines.to_string());
@@ -1090,11 +1279,13 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         *slot = Some(v);
         Some(())
     }
+    // GNU grep takes options before or after the pattern and files; the words are what is left.
+    let mut words: Vec<&String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--" {
-            i += 1;
+            words.extend(&args[i + 1..]);
             break;
         }
         if let Some(rest) = a.strip_prefix("--") {
@@ -1183,7 +1374,7 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
                 }
             }
         } else {
-            break;
+            words.push(&args[i]);
         }
         i += 1;
     }
@@ -1194,13 +1385,10 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         // GNU answers these with a "context is ignored" warning; qx words warnings badly.
         return None;
     }
+    let mut words = words.into_iter();
     let pattern = match pattern {
         Some(p) => p,
-        None => {
-            let p = args.get(i)?.clone();
-            i += 1;
-            p
-        }
+        None => words.next()?.clone(),
     };
     let pattern = pattern.as_str();
     // A newline separates patterns, with `-F` too.
@@ -1212,7 +1400,8 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         include.as_ref().is_none_or(|g| file.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&g[1..])))
     };
     let mut specs: Vec<(&str, PathBuf)> = Vec::new();
-    if i == args.len() {
+    let operands: Vec<&String> = words.collect();
+    if operands.is_empty() {
         if !recursive {
             // No path means stdin, which qx never gives a child.
             return None;
@@ -1220,12 +1409,17 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         // `grep -r x` searches `.` but names files without a `./` prefix.
         specs.push(("", path_of(cwd, ".")));
     } else {
-        for raw in &args[i..] {
-            if raw == "-" {
+        for raw in operands {
+            // `-` is stdin, and a leading `/` may be a POSIX-style path path_of cannot place.
+            if raw == "-" || raw.starts_with('/') {
                 return None;
             }
             specs.push((raw.as_str(), path_of(cwd, raw)));
         }
+    }
+    // Decline on any operand qx cannot answer before the first walk, not after it.
+    for (_, path) in &specs {
+        fs::metadata(path).ok().filter(|m| m.is_file() || (m.is_dir() && recursive))?;
     }
 
     // Expand to files in the spelling grep would print: `grep -r x src` says `src/a.rs`.
@@ -1283,26 +1477,45 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     // grep names files when given several operands or a directory to walk, even for a single hit
     // file; `grep -r x a.txt` does not.
     let multiple = walked || specs.len() > 1;
-    let needle = if insensitive {
-        pattern.to_lowercase()
+    // One case-insensitive matcher for the run, not a lowercased copy of every line.
+    let ci = if insensitive {
+        Some(regex::RegexBuilder::new(&regex::escape(pattern)).case_insensitive(true).build().ok()?)
     } else {
-        pattern.to_string()
+        None
+    };
+    let found_in = |s: &str| match &ci {
+        Some(re) => re.is_match(s),
+        None => s.contains(pattern),
     };
     let mut out = String::new();
     let mut hits = 0usize;
     let mut printed = false; // anything printed yet, across files: GNU separates groups of different files
     'files: for (disp, path) in &files {
+        if crate::exec::should_stop() {
+            return None;
+        }
         // Size first: a multi-gigabyte log must not be read just to be declined.
         if fs::metadata(path).ok()?.len() > READ_CAP {
             return None;
         }
         let bytes = fs::read(path).ok()?;
         // GNU prints "Binary file ... matches" for a NUL anywhere, or bytes that are not text in
-        // a UTF-8 locale; never guess at that.
-        if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
-            return None;
-        }
-        let text = crate::exec::decode(&bytes);
+        // a UTF-8 locale; qx declines whenever that message could be the answer, and otherwise
+        // the file is a plain miss (`.git` objects). An ASCII needle survives lossy decoding.
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(t) if !bytes.contains(&0) => t,
+            _ => {
+                if invert || !pattern.is_ascii() {
+                    return None;
+                }
+                let lossy: &str = &String::from_utf8_lossy(&bytes);
+                let hit = found_in(lossy);
+                if hit {
+                    return None;
+                }
+                ""
+            }
+        };
         // `split_inclusive` keeps a trailing newline from inventing an empty last line, which
         // `-v` would otherwise report.
         let raw_lines: Vec<&str> = text.split_inclusive('\n').collect();
@@ -1311,11 +1524,7 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         for (idx, raw) in raw_lines.iter().enumerate() {
             let line = raw.strip_suffix('\n').unwrap_or(raw);
             let line = line.strip_suffix('\r').unwrap_or(line);
-            let found = if insensitive {
-                line.to_lowercase().contains(&needle)
-            } else {
-                line.contains(&needle)
-            };
+            let found = found_in(line);
             if found != invert {
                 is_sel[idx] = true;
                 selected.push(idx);
@@ -1376,7 +1585,6 @@ fn cmd_grep(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             last = Some(idx);
             let sep = if is_sel[idx] { ':' } else { '-' };
             let line = raw.strip_suffix('\n').unwrap_or(raw);
-            let line = line.strip_suffix('\r').unwrap_or(line);
             if multiple {
                 out.push_str(disp);
                 out.push(sep);
@@ -1415,12 +1623,16 @@ fn simple_include(g: &str) -> bool {
 }
 
 /// Stream the file so `wc` on a multi-gigabyte log stays bounded.
-fn count_file(path: &Path) -> std::io::Result<(usize, usize, usize)> {
+fn count_file(path: &Path) -> std::io::Result<(usize, usize, usize, bool)> {
     let mut f = File::open(path)?;
     let mut buf = [0u8; 64 * 1024];
     let (mut lines, mut words, mut bytes) = (0usize, 0usize, 0usize);
     let mut in_word = false;
+    let mut ascii = true;
     loop {
+        if crate::exec::should_stop() {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stopped (cancelled or timed out)"));
+        }
         let n = f.read(&mut buf)?;
         if n == 0 {
             break;
@@ -1430,7 +1642,9 @@ fn count_file(path: &Path) -> std::io::Result<(usize, usize, usize)> {
             if b == b'\n' {
                 lines += 1;
             }
-            if b.is_ascii_whitespace() {
+            ascii &= b.is_ascii();
+            // C `isspace` also counts the vertical tab, which `is_ascii_whitespace` leaves out.
+            if b.is_ascii_whitespace() || b == 0x0B {
                 in_word = false;
             } else if !in_word {
                 in_word = true;
@@ -1438,7 +1652,7 @@ fn count_file(path: &Path) -> std::io::Result<(usize, usize, usize)> {
             }
         }
     }
-    Ok((lines, words, bytes))
+    Ok((lines, words, bytes, ascii))
 }
 
 /// `sed -n 'A,Bp'` (and `-n Ap`) prints one line range. Every other script, flag, `$`
@@ -1491,13 +1705,50 @@ fn cmd_sed(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut line_no = 0usize;
     // The last line printed had no newline (end of a file): GNU sed adds it once more output follows.
     let mut owed_newline = false;
+    let mut emit = |line: &str, out: &mut String| {
+        let has_nl = line.ends_with('\n');
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        if owed_newline {
+            out.push('\n');
+        }
+        out.push_str(line);
+        if has_nl {
+            out.push('\n');
+        }
+        // The last line of the input keeps whatever terminator it had.
+        owed_newline = !has_nl;
+    };
     for raw in &paths {
         let path = path_of(cwd, raw);
-        if !fs::metadata(&path).ok()?.is_file() {
+        let md = fs::metadata(&path).ok()?;
+        if !md.is_file() {
             return None;
         }
+        if md.len() > READ_CAP {
+            // Past the cap: stream the top of the file and stop at the range. A range that does not end
+            // inside the first READ_CAP bytes, or a binary file, is the real tool's.
+            let mut reader = BufReader::new(fs::File::open(&path).ok()?.take(READ_CAP));
+            let mut buf = Vec::new();
+            while line_no < to {
+                buf.clear();
+                if reader.read_until(b'\n', &mut buf).ok()? == 0 {
+                    break;
+                }
+                if buf.contains(&0) || (!buf.ends_with(b"\n") && reader.get_ref().limit() == 0) {
+                    return None;
+                }
+                line_no += 1;
+                if line_no >= from {
+                    emit(&crate::exec::decode(&buf), &mut out);
+                }
+            }
+            if line_no < to && reader.get_ref().limit() == 0 {
+                return None;
+            }
+            continue;
+        }
         let bytes = fs::read(&path).ok()?;
-        if bytes.len() as u64 > READ_CAP || bytes[..bytes.len().min(8192)].contains(&0) {
+        if bytes[..bytes.len().min(8192)].contains(&0) {
             return None;
         }
         let text = crate::exec::decode(&bytes);
@@ -1506,22 +1757,9 @@ fn cmd_sed(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
             if line_no > to {
                 break;
             }
-            if line_no < from {
-                continue;
+            if line_no >= from {
+                emit(line, &mut out);
             }
-            let has_nl = line.ends_with('\n');
-            let line = line.strip_suffix('\n').unwrap_or(line);
-            // qx normalises a CRLF line ending, as head, cat and tail do here.
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            if owed_newline {
-                out.push('\n');
-            }
-            out.push_str(line);
-            if has_nl {
-                out.push('\n');
-            }
-            // The last line of the input keeps whatever terminator it had.
-            owed_newline = !has_nl;
         }
     }
     Some(ok(out))
@@ -1544,15 +1782,15 @@ fn cmd_mkdir(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     if paths.is_empty() {
         return None;
     }
+    // cmd's mkdir makes the missing parents of a `\` path and GNU's refuses: the real one decides.
+    if !parents && paths.iter().any(|p| p.contains('\\') && !path_of(cwd, p).parent().is_some_and(Path::is_dir)) {
+        return None;
+    }
     let mut err = String::new();
     let mut code = 0;
     for p in paths {
         let path = path_of(cwd, p);
-        let res = if parents {
-            fs::create_dir_all(&path)
-        } else {
-            fs::create_dir(&path)
-        };
+        let res = if parents { fs::create_dir_all(&path) } else { fs::create_dir(&path) };
         if let Err(e) = res {
             err.push_str(&format!("mkdir: {}: {e}\n", path.display()));
             code = 1;
@@ -1610,11 +1848,14 @@ fn cmd_rm(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     let mut force = false;
     let mut recursive = false;
     let mut paths: Vec<&str> = Vec::new();
+    // After `--` every word is a name, so `rm -- -r x` never turns recursive.
+    let mut options = true;
     for a in args {
-        if a == "--" {
+        if options && a == "--" {
+            options = false;
             continue;
         }
-        if a.starts_with('-') && a.len() > 1 {
+        if options && a.starts_with('-') && a.len() > 1 {
             if a.starts_with("--") {
                 return None;
             }
@@ -1715,18 +1956,22 @@ fn copy_rec(src: &Path, dst: &Path, depth: usize) -> std::io::Result<()> {
         Ok(())
     } else {
         fs::copy(src, dst)?;
+        // CopyFileExW keeps the source's old write time; GNU `cp` stamps now, and make/cargo rely on that.
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(dst) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
         Ok(())
     }
 }
 
-/// A symlink or junction to a directory anywhere under `p`: copying it is a choice (follow or
-/// link) this builtin does not make, so `cp -r` leaves it to the real tool.
-fn has_dir_link(p: &Path, depth: usize) -> bool {
+/// A symlink or junction anywhere under `p`, `p` included: GNU `cp -r` copies it as a link and this
+/// builtin would copy its target, so such a tree is left to the real tool.
+fn has_link(p: &Path, depth: usize) -> bool {
     let Ok(md) = fs::symlink_metadata(p) else { return false };
     if md.file_type().is_symlink() {
-        return fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false);
+        return true;
     }
-    md.is_dir() && (depth > 64 || fs::read_dir(p).into_iter().flatten().flatten().any(|e| has_dir_link(&e.path(), depth + 1)))
+    md.is_dir() && (depth > 64 || fs::read_dir(p).into_iter().flatten().flatten().any(|e| has_link(&e.path(), depth + 1)))
 }
 
 /// True when `target` is `src` itself or lies inside it, judged on real paths (the nearest existing
@@ -1768,7 +2013,7 @@ fn cmd_cp(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
     if srcs.len() > 1 && !dst.is_dir() {
         return Some(fail("cp: target must be a directory for multiple sources".into()));
     }
-    if recursive && srcs.iter().any(|s| has_dir_link(&path_of(cwd, s), 0)) {
+    if recursive && srcs.iter().any(|s| has_link(&path_of(cwd, s), 0)) {
         return None;
     }
 
@@ -1791,6 +2036,11 @@ fn cmd_cp(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         } else {
             dst.clone()
         };
+        if src.is_dir() && target.is_file() {
+            err.push_str(&format!("cp: cannot overwrite non-directory '{}' with directory '{}'\n", target.display(), src.display()));
+            code = 1;
+            continue;
+        }
         if into_self(&src, &target, false) {
             err.push_str(&format!(
                 "cp: {} -> {}: destination is the source or inside it\n",
@@ -1820,8 +2070,8 @@ fn cmd_cp(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
 fn move_across(src: &Path, target: &Path) -> std::io::Result<()> {
     let refuse = |why: &str| Err(std::io::Error::other(why.to_string()));
     let src_dir = fs::symlink_metadata(src)?.is_dir();
-    if src_dir && has_dir_link(src, 0) {
-        return refuse("the tree holds a directory link; use the real mv");
+    if has_link(src, 0) {
+        return refuse("a link would be copied as its target; use the real mv");
     }
     if let Ok(md) = fs::symlink_metadata(target) {
         match (src_dir, md.is_dir()) {
@@ -1923,7 +2173,8 @@ fn cmd_touch(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         return None;
     }
     let readonly = |a: &String| fs::metadata(path_of(cwd, a)).is_ok_and(|m| m.permissions().readonly());
-    if args.iter().any(readonly) {
+    // A folder cannot be opened for append; the real touch updates its time.
+    if args.iter().any(readonly) || args.iter().any(|a| path_of(cwd, a).is_dir()) {
         return None;
     }
     let mut err = String::new();
@@ -2010,6 +2261,7 @@ fn cmd_realpath(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         return None;
     }
     let mut out = String::new();
+    let mut err = String::new();
     for a in args {
         let p = Path::new(a);
         let abs = if p.is_absolute() {
@@ -2019,23 +2271,24 @@ fn cmd_realpath(args: &[String], cwd: Option<&Path>) -> Option<BuiltinOut> {
         } else {
             p.to_path_buf()
         };
-        match fs::canonicalize(&abs) {
+        // GNU prints the path of a file about to be created: only the last component may be missing.
+        let resolved = fs::canonicalize(&abs).or_else(|e| match (abs.parent(), abs.file_name()) {
+            (Some(dir), Some(name)) if e.kind() == std::io::ErrorKind::NotFound => fs::canonicalize(dir).map(|d| d.join(name)),
+            _ => Err(e),
+        });
+        match resolved {
             Ok(c) => {
                 let s = c.display().to_string();
                 let trimmed = s.strip_prefix(r"\\?\").unwrap_or(&s);
                 out.push_str(&format!("{trimmed}\n"));
             }
+            // Like GNU: a failed operand does not hide the ones that resolved.
             Err(e) => {
-                return Some(BuiltinOut {
-                    code: 1,
-                    stdout: String::new(),
-                    stderr: format!("realpath: {a}: {e}\n"),
-                    elapsed: Duration::ZERO,
-                });
+                let _ = writeln!(err, "realpath: {a}: {e}");
             }
         }
     }
-    Some(ok(out))
+    Some(BuiltinOut { code: i32::from(!err.is_empty()), stdout: out, stderr: err, elapsed: Duration::ZERO })
 }
 
 fn cmd_whoami(args: &[String]) -> Option<BuiltinOut> {
@@ -2050,7 +2303,7 @@ fn cmd_whoami(args: &[String]) -> Option<BuiltinOut> {
         Some(d) => format!("{d}\\{user}\n"),
         None => format!("{user}\n"),
     };
-    Some(ok(line))
+    Some(ok(line.to_lowercase()))
 }
 
 fn cmd_hostname(args: &[String]) -> Option<BuiltinOut> {
@@ -2080,7 +2333,8 @@ fn cmd_seq(args: &[String]) -> Option<BuiltinOut> {
     if step == 0.0 || !first.is_finite() || !last.is_finite() || !step.is_finite() {
         return None;
     }
-    let count = ((last - first) / step).floor() + 1.0;
+    // The epsilon keeps `seq 0.1 0.1 0.3` from losing 0.3 to floating-point division.
+    let count = ((last - first) / step + 1e-9).floor() + 1.0;
     if !count.is_finite() || !(0.0..=1_000_000.0).contains(&count) {
         return None;
     }
@@ -2100,6 +2354,43 @@ fn cmd_seq(args: &[String]) -> Option<BuiltinOut> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seq_keeps_its_last_value_and_realpath_accepts_a_new_file() {
+        let lines = |a: &[&str]| {
+            let a: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+            try_exec("seq", &a, None, &[]).unwrap().stdout.lines().count()
+        };
+        assert_eq!(lines(&["0.1", "0.1", "0.3"]), 3);
+        assert_eq!(lines(&["0", "0.1", "0.3"]), 4);
+        assert_eq!(lines(&["1", "3"]), 3);
+        let here = std::env::current_dir().unwrap();
+        let o = try_exec("realpath", &["not-yet-created.txt".into()], Some(&here), &[]).unwrap();
+        assert_eq!(o.code, 0, "{}", o.stderr);
+        assert!(o.stdout.trim_end().ends_with("not-yet-created.txt"));
+        let o = try_exec("realpath", &["no-such-dir\\x.txt".into()], Some(&here), &[]).unwrap();
+        assert_eq!(o.code, 1);
+        // A failed operand does not hide the one that resolved.
+        let o = try_exec("realpath", &[".".into(), "no-such-dir\\x.txt".into()], Some(&here), &[]).unwrap();
+        assert_eq!((o.code, o.stdout.lines().count()), (1, 1), "{} | {}", o.stdout, o.stderr);
+        assert!(o.stderr.contains("no-such-dir"), "{}", o.stderr);
+    }
+
+    #[test]
+    fn cp_stamps_the_copy_with_the_current_time() {
+        let root = std::env::temp_dir().join(format!("qx-cpmtime-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let (a, b) = (root.join("a.txt"), root.join("b.txt"));
+        fs::write(&a, "x").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(86_400);
+        fs::OpenOptions::new().write(true).open(&a).unwrap().set_modified(old).unwrap();
+        let o = try_exec("cp", &["a.txt".into(), "b.txt".into()], Some(&root), &[]).unwrap();
+        assert_eq!(o.code, 0, "{}", o.stderr);
+        let age = std::time::SystemTime::now().duration_since(fs::metadata(&b).unwrap().modified().unwrap()).unwrap();
+        assert!(age < Duration::from_secs(3_600), "copy kept the source time: {age:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn cp_and_mv_refuse_to_nest_a_dir_in_itself() {
@@ -2154,6 +2445,118 @@ mod tests {
         let args = vec!["-a".to_string(), ".".to_string()];
         assert!(cmd_ls(&args, Some(&d), false).unwrap().stdout.contains(".hidden"));
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ls_shows_file_operands_as_typed_keeps_going_after_a_bad_one_and_marks_read_only() {
+        let d = tmp("ls-operands");
+        fs::create_dir(d.join("a")).unwrap();
+        fs::write(d.join("a").join("x.txt"), "x").unwrap();
+        fs::write(d.join("y.txt"), "y").unwrap();
+        let ro = d.join("ro.txt");
+        fs::write(&ro, "r").unwrap();
+        let mut perms = fs::metadata(&ro).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&ro, perms).unwrap();
+
+        let args: Vec<String> = ["a/x.txt", "nope", "y.txt", "a"].map(String::from).to_vec();
+        let out = cmd_ls(&args, Some(&d), false).unwrap();
+        assert_eq!(out.code, 1);
+        assert!(out.stderr.contains("nope"), "{}", out.stderr);
+        assert_eq!(out.stdout, "a/x.txt\ny.txt\n\na:\nx.txt\n");
+        // A file after a directory still comes first, so it never reads as one of the directory's entries.
+        let dir_first: Vec<String> = ["a", "y.txt", "ro.txt"].map(String::from).to_vec();
+        assert_eq!(cmd_ls(&dir_first, Some(&d), false).unwrap().stdout, "y.txt\nro.txt\n\na:\nx.txt\n");
+        let long: Vec<String> = ["-l", "a", "y.txt", "ro.txt"].map(String::from).to_vec();
+        let long = cmd_ls(&long, Some(&d), false).unwrap().stdout;
+        assert_eq!(long.matches("(UTC ").count() + long.matches("(times UTC)").count(), 2, "one header per listing: {long}");
+        let (files, dir) = long.split_once("\na:\n").unwrap();
+        assert!(files.contains("y.txt\n") && files.contains("ro.txt [ro]") && dir.contains("x.txt"), "{long}");
+
+        let long = cmd_ls(&["-l".to_string(), "ro.txt".to_string()], Some(&d), false).unwrap().stdout;
+        assert!(long.starts_with("(UTC ") && long.trim_end().ends_with("ro.txt [ro]"), "{long}");
+        assert!(!long.contains("-r-"), "{long}");
+
+        let full = cmd_ls(&["-l".to_string(), "ro.txt".to_string()], Some(&d), true).unwrap().stdout;
+        assert!(full.starts_with("-r-") && full.contains(" UTC "), "{full}");
+
+        let mut perms = fs::metadata(&ro).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = fs::set_permissions(&ro, perms);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    fn rendered(rows: &[(&str, bool, u64, u64, bool)], full: bool) -> String {
+        let at = |s: u64| UNIX_EPOCH + std::time::Duration::from_secs(s);
+        let style = LongStyle::new(full, rows.iter().map(|r| (r.2, Some(at(r.3)), r.1)));
+        let mut out = style.header();
+        for r in rows {
+            write_entry(&mut out, r.0, r.1, r.2, Some(at(r.3)), r.4, true, &style);
+        }
+        out
+    }
+
+    #[test]
+    fn long_listing_states_a_shared_date_once_and_pads_to_the_widest_size() {
+        // 2021-01-01 00:00:00 UTC = 1_609_459_200
+        let out = rendered(
+            &[("a.txt", false, 5, 1_609_459_200, false), ("big.bin", false, 123_456, 1_609_459_200 + 3660, false)],
+            false,
+        );
+        assert_eq!(out, "(UTC 2021-01-01)\n     5 00:00 a.txt\n123456 01:01 big.bin\n");
+    }
+
+    #[test]
+    fn long_listing_keeps_full_dates_when_they_differ() {
+        let out = rendered(
+            &[("a", false, 1, 1_609_459_200, false), ("b", false, 22, 1_609_459_200 + 86_400, false)],
+            false,
+        );
+        assert_eq!(out, "(times UTC)\n 1 2021-01-01 00:00 a\n22 2021-01-02 00:00 b\n");
+    }
+
+    #[test]
+    fn long_listing_marks_dirs_exec_and_read_only_and_full_mode_stays_classic() {
+        let rows = [
+            ("d", true, 0, 1_609_459_200, false),
+            ("r.txt", false, 1, 1_609_459_200, true),
+            ("t.exe", false, 2, 1_609_459_200, false),
+        ];
+        let out = rendered(&rows, false);
+        assert_eq!(out, "(UTC 2021-01-01 00:00)\n- d/\n1 r.txt [ro]\n2 t.exe*\n");
+        let full = rendered(&rows, true);
+        assert_eq!(
+            full,
+            "drwxr-xr-x          0 2021-01-01 00:00 UTC d\n-r--r--r--          1 2021-01-01 00:00 UTC r.txt\n-rwxr-xr-x          2 2021-01-01 00:00 UTC t.exe\n"
+        );
+    }
+
+    #[test]
+    fn long_listing_dir_rows_show_a_dash_and_do_not_widen_the_column() {
+        let out = rendered(
+            &[("d", true, 4096, 1_609_459_200, false), ("f", false, 10, 1_609_459_200 + 60, false)],
+            false,
+        );
+        assert_eq!(out, "(UTC 2021-01-01)\n - 00:00 d/\n10 00:01 f\n");
+        // With the time in the header too, a name that starts with a number still cannot read as a size.
+        let out = rendered(&[("2024 notes", true, 0, 1_609_459_200, false), ("f", false, 3, 1_609_459_200, false)], false);
+        assert_eq!(out, "(UTC 2021-01-01 00:00)\n- 2024 notes/\n3 f\n");
+    }
+
+    #[test]
+    fn long_listing_hoists_a_shared_minute_into_the_header() {
+        let out = rendered(
+            &[("a", false, 7, 1_609_459_200 + 3660, false), ("b", false, 123, 1_609_459_200 + 3660 + 30, false)],
+            false,
+        );
+        assert_eq!(out, "(UTC 2021-01-01 01:01)\n  7 a\n123 b\n");
+        // Same minute on different days still needs per-row dates.
+        let mixed = rendered(
+            &[("a", false, 1, 1_609_459_200, false), ("b", false, 2, 1_609_459_200 + 86_400, false)],
+            false,
+        );
+        assert!(mixed.starts_with("(times UTC)\n"), "{mixed}");
     }
 
     #[test]
@@ -2243,9 +2646,30 @@ mod tests {
         let text: String = (0..20_000).map(|i| format!("line{i}\n")).collect();
         fs::write(&path, text).unwrap();
         assert_eq!(
-            read_head_tail(&path, 2, true).unwrap(),
-            "line19998\nline19999\n"
+            read_head_tail(&path, 2, true).unwrap().as_deref(),
+            Some("line19998\nline19999\n")
         );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn head_and_tail_decode_utf16_whole_and_decline_a_window_that_is_too_small() {
+        let d = tmp("headtail-utf16");
+        let path = d.join("u16.txt");
+        // What PowerShell 5.1 `>` writes: BOM, UTF-16LE, CRLF.
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in "one\r\nt\u{e9}w\u{f6}\r\nthree\r\n".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(read_head_tail(&path, 2, false).unwrap().as_deref(), Some("one\r\nt\u{e9}w\u{f6}\r\n"));
+        assert_eq!(read_head_tail(&path, 2, true).unwrap().as_deref(), Some("t\u{e9}w\u{f6}\r\nthree\r\n"));
+
+        // One 40 MiB line: neither end fits the 32 MiB window, so the real tool must answer.
+        let big = d.join("big.txt");
+        fs::write(&big, vec![b'x'; 40 * 1024 * 1024]).unwrap();
+        assert_eq!(read_head_tail(&big, 5, true).unwrap(), None);
+        assert_eq!(read_head_tail(&big, 5, false).unwrap(), None);
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -2267,6 +2691,20 @@ mod tests {
         let rm = vec!["-rf".to_string(), "a".to_string(), "moved".to_string()];
         assert_eq!(cmd_rm(&rm, Some(&d)).unwrap().code, 0);
         assert!(!d.join("a").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn mkdir_of_an_existing_folder_fails_with_a_backslash_path_too() {
+        let d = tmp("mkdir-exists");
+        fs::create_dir_all(d.join("sub")).unwrap();
+        for p in ["sub", r".\sub"] {
+            let r = cmd_mkdir(&[p.to_string()], Some(&d)).unwrap();
+            assert_eq!(r.code, 1, "{p}: {}", r.stderr);
+        }
+        // A new nested path with a backslash: cmd's mkdir makes the parents and GNU's refuses, so the real one decides.
+        assert!(cmd_mkdir(&[r"p\q".to_string()], Some(&d)).is_none());
+        assert!(!d.join("p").exists());
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -2372,6 +2810,28 @@ mod tests {
     }
 
     #[test]
+    fn grep_takes_flags_after_the_pattern_and_skips_binary_misses() {
+        let d = scratch("grep-late");
+        fs::create_dir(d.join("src")).unwrap();
+        fs::write(d.join("src/a.txt"), "Foo /api/users\nbar\n").unwrap();
+        fs::write(d.join("src/blob.bin"), b"\x00\x01\xffzzz").unwrap();
+        let out = |args: &[&str]| run("grep", args, &d).map(|o| (o.code, o.stdout));
+        // Options after the pattern and operands, as GNU permutes them.
+        assert_eq!(out(&["-rn", "foo", "src", "-i"]), Some((0, "src/a.txt:1:Foo /api/users\n".into())));
+        // A pattern with a leading slash is text, an operand with one is a path qx cannot place.
+        assert_eq!(out(&["-r", "/api/users", "src"]), Some((0, "src/a.txt:Foo /api/users\n".into())));
+        assert!(out(&["-r", "api", "/src"]).is_none());
+        // A binary file without the needle is a plain miss; with it, or under -v, the real tool answers.
+        assert_eq!(out(&["-rc", "bar", "src"]), Some((0, "src/a.txt:1\nsrc/blob.bin:0\n".into())));
+        assert!(out(&["-r", "zzz", "src"]).is_none());
+        assert!(out(&["-rv", "bar", "src"]).is_none());
+        assert!(out(&["-r", "é", "src"]).is_none());
+        // A bad second operand declines before anything is walked.
+        assert!(out(&["-r", "bar", "src", "missing"]).is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn grep_context_groups_and_flags_follow_gnu() {
         let d = scratch("grep-ctx");
         fs::write(d.join("a.txt"), "alpha\nbeta\nalpha gamma\n").unwrap();
@@ -2430,7 +2890,10 @@ mod tests {
             "1\n3\n5\n"
         );
         assert!(!try_exec("hostname", &[], None, &[]).unwrap().stdout.trim().is_empty());
-        assert!(!try_exec("whoami", &[], None, &[]).unwrap().stdout.trim().is_empty());
+        let me = try_exec("whoami", &[], None, &[]).unwrap().stdout;
+        // whoami.exe prints `host\user` in lower case; scripts compare that string.
+        assert!(!me.trim().is_empty());
+        assert_eq!(me, me.to_lowercase());
         let rp = try_exec("realpath", &[String::from(".")], None, &[]).unwrap();
         assert_eq!(rp.code, 0);
         assert!(rp.stdout.trim().len() > 1);
@@ -2446,6 +2909,92 @@ mod tests {
     fn run(name: &str, args: &[&str], cwd: &Path) -> Option<BuiltinOut> {
         let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         try_exec(name, &a, Some(cwd), &[])
+    }
+
+    #[test]
+    fn rm_double_dash_ends_options() {
+        let d = scratch("rm-dashdash");
+        fs::create_dir_all(d.join("victim")).unwrap();
+        fs::write(d.join("victim/keep.txt"), "x").unwrap();
+        let o = run("rm", &["--", "-r", "victim"], &d).unwrap();
+        assert_eq!(o.code, 1, "{}", o.stderr);
+        assert!(d.join("victim/keep.txt").is_file());
+        fs::write(d.join("-r"), "x").unwrap();
+        assert_eq!(run("rm", &["--", "-r"], &d).unwrap().code, 0);
+        assert!(!d.join("-r").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ls_declines_flags_it_does_not_render_and_reports_walk_errors() {
+        let d = scratch("ls-flags");
+        fs::create_dir_all(d.join("zdir")).unwrap();
+        fs::write(d.join("a.txt"), "x").unwrap();
+        assert!(run("ls", &["--group-directories-first"], &d).is_none());
+        assert!(run("ls", &["--color=always"], &d).is_none());
+        assert!(run("ls", &["--color=never"], &d).is_some());
+        let opts = LsOpts {
+            full: false,
+            all: false,
+            long: false,
+            recursive: true,
+            reverse: false,
+            dirs_as_files: false,
+            sort: LsSort::Name,
+        };
+        let mut walk = LsWalk { shown: 0, limit: usize::MAX, capped: false, depth_capped: false, err: String::new() };
+        let mut out = String::new();
+        assert!(list_recursive(&d.join("gone"), "gone", &opts, &mut out, &mut walk, 0).is_some());
+        assert!(out.is_empty(), "{out}");
+        assert!(walk.err.contains("gone"), "{}", walk.err);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn text_builtins_keep_line_terminators_byte_exact() {
+        let d = scratch("terminators");
+        fs::write(d.join("crlf.txt"), "a\r\nb\r\nc").unwrap();
+        fs::write(d.join("nonl.txt"), "abc").unwrap();
+        let out = |name: &str, args: &[&str]| run(name, args, &d).expect("built-in declined").stdout;
+        assert_eq!(out("cat", &["nonl.txt"]), "abc");
+        assert_eq!(out("cat", &["nonl.txt", "nonl.txt"]), "abcabc");
+        assert_eq!(out("cat", &["-n", "crlf.txt"]), "     1\ta\r\n     2\tb\r\n     3\tc");
+        assert_eq!(out("head", &["-n", "1", "crlf.txt"]), "a\r\n");
+        assert_eq!(out("head", &["-n", "5", "crlf.txt"]), "a\r\nb\r\nc");
+        assert_eq!(out("tail", &["-n", "2", "crlf.txt"]), "b\r\nc");
+        assert_eq!(out("grep", &["b", "crlf.txt"]), "b\r\n");
+        assert_eq!(out("grep", &["-i", "B", "crlf.txt"]), "b\r\n");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn wc_words_split_on_vertical_tab_and_decline_non_ascii() {
+        let d = scratch("wc-words");
+        fs::write(d.join("vt.txt"), "a\x0bb\n").unwrap();
+        fs::write(d.join("nbsp.txt"), "a\u{a0}b\n").unwrap();
+        assert_eq!(run("wc", &["-w", "vt.txt"], &d).unwrap().stdout, "2 vt.txt\n");
+        // GNU splits words on U+00A0 in a UTF-8 locale; the byte scan cannot, so the real wc answers.
+        assert!(run("wc", &["-w", "nbsp.txt"], &d).is_none());
+        assert!(run("wc", &["nbsp.txt"], &d).is_none());
+        assert_eq!(run("wc", &["-l", "nbsp.txt"], &d).unwrap().stdout, "1 nbsp.txt\n");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn mkdir_touch_and_cp_match_the_tools_they_stand_in_for() {
+        let d = scratch("mkdir-touch-cp");
+        // cmd's mkdir makes the parents of a `\` path and GNU's does not: the real one decides.
+        assert!(run("mkdir", &[r"p\q\r"], &d).is_none());
+        assert_eq!(run("mkdir", &["-p", "p/q/r"], &d).unwrap().code, 0);
+        assert!(d.join("p/q/r").is_dir());
+        assert_eq!(run("mkdir", &["x/y"], &d).unwrap().code, 1); // GNU without -p does not
+        assert!(run("touch", &["p"], &d).is_none()); // a folder goes to the real touch
+        fs::write(d.join("f1"), "x").unwrap();
+        let o = run("cp", &["-r", "p", "f1"], &d).unwrap();
+        assert_eq!(o.code, 1);
+        assert!(o.stderr.contains("cannot overwrite non-directory"), "{}", o.stderr);
+        assert_eq!(fs::read_to_string(d.join("f1")).unwrap(), "x");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -2545,10 +3094,23 @@ mod tests {
                 assert!(fs::symlink_metadata(d.join("link.txt")).is_err());
             }
         }
-        assert!(!has_dir_link(&d.join("tree"), 0));
+        assert!(!has_link(&d.join("tree"), 0));
+        // A file link is copied as a link by GNU `cp -r` and listed as one by `ls -l`; the builtins
+        // would show or copy its target, so both leave it to the real tool.
+        fs::create_dir_all(d.join("ftree")).unwrap();
+        fs::write(d.join("ftree/real.txt"), "x").unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(d.join("ftree/real.txt"), d.join("ftree/link.txt")).is_ok() {
+            assert!(has_link(&d.join("ftree"), 0));
+            assert!(run("cp", &["-r", "ftree", "ftree2"], &d).is_none());
+            assert!(!d.join("ftree2").exists());
+            assert!(run("ls", &["-l", "ftree"], &d).is_none());
+            assert!(run("ls", &["-l", "ftree/link.txt"], &d).is_none());
+            assert!(run("ls", &["ftree"], &d).is_some());
+        }
         #[cfg(windows)]
         if std::os::windows::fs::symlink_dir(d.join("tree/sub"), d.join("tree/jump")).is_ok() {
-            assert!(has_dir_link(&d.join("tree"), 0));
+            assert!(has_link(&d.join("tree"), 0));
             assert!(run("cp", &["-r", "tree", "tree2"], &d).is_none());
         }
     }
@@ -2676,8 +3238,8 @@ mod tests {
             (vec!["-n", "2,4p", "five.txt"], "b\nc\nd\n"),
             (vec!["-n", "1,2p", "five.txt", "big.txt"], "a\nb\n"),
             (vec!["-n", "9,10p", "big.txt"], "9\n10\n"),
-            // qx normalises CRLF, as its head, cat and tail do (real sed would keep the CRs).
-            (vec!["-n", "2,3p", "crlf.txt"], "b\nc\n"),
+            // CRLF stays CRLF, as the real sed keeps it.
+            (vec!["-n", "2,3p", "crlf.txt"], "b\r\nc\r\n"),
             (vec!["-n", "1p", "nonl.txt"], "x"),
             // GNU sed adds the newline a file lacks once more output follows it.
             (vec!["-n", "1,2p", "nonl.txt", "five.txt"], "x\na\n"),
@@ -2685,6 +3247,45 @@ mod tests {
         ] {
             let out = run("sed", &case, &d).expect("built-in declined a range it claims");
             assert_eq!((out.code, out.stdout.as_str()), (0, want), "{case:?}");
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A range at the top of a file past the read cap is answered from a stream that stops at the range.
+    #[test]
+    fn sed_range_of_a_file_past_the_read_cap_streams_and_stops_early() {
+        let d = scratch("sed-large");
+        let mut big = b"a\nb\nc\nd\n".to_vec();
+        big.resize(READ_CAP as usize + 4096, b'z');
+        fs::write(d.join("large.txt"), &big).unwrap();
+        let t = std::time::Instant::now();
+        let out = run("sed", &["-n", "1,3p", "large.txt"], &d).expect("built-in declined the top of a large file");
+        assert_eq!((out.code, out.stdout.as_str()), (0, "a\nb\nc\n"));
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        // A range that needs more than the cap of one line is still the real tool's.
+        assert!(run("sed", &["-n", "5p", "large.txt"], &d).is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A file past the cap keeps its start and its end: a log's failure is the last line.
+    #[test]
+    fn cat_of_a_file_past_the_read_cap_keeps_both_ends() {
+        let d = scratch("cat-large");
+        // Different line lengths put the two cut points at different offsets inside a line.
+        for width in [79usize, 97, 1013] {
+            let mut big = String::from("first line\n");
+            let filler = "x".repeat(width) + "\n";
+            while big.len() < READ_CAP as usize + (1 << 20) {
+                big.push_str(&filler);
+            }
+            big.push_str("FAILED: the last line\n");
+            fs::write(d.join("large.log"), &big).unwrap();
+            let out = run("cat", &["large.log"], &d).expect("cat is a built-in");
+            assert_eq!(out.code, 0);
+            assert!(out.stdout.starts_with("first line\n"), "start kept (width {width})");
+            assert!(out.stdout.ends_with("FAILED: the last line\n"), "end kept (width {width})");
+            assert!(out.stdout.contains("bytes omitted"), "the gap is marked (width {width})");
+            assert!(out.stdout.len() <= READ_CAP as usize, "{} (width {width})", out.stdout.len());
         }
         let _ = fs::remove_dir_all(&d);
     }
@@ -2804,6 +3405,11 @@ mod tests {
         let here = Path::new(".");
         assert_eq!(try_exec("Test-Path", &["Cargo.toml".into()], Some(here), &[]).unwrap().stdout, "True\n");
         assert_eq!(try_exec("test-path", &["nope".into(), "-PathType".into(), "Leaf".into()], Some(here), &[]).unwrap().stdout, "False\n");
+        // Provider paths belong to the real PowerShell.
+        for (p, a) in [("test-path", "env:PATH"), ("ls", "env:"), ("cat", "HKCU:\\Software"), ("Get-Content", "env:PATH")] {
+            assert!(try_exec(p, &[a.into()], Some(here), &[]).is_none(), "{p} {a}");
+        }
+        assert!(try_exec("ls", &[here.to_string_lossy().into_owned()], Some(here), &[]).is_some());
         assert_eq!(try_exec("Write-Output", &["a".into(), "b".into()], None, &[]).unwrap().stdout, "a\nb\n");
         assert!(try_exec("Write-Host", &["-NoNewline".into(), "a".into()], None, &[]).is_none());
     }}

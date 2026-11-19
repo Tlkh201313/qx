@@ -4,6 +4,8 @@
 //! or a compiler error in the middle of a long log). `compact` rescues lines that
 //! look diagnostic before it truncates.
 
+use std::borrow::Cow;
+
 /// Remove ANSI escape sequences (colors, cursor moves, OSC titles).
 pub fn strip_ansi(s: &str) -> String {
     if !s.contains('\x1b') {
@@ -67,8 +69,6 @@ const IMPORTANT_MARKERS: &[&str] = &[
     "exception",
     "traceback",
     "fatal",
-    "failed",
-    "failure",
     "assertion",
     "not found",
     "cannot",
@@ -77,7 +77,7 @@ const IMPORTANT_MARKERS: &[&str] = &[
     "denied",
     "segmentation fault",
     "warn",
-    "fail",
+    "fail", // also covers "failed" and "failure"
     "✗",
     "✘",
     "timed out",
@@ -87,8 +87,16 @@ const IMPORTANT_MARKERS: &[&str] = &[
 ];
 
 pub fn interesting(line: &str) -> bool {
-    let l = line.to_ascii_lowercase();
-    IMPORTANT_MARKERS.iter().any(|m| l.contains(m))
+    // One lowercase buffer per thread: this runs on every line of a long log.
+    thread_local! {
+        static LOWER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+    LOWER.with(|cell| {
+        let mut l = cell.borrow_mut();
+        l.clear();
+        l.extend(line.chars().map(|c| c.to_ascii_lowercase()));
+        IMPORTANT_MARKERS.iter().any(|m| l.contains(m))
+    })
 }
 
 /// Appends the line, cut at `MAX_LINE_CHARS`; true when it was cut (the caller spools the original).
@@ -105,7 +113,7 @@ fn push_capped(out: &mut String, line: &str) -> bool {
 
 /// Collapse runs of three or more identical lines into `line  (xN)`.
 /// Returns the new lines and how many source lines were removed.
-fn collapse(lines: &[&str]) -> (Vec<String>, usize) {
+fn collapse<'a>(lines: &[&'a str]) -> (Vec<Cow<'a, str>>, usize) {
     let mut out = Vec::with_capacity(lines.len());
     let mut collapsed = 0usize;
     let mut i = 0usize;
@@ -116,12 +124,10 @@ fn collapse(lines: &[&str]) -> (Vec<String>, usize) {
         }
         let run = j - i;
         if run >= 3 {
-            out.push(format!("{}  (x{})", lines[i], run));
+            out.push(Cow::Owned(format!("{}  (x{})", lines[i], run)));
             collapsed += run - 1;
         } else {
-            for line in &lines[i..j] {
-                out.push((*line).to_string());
-            }
+            out.extend(lines[i..j].iter().map(|l| Cow::Borrowed(*l)));
         }
         i = j;
     }
@@ -144,36 +150,34 @@ fn names_a_file(line: &str) -> bool {
 /// Runs of 8+ lines that differ only in their digits (progress counters,
 /// timestamps) keep the first and last line plus a count. Only used over budget,
 /// where head/tail would drop them anyway; diagnostics are never collapsed.
-fn collapse_similar(lines: Vec<String>) -> (Vec<String>, bool) {
-    let keys: Vec<String> = lines
-        .iter()
-        .map(|l| {
-            let mut k = String::with_capacity(l.len());
-            let mut digits = false;
-            for c in l.chars() {
-                if c.is_ascii_digit() {
-                    if !digits {
-                        k.push('#');
-                    }
-                } else {
-                    k.push(c);
-                }
-                digits = c.is_ascii_digit();
-            }
-            k
+fn collapse_similar(lines: Vec<Cow<'_, str>>) -> (Vec<Cow<'_, str>>, bool) {
+    // A line's shape: each run of digits is one `#`. Compared on the fly, so no key string per line.
+    fn shape(l: &str) -> impl Iterator<Item = char> + '_ {
+        let mut digits = false;
+        l.chars().filter_map(move |c| {
+            let d = c.is_ascii_digit();
+            let keep = if d { (!digits).then_some('#') } else { Some(c) };
+            digits = d;
+            keep
         })
-        .collect();
-    let mut out = Vec::with_capacity(lines.len());
+    }
+    let mut out: Vec<Cow<str>> = Vec::with_capacity(lines.len());
     let mut changed = false;
     let mut i = 0usize;
     while i < lines.len() {
         let mut j = i + 1;
-        while j < keys.len() && keys[j] == keys[i] {
+        while j < lines.len() && shape(&lines[j]).eq(shape(&lines[i])) {
             j += 1;
         }
-        if j - i >= 8 && keys[i].contains('#') && !interesting(&lines[i]) && !names_a_file(&lines[i]) {
+        // A shape with no letter left is a column of numbers (`seq 400`, ids, sizes): the numbers are the content.
+        if j - i >= 8
+            && shape(&lines[i]).any(|c| c == '#')
+            && shape(&lines[i]).any(char::is_alphabetic)
+            && !interesting(&lines[i])
+            && !names_a_file(&lines[i])
+        {
             out.push(lines[i].clone());
-            out.push(format!("[qx] ... {} similar lines (only digits differ) ...", j - i - 2));
+            out.push(Cow::Owned(format!("[qx] ... {} similar lines (only digits differ) ...", j - i - 2)));
             out.push(lines[j - 1].clone());
             changed = true;
         } else {
@@ -186,61 +190,95 @@ fn collapse_similar(lines: Vec<String>) -> (Vec<String>, bool) {
 
 /// Drop the working directory from located paths (`C:\proj\src\a.rs:3` ->
 /// `src\a.rs:3`); the caller already knows it. Returns how many were shortened.
+#[cfg(test)] // the product code calls `shorten`; tests and the fuzzer want the in-place form
 pub fn relative_paths(text: &mut String, cwd: &str) -> usize {
-    let dir = cwd.trim_end_matches(['\\', '/']);
-    if dir.len() < 3 {
-        return 0;
-    }
-    let mut total = 0;
-    for sep in ['\\', '/'] {
-        let pat = format!("{}{sep}", dir.replace(['\\', '/'], &sep.to_string())).to_ascii_lowercase();
-        let hay = text.to_ascii_lowercase(); // same byte offsets as `text`
-        let mut out = String::with_capacity(text.len());
-        let mut at = 0;
-        while let Some(p) = hay[at..].find(&pat) {
-            let p = at + p;
-            // Mid-word or mid-path means a different (longer) path, not ours.
-            let glued = text[..p]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_alphanumeric() || "_-./\\".contains(c));
-            out.push_str(&text[at..p]);
-            if glued {
-                out.push_str(&text[p..p + pat.len()]);
-            } else {
-                total += 1;
-            }
-            at = p + pat.len();
-        }
-        out.push_str(&text[at..]);
-        *text = out;
+    let (shorter, total) = shorten(text, cwd);
+    if let Some(s) = shorter {
+        *text = s;
     }
     total
 }
 
+/// `relative_paths` without touching its input: the shortened text (`None` when nothing matched, so
+/// the common case allocates no second copy) and how many paths were shortened.
+fn shorten(text: &str, cwd: &str) -> (Option<String>, usize) {
+    let dir = cwd.trim_end_matches(['\\', '/']);
+    if dir.len() < 3 {
+        return (None, 0);
+    }
+    let mut cur: Option<String> = None;
+    let mut total = 0;
+    for sep in ['\\', '/'] {
+        let pat = format!("{}{sep}", dir.replace(['\\', '/'], &sep.to_string())).to_ascii_lowercase();
+        let src = cur.as_deref().unwrap_or(text);
+        let hay = src.to_ascii_lowercase(); // same byte offsets as `src`
+        let mut cuts = Vec::new();
+        let mut at = 0;
+        while let Some(p) = hay[at..].find(&pat) {
+            let p = at + p;
+            // Mid-word or mid-path means a different (longer) path, not ours.
+            let glued = src[..p]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || "_-./\\".contains(c));
+            if !glued {
+                cuts.push(p);
+            }
+            at = p + pat.len();
+        }
+        if cuts.is_empty() {
+            continue;
+        }
+        let mut out = String::with_capacity(src.len());
+        let mut from = 0;
+        for &p in &cuts {
+            out.push_str(&src[from..p]);
+            from = p + pat.len();
+        }
+        out.push_str(&src[from..]);
+        total += cuts.len();
+        cur = Some(out);
+    }
+    (cur, total)
+}
+
 /// Save the uncut output (already redacted) so a truncation never loses facts:
-/// the agent can grep the file. Keeps the newest 40; None on any I/O error.
+/// the agent can grep the file. Keeps the newest 40, and anything younger than 10 minutes (the folder is
+/// shared by every qx process, so one noisy run must not evict another session's `full_output`);
+/// None on any I/O error.
 pub fn spool(stdout: &str, stderr: &str) -> Option<std::path::PathBuf> {
+    use std::io::Write;
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let dir = std::env::temp_dir().join("qx-spool");
     std::fs::create_dir_all(&dir).ok()?;
-    let mut old: Vec<_> = std::fs::read_dir(&dir).ok()?.flatten().map(|e| e.path()).collect();
-    old.sort();
-    for p in &old[..old.len().saturating_sub(39)] {
-        let _ = std::fs::remove_file(p);
-    }
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
+    prune_spool(&dir, ms, 39, 10 * 60 * 1000);
     let path = dir.join(format!("{ms:015}-{}-{}.log", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
-    let mut body = stdout.to_string();
+    // Written piece by piece: joining them first would copy a 16 MiB log once more.
+    let mut f = std::fs::File::create(&path).ok()?;
+    f.write_all(stdout.as_bytes()).ok()?;
     if !stderr.is_empty() {
-        body.push_str("\n[stderr]\n");
-        body.push_str(stderr);
+        f.write_all(b"\n[stderr]\n").ok()?;
+        f.write_all(stderr.as_bytes()).ok()?;
     }
-    std::fs::write(&path, body).ok()?;
     Some(path)
+}
+
+/// Deletes spool files beyond the newest `keep`, except those written less than `min_age_ms` ago. File names
+/// start with their write time in milliseconds, so name order is age order.
+fn prune_spool(dir: &std::path::Path, now_ms: u128, keep: usize, min_age_ms: u128) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut old: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    old.sort();
+    for p in &old[..old.len().saturating_sub(keep)] {
+        let written = p.file_name().and_then(|n| n.to_str()).and_then(|n| n.split('-').next()?.parse::<u128>().ok());
+        if written.is_none_or(|w| now_ms.saturating_sub(w) >= min_age_ms) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// Cargo build-script chatter: the `cargo:rerun-if-*` directives and the `NAME = None` lines that follow
@@ -285,7 +323,7 @@ pub fn drop_build_noise(text: &mut String) -> usize {
     dropped
 }
 
-/// `relative_paths` on both streams of a digested build/test/traceback, with a
+/// `relative_paths` on the two streams a reply shows (see `digest::shorten_paths`), with a
 /// note saying what the paths are relative to. Under 3 hits the note costs more
 /// than it saves, so nothing changes.
 pub fn relative_to_cwd(so: &mut String, se: &mut String, cwd: Option<&std::path::Path>) {
@@ -297,17 +335,21 @@ pub fn relative_to_cwd(so: &mut String, se: &mut String, cwd: Option<&std::path:
     };
     let dir = dir.to_string_lossy();
     let dir = dir.trim_start_matches(r"\\?\");
-    let (mut a, mut b) = (so.clone(), se.clone());
-    let (na, nb) = (relative_paths(&mut a, dir), relative_paths(&mut b, dir));
+    let ((a, na), (b, nb)) = (shorten(so, dir), shorten(se, dir));
     if na + nb < 3 {
         return;
     }
-    let t = if na > 0 { &mut a } else { &mut b };
+    if let Some(a) = a {
+        *so = a;
+    }
+    if let Some(b) = b {
+        *se = b;
+    }
+    let t = if na > 0 { so } else { se };
     if !t.is_empty() && !t.ends_with('\n') {
         t.push('\n');
     }
     t.push_str(&format!("[qx] paths relative to {dir}\n"));
-    (*so, *se) = (a, b);
 }
 
 /// A line redrawn with lone `\r` (a progress bar) shows only its last frame on a terminal. Keep that
@@ -441,7 +483,7 @@ pub fn compact(text: &str, max_lines: usize, head: usize, tail: usize) -> (Strin
 /// Each diagnostic line in `middle` with up to `follow` plain lines under it: those carry the
 /// `--> file:line:col` or the panic message that makes the marker line usable. A following marker
 /// line starts its own group, so every group holds exactly one marker.
-fn rescue_groups(middle: &[String], follow: usize) -> Vec<std::ops::Range<usize>> {
+fn rescue_groups(middle: &[Cow<'_, str>], follow: usize) -> Vec<std::ops::Range<usize>> {
     let mut groups = Vec::new();
     let mut i = 0;
     while i < middle.len() {
@@ -510,6 +552,11 @@ mod tests {
         assert!(out.lines().count() < 10, "{out}");
         let e: String = (0..60).map(|i| format!("error: item {i} failed\n")).collect();
         assert!(!compact(&e, 20, 5, 5).0.contains("similar lines"));
+        // A column of bare numbers is data, not progress: the head and tail window keeps real lines.
+        let nums: String = (1..=400).map(|i| format!("{i}\n")).collect();
+        let (out, cut) = compact(&nums, 50, 10, 10);
+        assert!(cut && !out.contains("similar lines"), "{out}");
+        assert!(out.lines().any(|l| l == "10") && out.lines().any(|l| l == "391"), "{out}");
         // under budget nothing is touched
         let small: String = (0..12).map(|i| format!("n {i}\n")).collect();
         assert_eq!(compact(&small, 50, 10, 10).0, small);
@@ -543,6 +590,26 @@ mod tests {
     }
 
     #[test]
+    fn spool_prune_spares_new_files_and_the_newest_ones() {
+        let dir = std::env::temp_dir().join(format!("qx-spool-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now: u128 = 10_000_000;
+        // 45 files written in the last 10 minutes, 5 written long ago.
+        for i in 0..50u128 {
+            let ms = if i < 5 { i } else { now - 1000 + i };
+            std::fs::write(dir.join(format!("{ms:015}-1-{i}.log")), "x").unwrap();
+        }
+        prune_spool(&dir, now, 39, 600_000);
+        let left = std::fs::read_dir(&dir).unwrap().count();
+        // The 5 old ones go (outside the newest 39); the 45 recent ones stay though that is over 39.
+        assert_eq!(left, 45);
+        prune_spool(&dir, now + 700_000, 39, 600_000);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 39);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn relative_paths_shorten_only_paths_that_start_at_the_cwd() {
         let mut t = String::from(
             r"C:\Proj\src\a.rs:3, c:\proj\b.rs, é D:\x\C:\proj\no, C:/proj/c.rs, C:\ProjX\z",
@@ -551,6 +618,35 @@ mod tests {
         assert_eq!(t, r"src\a.rs:3, b.rs, é D:\x\C:\proj\no, c.rs, C:\ProjX\z");
         let mut root = String::from(r"C:\a");
         assert_eq!(relative_paths(&mut root, "C:\\"), 0);
+    }
+
+    #[test]
+    fn relative_to_cwd_needs_three_hits_and_puts_the_note_on_the_stream_that_had_them() {
+        let cwd = std::path::Path::new(r"C:\proj");
+        let three = "C:\\proj\\a.rs\nC:\\proj\\b.rs\nC:\\proj\\c.rs\n";
+
+        let (mut so, mut se) = (three.to_string(), String::from("clean\n"));
+        relative_to_cwd(&mut so, &mut se, Some(cwd));
+        assert_eq!(so, "a.rs\nb.rs\nc.rs\n[qx] paths relative to C:\\proj\n");
+        assert_eq!(se, "clean\n");
+
+        // Hits split across the streams still count together; the note goes to stdout.
+        let (mut so, mut se) = (String::from("C:\\proj\\a.rs\n"), String::from("C:\\proj\\b.rs\nC:\\proj\\c.rs\n"));
+        relative_to_cwd(&mut so, &mut se, Some(cwd));
+        assert_eq!(so, "a.rs\n[qx] paths relative to C:\\proj\n");
+        assert_eq!(se, "b.rs\nc.rs\n");
+
+        // Only stderr has hits: the note lands there.
+        let (mut so, mut se) = (String::from("plain\n"), three.to_string());
+        relative_to_cwd(&mut so, &mut se, Some(cwd));
+        assert_eq!(so, "plain\n");
+        assert_eq!(se, "a.rs\nb.rs\nc.rs\n[qx] paths relative to C:\\proj\n");
+
+        // Two hits are not worth the note: both streams come back byte for byte.
+        let two = "C:\\proj\\a.rs\nC:\\proj\\b.rs\n";
+        let (mut so, mut se) = (two.to_string(), String::from("x\n"));
+        relative_to_cwd(&mut so, &mut se, Some(cwd));
+        assert_eq!((so.as_str(), se.as_str()), (two, "x\n"));
     }
 
     #[test]
@@ -649,4 +745,98 @@ mod tests {
         assert!(!s.contains("rerun-if") && s.contains("12 cargo build-script lines omitted"), "{s}");
         let mut few = "cargo:rerun-if-changed=a\nV = None\n".to_string();
         assert_eq!(drop_build_noise(&mut few), 0);
-    }}
+    }
+
+    /// A reply built the way the MCP `run` reply and the CLI build it: noise dropped, digest or plain
+    /// compaction, a spool file for a cut, and the `full output:` line that names it.
+    fn reply_like_run(label: &str, stdout: &str, stderr: &str, code: i32) -> String {
+        use crate::digest;
+        let (mut so, mut se) = (stdout.to_string(), stderr.to_string());
+        drop_build_noise(&mut se);
+        drop_build_noise(&mut so);
+        digest::drop_git_eol_warnings(label, &mut se);
+        let (mut truncated, mut lossy) = (false, false);
+        let original = if let Some(d) = digest::digest(label, &so, &se, code) {
+            lossy = d.lossy();
+            truncated |= d.clipped;
+            (std::mem::replace(&mut so, d.stdout), std::mem::replace(&mut se, d.stderr))
+        } else {
+            let (max, head, tail) = digest::plain_budget(label, (200, 80, 60));
+            let (a, cut) = compact(&so, max, head, tail);
+            let (b, cut_err) = compact(&se, 120, 50, 40);
+            truncated |= cut | cut_err;
+            (std::mem::replace(&mut so, a), std::mem::replace(&mut se, b))
+        };
+        digest::shorten_paths("", label, &mut so, &mut se, None);
+        let mut text = so;
+        if !se.is_empty() {
+            text.push_str("[stderr]\n");
+            text.push_str(&se);
+        }
+        if truncated || lossy {
+            if let Some(p) = spool(&original.0, &original.1) {
+                text.push_str(&format!("\n[qx] full output: {}\n", p.display()));
+                std::fs::remove_file(p).ok();
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn every_cut_names_a_route_to_the_full_text() {
+        let generic: String = (0..1000).map(|i| format!("line w{i} w{}\n", i * 7 + 3)).collect();
+        let git_log: String = (0..120)
+            .map(|i| format!("commit {i:040x}\nAuthor: A <a@b.c>\nDate:   Mon Jan 1 00:00:00 2024 +0000\n\n    change number {i}\n\n"))
+            .collect();
+        let deleted: String = (0..40).map(|i| format!("-old line {i}\n")).collect();
+        let git_diff = format!(
+            "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\nindex 1234567..0000000\n--- a/gone.txt\n+++ /dev/null\n@@ -1,40 +0,0 @@\n{deleted}"
+        );
+        let big_diff: String = (0..30)
+            .map(|f| {
+                let body: String = (0..30).map(|i| format!("+added {f} {i}\n")).collect();
+                format!("diff --git a/f{f}.txt b/f{f}.txt\nindex 1234567..89abcde 100644\n--- a/f{f}.txt\n+++ b/f{f}.txt\n@@ -1,1 +1,31 @@\n ctx\n{body}")
+            })
+            .collect();
+        let json = format!(
+            "[{}]\n",
+            (0..300).map(|i| format!("{{\"id\":{i},\"name\":\"item {i}\",\"tags\":[\"a\",\"b\"]}}")).collect::<Vec<_>>().join(",")
+        );
+        let pretty_json = serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(&json).unwrap()).unwrap();
+        let grep: String = (0..300).map(|i| format!("src/m{}.rs:{}:let foo = {i};\n", i % 40, i + 1)).collect();
+        let build: String = (0..5000)
+            .map(|i| {
+                if i % 500 == 250 {
+                    format!("error[E0308]: mismatched types {i}\n --> src/m{i}.rs:{i}:5\n")
+                } else {
+                    format!("   Compiling crate{i} v0.1.{i}\n")
+                }
+            })
+            .collect();
+        let cases: [(&str, &str, i32); 8] = [
+            ("somecmd --all", &generic, 0),
+            ("git log", &git_log, 0),
+            ("git diff", &git_diff, 0),
+            ("git diff", &big_diff, 0),
+            ("cat x.json", &json, 0),
+            ("cat x.json", &pretty_json, 0),
+            ("rg foo", &grep, 0),
+            ("cargo build", &build, 101),
+        ];
+        for (label, input, code) in cases {
+            let (stdout, stderr) = if label == "cargo build" { ("", input) } else { (input, "") };
+            let text = reply_like_run(label, stdout, stderr, code);
+            let is_marker = |l: &str| l.starts_with("[qx]") || l.starts_with("[stderr]");
+            let kept = text.lines().filter(|l| !l.trim().is_empty() && !is_marker(l)).count();
+            // Noise the pipeline drops by design (build-script directives, a failed build's
+            // `Compiling` progress) is not content, so losing it needs no route.
+            let mut clean = input.to_string();
+            drop_build_noise(&mut clean);
+            let had = clean.lines().filter(|l| !l.trim().is_empty() && !crate::digest::routine_line(l.trim())).count();
+            let dropped = kept < had || text.contains("omitted") || text.contains(" more");
+            if dropped {
+                assert!(text.contains("[qx] full output: "), "`{label}` dropped lines but names no route:\n{text}");
+            }
+        }
+    }
+}

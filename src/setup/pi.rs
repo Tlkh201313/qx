@@ -17,7 +17,7 @@ const EXTENSION: &str = include_str!("../../integrations/pi/qx.js");
 const BRIDGE: &str = include_str!("../../integrations/pi/qx/bridge.js");
 const BRIDGE_PACKAGE: &str = "{\n  \"type\": \"module\"\n}\n";
 
-pub fn pi_version(_p: &Paths) -> Option<(u32, u32)> {
+pub fn pi_version() -> Option<(u32, u32)> {
     let crate::resolve::Target::Direct { prefix, .. } = crate::resolve::resolve("pi", None) else {
         return None;
     };
@@ -85,13 +85,13 @@ pub fn edit_pi(
             }
         }
         env.insert("QX_CLIENT".to_string(), json!("pi"));
-        let entry = json!({
+        let entry = super::overlay(existing.as_ref(), json!({
             "command": exe.to_string_lossy(),
             "args": ["mcp"],
             "env": env,
             "exposure": "direct",
             "timeout": 600,
-        });
+        }));
         let edit = match std::fs::read_to_string(&file) {
             Ok(text) => match a {
                 Action::Install => match set_member(&text, &["mcpServers", "qx"], &entry) {
@@ -108,7 +108,11 @@ pub fn edit_pi(
                 },
                 Action::Remove => match super::jsonc::remove_member(&text, &["mcpServers", "qx"]) {
                     Ok(out) if out == text => Edit::Unchanged,
-                    Ok(out) => Edit::Changed(out),
+                    // `mcpServers` left empty goes too; a section the user left empty stays (text unchanged above).
+                    Ok(out) => match super::jsonc::prune_empty(&out, &["mcpServers"]) {
+                        Ok(out) => Edit::Changed(out),
+                        Err(e) => Edit::Refuse(e),
+                    },
                     Err(e) => Edit::Refuse(e),
                 },
             },
@@ -122,35 +126,40 @@ pub fn edit_pi(
             },
             Err(e) => Edit::Refuse(format!("cannot read {}: {e}", file.display())),
         };
-        return vec![(file, edit)];
+        // The extension this build replaced would register the same tools a second time.
+        // Keep it while the MCP entry cannot be written, or pi loses qx entirely.
+        let refused = matches!(edit, Edit::Refuse(_));
+        let mut out = vec![(file, edit)];
+        if !refused {
+            out.extend(legacy_files(p, exe).into_iter().filter(|(file, _)| file.is_file()).map(|(file, _)| (file, Edit::Changed(String::new()))));
+        }
+        return out;
     }
 
     // pi older than 0.99: the extension, its bridge and the ESM marker beside them.
-    let dir = extension_dir(p);
-    let escaped = serde_json::to_string(&exe.to_string_lossy()).unwrap_or_default();
-    let escaped = escaped.trim_matches('"');
-    let files = [
-        (dir.join("qx.js"), EXTENSION.replace("__QX_EXE__", escaped)),
-        (dir.join("qx").join("bridge.js"), BRIDGE.to_string()),
-        (dir.join("qx").join("package.json"), BRIDGE_PACKAGE.to_string()),
-    ];
-    files
+    legacy_files(p, exe)
         .into_iter()
         .map(|(file, wanted)| {
-            let edit = match a {
-                // Empty text means "remove the file": see `apply`.
-                Action::Remove => match std::fs::read_to_string(&file) {
-                    Ok(_) => Edit::Changed(String::new()),
-                    Err(_) => Edit::Unchanged,
-                },
-                Action::Install => match std::fs::read_to_string(&file) {
-                    Ok(current) if current == wanted => Edit::Unchanged,
-                    _ => Edit::Changed(wanted),
-                },
-            };
+            let edit = super::edit_generated(&file, wanted, a);
             (file, edit)
         })
         .collect()
+}
+
+/// The pre-0.99 extension, its bridge and the ESM marker beside them, with the text qx writes.
+fn legacy_files(p: &Paths, exe: &Path) -> [(PathBuf, String); 3] {
+    let dir = extension_dir(p);
+    [
+        (dir.join("qx.js"), super::fill_exe(EXTENSION, exe)),
+        (dir.join("qx").join("bridge.js"), BRIDGE.to_string()),
+        (dir.join("qx").join("package.json"), BRIDGE_PACKAGE.to_string()),
+    ]
+}
+
+/// Whether `content` is exactly what qx writes for one of its pre-0.99 files, whatever exe path
+/// it names. Used to skip a `.qx-bak` of a file qx made and never saw edited.
+pub fn is_generated(content: &str) -> bool {
+    content == BRIDGE || content == BRIDGE_PACKAGE || super::generated_from(EXTENSION, content)
 }
 
 #[cfg(test)]
@@ -163,10 +172,11 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         Paths {
             home: root.clone(),
-            local_app_data: root.join("local"),
             dsh_home: root.join("dsh"),
             hermes_home: root.join("hermes"),
             codex_home: root.join("codex"),
+            claude_config_dir: None,
+            omp_agent_dir: root.join(".omp").join("agent"),
         }
     }
 
@@ -184,6 +194,21 @@ mod tests {
         assert_eq!(v["mcpServers"]["qx"]["exposure"], "direct");
         assert_eq!(v["mcpServers"]["qx"]["timeout"], 600);
         assert_eq!(v["mcpServers"]["qx"]["env"]["QX_CLIENT"], "pi");
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn pi_keeps_legacy_extension_when_mcp_json_is_unreadable() {
+        let p = paths("unreadable");
+        let exe = Path::new(r"C:\q\qx.exe");
+        // A directory where mcp.json should be: reading it fails, but not with NotFound.
+        std::fs::create_dir_all(mcp_file(&p)).unwrap();
+        let legacy = extension_dir(&p).join("qx.js");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "x").unwrap();
+        let out = edit_pi(Some((1, 3)), &p, exe, Action::Install);
+        assert_eq!(out.len(), 1, "legacy files must not be deleted");
+        assert!(matches!(out[0].1, Edit::Refuse(_)));
         let _ = std::fs::remove_dir_all(&p.home);
     }
 
@@ -228,8 +253,26 @@ mod tests {
     }
 
     #[test]
+    fn pi_099_removes_the_extension_it_replaces() {
+        let p = paths("upgrade");
+        let exe = Path::new(r"C:\q\qx.exe");
+        for (file, text) in legacy_files(&p, exe) {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, text).unwrap();
+        }
+        for action in [Action::Install, Action::Remove] {
+            let gone = edit_pi(Some((1, 3)), &p, exe, action)
+                .into_iter()
+                .filter(|(_, e)| matches!(e, Edit::Changed(t) if t.is_empty()))
+                .count();
+            assert_eq!(gone, 3, "{action:?} must remove all three legacy files");
+        }
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
     fn an_unreadable_mcp_json_is_refused_not_overwritten() {
-        let p = paths("unreadable");
+        let p = paths("utf16");
         let file = mcp_file(&p);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         // UTF-16LE with a BOM: not valid UTF-8, and holds other servers the user cares about.
@@ -252,6 +295,21 @@ mod tests {
             Edit::Refuse(reason) => assert!(reason.contains("pi not found"), "{reason}"),
             _ => panic!("a missing pi must be refused"),
         }
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn is_generated_recognises_only_what_qx_writes() {
+        let exe = Path::new(r"C:\q\qx.exe");
+        let p = paths("gen");
+        for (_, text) in legacy_files(&p, exe) {
+            assert!(is_generated(&text));
+        }
+        assert!(is_generated(&EXTENSION.replace("__QX_EXE__", r"D:\other\qx.exe")), "any exe path is ours");
+        assert!(!is_generated(""));
+        assert!(!is_generated("// the user's own edit\n"));
+        assert!(!is_generated(&format!("{BRIDGE}// edited\n")));
+        assert!(!is_generated(&EXTENSION.replace("__QX_EXE__", "x").replace("registerTool", "register")));
         let _ = std::fs::remove_dir_all(&p.home);
     }
 }

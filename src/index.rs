@@ -131,7 +131,7 @@ mod imp {
             ov: *mut Overlapped,
             completion: *mut c_void,
         ) -> i32;
-        fn CancelIoEx(h: Handle, ov: *mut Overlapped) -> i32;
+        fn CancelIoEx(h: Handle, ov: *mut c_void) -> i32;
     }
 
     const INVALID_HANDLE: isize = -1;
@@ -153,6 +153,8 @@ mod imp {
         port: Handle,
         pending: Box<Pending>,
         broken: bool,
+        /// Cleared once git cannot answer for this root (not a repository, no git): no more asking.
+        git_ok: bool,
     }
 
     // The handles are used under the registry mutex only.
@@ -161,7 +163,7 @@ mod imp {
     impl Drop for Index {
         fn drop(&mut self) {
             unsafe {
-                CancelIoEx(self.dir, &mut self.pending.ov);
+                CancelIoEx(self.dir, (&mut self.pending.ov as *mut Overlapped).cast());
                 // The request ends with exactly one packet; the buffer stays until the kernel is done with it.
                 let (mut n, mut key, mut pov) = (0u32, 0usize, std::ptr::null_mut());
                 let got = GetQueuedCompletionStatus(self.port, &mut n, &mut key, &mut pov, 2000);
@@ -172,6 +174,8 @@ mod imp {
                 CloseHandle(self.dir);
                 CloseHandle(self.port);
             }
+            // Its changes are no longer seen: content cached under its mtimes cannot be vouched for.
+            crate::fsops::content_forget(&self.root, true);
         }
     }
 
@@ -287,16 +291,58 @@ mod imp {
                 return;
             }
             let comps: Vec<&str> = rel.split('/').collect();
+            let last = comps.len() - 1;
+            // An ignore rule changed, or a name is a short 8.3 alias (which names a file the list holds under
+            // its long name): the list cannot follow, so the next query rebuilds it.
+            if rel == ".git/info/exclude" || comps[last].eq_ignore_ascii_case(".gitignore") || is_short_name(comps[last]) {
+                trace(|| format!("change: rules or alias {rel}"));
+                self.broken = true;
+                return;
+            }
+            // A folder that went takes everything cached below it; a file only itself (a lookup, not a scan).
+            let gone_tree = matches!(action, REMOVED | RENAMED_OLD) && self.snap.files.binary_search_by(|e| e.rel.as_str().cmp(rel)).is_err();
             // A path inside a generated or VCS directory is not in the list: one name check, no syscall.
+            // The last part may be a plain file that only has such a name (`vendor`, `dist`): that one is listed.
+            let mut skip_leaf = false;
             for (i, c) in comps.iter().enumerate() {
                 if crate::fsops::skip_dir_name(c) {
-                    if i + 1 == comps.len() && (action == ADDED || action == RENAMED_NEW) && !crate::fsops::vcs_dir_name(c) {
-                        Arc::make_mut(&mut self.snap).skipped.insert((*c).to_string());
+                    if i != last {
+                        return;
                     }
-                    return;
+                    skip_leaf = true;
                 }
             }
+            if skip_leaf {
+                if let Some((parent, _)) = rel.rsplit_once('/') {
+                    if self.under_ignored(parent) {
+                        return;
+                    }
+                }
+                let full = self.root.join(rel.replace('/', "\\"));
+                crate::fsops::content_forget(&full, gone_tree);
+                match action {
+                    REMOVED | RENAMED_OLD => Arc::make_mut(&mut self.snap).remove(rel),
+                    ADDED | RENAMED_NEW | MODIFIED => match std::fs::symlink_metadata(&full) {
+                        Ok(md) if md.file_type().is_file() => {
+                            let modified = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                            Arc::make_mut(&mut self.snap).upsert(rel, full, modified);
+                        }
+                        Ok(md) if md.file_type().is_dir() && action != MODIFIED && !crate::fsops::vcs_dir_name(comps[last]) => {
+                            Arc::make_mut(&mut self.snap).skipped.insert(comps[last].to_string());
+                        }
+                        _ => {}
+                    },
+                    _ => self.broken = true,
+                }
+                return;
+            }
+            // A folder git ignores (the walk left it out, and recorded it in `skipped` by its path).
+            if self.under_ignored(rel) {
+                return;
+            }
             let full = self.root.join(rel.replace('/', "\\"));
+            // A rewrite that keeps the mtime would otherwise be served from the content cache.
+            crate::fsops::content_forget(&full, gone_tree);
             match action {
                 REMOVED | RENAMED_OLD => Arc::make_mut(&mut self.snap).remove(rel),
                 ADDED | RENAMED_NEW | MODIFIED => {
@@ -323,13 +369,66 @@ mod imp {
             }
         }
 
+        /// Whether `rel` is, or lies below, a folder the walk left out and recorded by its path.
+        fn under_ignored(&self, rel: &str) -> bool {
+            self.snap.skipped.iter().any(|s| rel.strip_prefix(s.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/')))
+        }
+
+        /// Ask git whether the folder `rel` is ignored. At most `*budget` asks per call chain (a process each);
+        /// `None` when the budget is spent, so the caller falls back to a rebuild.
+        fn git_ignores(&mut self, rel: &str, budget: &mut u32) -> Option<bool> {
+            if !self.git_ok {
+                return Some(false);
+            }
+            if *budget == 0 {
+                return None;
+            }
+            *budget -= 1;
+            match crate::fsops::git_ignores_dir(&self.root, rel) {
+                Some(v) => Some(v),
+                None => {
+                    self.git_ok = false; // no git, no repository, or too slow: the walk leaves nothing out either
+                    Some(false)
+                }
+            }
+        }
+
         /// A directory appeared (created, renamed in, or copied whole): list what it holds.
         fn add_tree(&mut self, dir: &Path, rel: &str) {
+            let mut budget = 16u32;
+            match self.git_ignores(rel, &mut budget) {
+                Some(true) => {
+                    Arc::make_mut(&mut self.snap).skipped.insert(rel.to_string());
+                    return;
+                }
+                Some(false) => {}
+                None => {
+                    self.broken = true;
+                    return;
+                }
+            }
             let mut stack = vec![(dir.to_path_buf(), rel.to_string())];
             while let Some((d, r)) = stack.pop() {
-                let Ok(rd) = std::fs::read_dir(&d) else { continue };
-                for e in rd.flatten() {
-                    let Ok(ft) = e.file_type() else { continue };
+                let rd = match std::fs::read_dir(&d) {
+                    Ok(rd) => rd,
+                    Err(e) => {
+                        // Files below it would be missing from the list until the next rebuild.
+                        if crate::fsops::walk_lost(&e) {
+                            self.broken = true;
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                for e in rd {
+                    let Ok(e) = e else {
+                        self.broken = true;
+                        return;
+                    };
+                    let Ok(ft) = e.file_type() else {
+                        self.broken = true;
+                        return;
+                    };
                     let name = e.file_name().to_string_lossy().into_owned();
                     let child_rel = format!("{r}/{name}");
                     if ft.is_symlink() {
@@ -347,14 +446,37 @@ mod imp {
                             self.broken = true;
                             return;
                         }
-                        stack.push((e.path(), child_rel));
+                        match self.git_ignores(&child_rel, &mut budget) {
+                            Some(true) => {
+                                Arc::make_mut(&mut self.snap).skipped.insert(child_rel);
+                            }
+                            Some(false) => stack.push((e.path(), child_rel)),
+                            None => {
+                                self.broken = true; // too many folders to ask about one by one
+                                return;
+                            }
+                        }
                     } else if ft.is_file() {
-                        let modified = e.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+                        let modified = match e.metadata().and_then(|m| m.modified()) {
+                            Ok(m) => m,
+                            Err(err) if !crate::fsops::walk_lost(&err) => continue, // gone again; its REMOVED follows
+                            Err(_) => {
+                                self.broken = true;
+                                return;
+                            }
+                        };
                         Arc::make_mut(&mut self.snap).upsert(&child_rel, e.path(), modified);
                     }
                 }
             }
         }
+    }
+
+    /// An 8.3 alias such as `LONGFI~1.TXT`: the kernel reports it when a file is reached by that name.
+    fn is_short_name(name: &str) -> bool {
+        let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+        let Some((head, num)) = stem.rsplit_once('~') else { return false };
+        (1..=6).contains(&head.len()) && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) && ext.len() <= 3
     }
 
     fn is_reparse(md: &std::fs::Metadata) -> bool {
@@ -386,14 +508,18 @@ mod imp {
                 buf: vec![0u32; BUFFER_WORDS],
             }),
             broken: false,
+            git_ok: true,
         };
         if !index.issue() {
             return None; // Drop closes the handles
         }
-        let (parts, skipped) = crate::fsops::walk_live(root, false, Vec::<Entry>::new, |found, p, meta| {
+        let (parts, skipped, complete) = crate::fsops::walk_live(root, false, Vec::<Entry>::new, |found, p, meta| {
             let rel = p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/");
             found.push(Entry { path: p.to_path_buf(), rel, modified: meta.modified() });
         });
+        if !complete {
+            return None; // a folder could not be read: a list missing its files would stay wrong
+        }
         let mut files: Vec<Entry> = parts.into_iter().flatten().collect();
         if files.len() >= crate::fsops::MAX_WALK_FILES {
             return None; // too big to hold exactly: keep walking
@@ -405,12 +531,15 @@ mod imp {
 
     fn find(root: &Path) -> Option<(Arc<Mutex<Index>>, String)> {
         let want = key(root);
-        let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        for ix in reg.iter() {
+        let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        // The nearest root that holds the folder: an exact one, else the longest base.
+        let mut hit: Option<(usize, String)> = None;
+        for (at, ix) in reg.iter().enumerate() {
             let Ok(guard) = ix.lock() else { continue };
             let base = key(&guard.root);
             if want == base {
-                return Some((ix.clone(), String::new()));
+                hit = Some((at, String::new()));
+                break;
             }
             if let Some(rest) = want.strip_prefix(&base).and_then(|r| r.strip_prefix('\\')) {
                 // The case of the on-disk path, not of the query, names the prefix.
@@ -418,11 +547,25 @@ mod imp {
                 let tail: String = root.to_string_lossy().replace('\\', "/");
                 let tail = tail.trim_end_matches('/');
                 if tail.len() >= n {
-                    return Some((ix.clone(), tail[tail.len() - n..].to_string()));
+                    let prefix = tail[tail.len() - n..].to_string();
+                    if covers_in(&guard, &prefix) && hit.as_ref().is_none_or(|(_, p)| prefix.len() < p.len()) {
+                        hit = Some((at, prefix));
+                    }
                 }
             }
         }
-        None
+        // A root in use goes to the back, so the one evicted for room is the one used longest ago.
+        let (at, prefix) = hit?;
+        let ix = reg.remove(at);
+        reg.push(ix.clone());
+        Some((ix, prefix))
+    }
+
+    /// Whether `prefix` (a folder under the index root) is in the index: a folder the walk skipped by
+    /// name (node_modules, target) or a hidden one is not.
+    fn covers_in(index: &Index, prefix: &str) -> bool {
+        let under_ignored = |s: &String| prefix.strip_prefix(s.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+        prefix.split('/').all(|c| !c.starts_with('.') && !index.snap.skipped.contains(c)) && !index.snap.skipped.iter().any(under_ignored)
     }
 
     fn trace(msg: impl FnOnce() -> String) {
@@ -443,6 +586,7 @@ mod imp {
             trace(|| "broken: rebuilding".to_string());
             let base = guard.root.clone();
             drop(guard);
+            crate::fsops::drop_ignored_cache(); // an ignore rule may be why: ask git again
             forget(&base);
             rebuild_in_background(base);
             return None;
@@ -468,7 +612,9 @@ mod imp {
         let Ok(root) = std::fs::canonicalize(root) else { return };
         let root = root.as_path();
         let k = key(root);
-        if find(root).is_some_and(|(_, prefix)| prefix.is_empty()) {
+        // A folder inside an indexed root is served by that index (`find` only names a root that holds it);
+        // building its own would evict the root.
+        if find(root).is_some() {
             return;
         }
         {
@@ -478,6 +624,7 @@ mod imp {
             }
             building.push(k.clone());
         }
+        let _done = BuildDone(k.clone());
         let started = std::time::Instant::now();
         let built = build(root);
         trace(|| format!("build {} -> {} in {:?}", root.display(), built.as_ref().map_or(0, |i| i.snap.files.len()), started.elapsed()));
@@ -488,7 +635,54 @@ mod imp {
             }
             reg.push(Arc::new(Mutex::new(index)));
         }
-        BUILDING.lock().unwrap_or_else(|e| e.into_inner()).retain(|b| b != &k);
-        BUILT.notify_all();
+    }
+
+    /// Takes a root off the building list when its build ends, also by a panic: a root left on it would
+    /// never be built again, and every query on it would wait the full 2 s.
+    struct BuildDone(String);
+
+    impl Drop for BuildDone {
+        fn drop(&mut self) {
+            BUILDING.lock().unwrap_or_else(|e| e.into_inner()).retain(|b| b != &self.0);
+            BUILT.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_build_that_panics_does_not_stay_on_the_building_list() {
+            let k = String::from("c:\\qx-test-panicking-root");
+            BUILDING.lock().unwrap_or_else(|e| e.into_inner()).push(k.clone());
+            let k2 = k.clone();
+            let t = std::thread::spawn(move || {
+                let _done = BuildDone(k2);
+                panic!("build died");
+            });
+            assert!(t.join().is_err());
+            let left = BUILDING.lock().unwrap_or_else(|e| e.into_inner()).contains(&k);
+            assert!(!left, "the root is still on the building list");
+            assert!(!wait_for_build(Path::new("C:\\qx-test-panicking-root")));
+        }
+
+        #[test]
+        fn a_folder_that_cannot_be_listed_breaks_the_index() {
+            let dir = std::env::temp_dir().join(format!("qx-index-addtree-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.txt"), "x").unwrap();
+            let mut index = build(&dir).expect("an index was built");
+            index.git_ok = false; // no git process for this check
+            // Gone again before it was listed: its REMOVED follows and the list stays right.
+            index.add_tree(&dir.join("gone"), "gone");
+            assert!(!index.broken);
+            // Any other failure (here a file where a folder was expected) would leave files out.
+            index.add_tree(&dir.join("f.txt"), "f.txt");
+            assert!(index.broken);
+            drop(index);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

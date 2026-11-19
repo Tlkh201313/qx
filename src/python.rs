@@ -122,7 +122,18 @@ pub struct VenvRedirect {
 
 /// The one-process equivalent of `<venv>\Scripts\python.exe`, when that is safe.
 pub fn venv_redirect(python: &Path) -> Option<VenvRedirect> {
-    venv_redirect_with(python, |k| std::env::var(k).ok())
+    venv_redirect_env(python, &[])
+}
+
+/// `venv_redirect` for a call whose own `NAME=value` prefixes override the inherited environment.
+pub fn venv_redirect_env(python: &Path, envs: &[(String, String)]) -> Option<VenvRedirect> {
+    venv_redirect_with(python, |k| {
+        envs.iter()
+            .rev()
+            .find(|(n, _)| n.eq_ignore_ascii_case(k))
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var(k).ok())
+    })
 }
 
 fn venv_redirect_with(python: &Path, env: impl Fn(&str) -> Option<String>) -> Option<VenvRedirect> {
@@ -386,6 +397,25 @@ mod tests {
         )
         .unwrap();
         assert!(venv_redirect_with(&python, none).is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_pythonhome_prefix_on_the_call_stops_the_venv_redirect() {
+        let d = tmp("venv-prefix");
+        let v = d.join("v");
+        fs::create_dir_all(v.join("Scripts")).unwrap();
+        fs::create_dir_all(d.join("h")).unwrap();
+        fs::write(d.join("h").join("python.exe"), "").unwrap();
+        fs::write(v.join("pyvenv.cfg"), format!("home = {}\nversion_info = 3.12.1\n", d.join("h").display())).unwrap();
+        let python = v.join("Scripts").join("python.exe");
+        fs::write(&python, "").unwrap();
+        if venv_redirect(&python).is_none() {
+            return; // this process's own environment already turns the redirect off
+        }
+        for key in ["pythonhome", "__PYVENV_LAUNCHER__"] {
+            assert!(venv_redirect_env(&python, &[(key.to_string(), "x".to_string())]).is_none(), "{key}");
+        }
         let _ = fs::remove_dir_all(&d);
     }
 
