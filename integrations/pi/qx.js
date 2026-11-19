@@ -39,6 +39,11 @@ const RUN_PARAMETERS = Type.Object({
   env: Type.Optional(
     Type.Record(Type.String(), Type.String(), { description: "Extra environment variables for the command." }),
   ),
+  fresh: Type.Optional(
+    Type.Boolean({
+      description: "Run it again even when a passing test/lint run on an unchanged git tree would be answered from memory.",
+    }),
+  ),
   mode: Type.Optional(
     Type.Union([Type.Literal("compact"), Type.Literal("full")], {
       description: "compact (default) or full.",

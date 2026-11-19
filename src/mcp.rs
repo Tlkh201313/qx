@@ -569,7 +569,7 @@ fn run_schema() -> Value {
                 "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Extra environment variables for the command." },
                 "timeout_ms": { "type": "integer", "default": 120000, "description": "1000 to 3600000; how long this call waits before the command becomes a job." },
                 "kill_on_timeout": { "type": "boolean", "description": "Stop the command at timeout_ms instead of moving it to a job." },
-                "fresh": { "type": "boolean", "description": "Run it again even when a repeat of a read-only command in an unchanged git tree would be answered from memory." },
+                "fresh": { "type": "boolean", "description": "Run it again even when a passing test/lint run on an unchanged git tree would be answered from memory." },
                 "mode": { "type": "string", "enum": ["compact", "full"], "default": "compact" },
                 "background": { "type": "boolean", "description": "Return a job id at once." },
                 "job": { "type": "string", "description": "Follow a background job by id, or `list`." },
