@@ -89,9 +89,10 @@ pub fn digest(label: &str, stdout: &str, stderr: &str, code: i32) -> Option<Dige
         // so it skips the saving gate below; only a minified line past the per-line cap is cut (and
         // spooled). Only a long diff is condensed.
         if stdout.lines().count() <= DIFF_WHOLE {
-            let (o, cut_o) = bound(trim_diff_headers(stdout)?, DIFF_WHOLE);
+            let (trimmed, folded) = trim_diff_headers(stdout)?;
+            let (o, cut_o) = bound(trimmed, DIFF_WHOLE);
             let (err, cut) = keep_stderr(stderr);
-            return Some(Digest { stdout: o, stderr: err, profile: "git-diff", omitted: 0, clipped: sd || ed || cut || cut_o, passed: code == 0 });
+            return Some(Digest { stdout: o, stderr: err, profile: "git-diff", omitted: 0, clipped: sd || ed || cut || cut_o || folded, passed: code == 0 });
         }
         let (o, n, c) = git_diff(stdout)?;
         ("git-diff", o, None, n, c)
@@ -336,7 +337,8 @@ struct Commit {
     body: usize,
 }
 
-/// `commit <sha>/Author/Date/message` -> `sha7 subject (who, date) (refs) [+N body lines]`.
+/// `commit <sha>/Author/Date/message` -> `sha7 subject (who, date) (refs) [+N body lines]`. The 7-char
+/// hashes and the body markers say what was condensed; the caller spools the full text.
 fn git_log(text: &str) -> Option<(String, usize)> {
     let mut commits: Vec<Commit> = Vec::new();
     for line in text.lines() {
@@ -380,9 +382,22 @@ fn git_log(text: &str) -> Option<(String, usize)> {
     if commits.is_empty() || commits.iter().any(|c| c.hash.is_empty() || c.subject.is_empty()) {
         return None;
     }
+    // One author and one day on every entry (a solo branch, a fresh clone's recent history) is said
+    // once in a header; entries that differ keep their own `(who, date)`.
+    let same = commits.len() >= 2
+        && !commits[0].who.is_empty()
+        && !commits[0].when.is_empty()
+        && commits.iter().all(|c| c.who == commits[0].who && c.when == commits[0].when);
     let mut out = String::new();
+    if same {
+        out.push_str(&format!("all by {}, {}\n", commits[0].who, commits[0].when));
+    }
     for c in &commits {
-        out.push_str(&format!("{} {} ({}, {})", c.hash, c.subject, c.who, c.when));
+        if same {
+            out.push_str(&format!("{} {}", c.hash, c.subject));
+        } else {
+            out.push_str(&format!("{} {} ({}, {})", c.hash, c.subject, c.who, c.when));
+        }
         if !c.deco.is_empty() {
             out.push(' ');
             out.push_str(&c.deco);
@@ -392,7 +407,6 @@ fn git_log(text: &str) -> Option<(String, usize)> {
         }
         out.push('\n');
     }
-    out.push_str("[qx] git log condensed (7-char hashes, bodies dropped)\n");
     let omitted = text.lines().count().saturating_sub(commits.len());
     Some((out, omitted))
 }
@@ -634,14 +648,18 @@ fn is_pathlist(l: &str) -> bool {
 
 /// Lossless as a set: every path of one directory goes on ONE line `dir/{a,b,c}` (directories in order
 /// of first appearance, names in their original order), so the order across directories is regrouped.
+/// That is safe for `git ls-files` too: it prints in path order, so the set (with the directory of each
+/// name) is the whole answer and regrouping loses nothing, even with root files between directories.
 /// When the order is the answer (`rg --files --sort modified`, a pipe into `sort`), `regroup` is false
-/// and only consecutive paths of one directory share a line. When 3+ names of a line share one
-/// extension it is factored out: `dir/{a,b,c}.rs`. Names or dirs that hold `,{}`, a name without an
-/// extension, or a directory path itself stay as plain lines.
+/// and only consecutive paths of one directory share a line. When 3+ names of a line share one ending
+/// that starts at a `.`, `-` or `_` it is factored out: `dir/{a,b,c}.rs`, `dir/{a,b,c}-v2.md`. Names or
+/// dirs that hold `,{}`, a root name (no directory to share) or a directory path itself stay as plain lines.
+/// Half the lines must carry a directory: a repo's file list has root files (`Cargo.toml`, `README.md`)
+/// beside its folders, and those must not keep the folders from being grouped.
 fn paths(text: &str, regroup: bool) -> Option<(String, usize)> {
     let sep = |c: char| c == '/' || c == '\\';
     let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
-    if lines.len() < 12 || lines.iter().filter(|l| l.contains(sep)).count() * 10 < lines.len() * 9 {
+    if lines.len() < 12 || lines.iter().filter(|l| l.contains(sep)).count() * 2 < lines.len() {
         return None;
     }
     let cut = |l: &str| l.rfind(sep).map_or(0, |k| k + 1);
@@ -661,14 +679,20 @@ fn paths(text: &str, regroup: bool) -> Option<(String, usize)> {
         };
         groups[g].1.push(&l[dir.len()..]);
     }
-    // `.rs` of `a.rs`; none for `Makefile` or a dotfile (`.gitignore`).
-    fn ext(n: &str) -> Option<&str> {
-        n.rfind('.').filter(|&k| k > 0 && k + 1 < n.len()).map(|k| &n[k..])
+    // The longest ending every name shares that starts at a `.`, `-` or `_` and leaves each stem
+    // non-empty: `.rs` of `a.rs`, `-v2.md` of `a-v2.md`; none for `Makefile` or a dotfile (`.gitignore`).
+    fn shared_tail<'a>(names: &[&'a str]) -> Option<&'a str> {
+        let first = names[0];
+        let same = names[1..].iter().map(|n| first.bytes().rev().zip(n.bytes().rev()).take_while(|(a, b)| a == b).count()).min()?;
+        let shortest = names.iter().map(|n| n.len()).min()?;
+        (first.len() - same..first.len())
+            .find(|&k| matches!(first.as_bytes()[k], b'.' | b'-' | b'_') && k + 1 < first.len() && first.len() - k < shortest)
+            .map(|k| &first[k..])
     }
     let mut out = String::new();
     let mut shown = 0usize;
     for (dir, names) in &groups {
-        if names.len() < 2 || dir.contains([',', '{', '}']) || names.iter().any(|n| n.is_empty() || n.contains([',', '{', '}'])) {
+        if dir.is_empty() || names.len() < 2 || dir.contains([',', '{', '}']) || names.iter().any(|n| n.is_empty() || n.contains([',', '{', '}'])) {
             for n in names {
                 out.push_str(dir);
                 out.push_str(n);
@@ -678,7 +702,7 @@ fn paths(text: &str, regroup: bool) -> Option<(String, usize)> {
             continue;
         }
         for chunk in names.chunks(60) {
-            let common = ext(chunk[0]).filter(|e| chunk.len() >= 3 && chunk.iter().all(|n| ext(n) == Some(*e)));
+            let common = (chunk.len() >= 3).then(|| shared_tail(chunk)).flatten();
             match (chunk.len(), common) {
                 (1, _) => out.push_str(&format!("{dir}{}", chunk[0])),
                 (_, Some(e)) => {
@@ -1045,30 +1069,89 @@ fn fold_diff_header(lines: &[&str], i: usize) -> (Vec<String>, usize) {
     (out, j)
 }
 
+/// Whole-file diffs shrink to what an agent needs: that the file went or came, and how big it is. The
+/// caller marks the digest clipped, so the full text is spooled and named. `folded` is the header block
+/// `fold_diff_header` made and `at` the index of its hunk header. A deleted file of 6+ lines becomes one
+/// line (its content is in git already); a new file of over 20 lines keeps its first 5 lines. Returns the
+/// lines to print instead of the header block and the body, and the index after them; `None` leaves the
+/// diff as it is (a smaller file, a mode change, a path with spaces, a body that does not match its
+/// hunk header).
+fn fold_whole_file(folded: &[String], lines: &[&str], at: usize) -> Option<(Vec<String>, usize)> {
+    const DELETED_MIN: usize = 6;
+    const NEW_MIN: usize = 21;
+    const NEW_SHOWN: usize = 5;
+    let [title] = folded else { return None };
+    let (path, tag) = title.strip_prefix("diff ")?.rsplit_once(" (")?;
+    let tag = tag.strip_suffix(')')?;
+    if path.is_empty() || path.contains(char::is_whitespace) {
+        return None;
+    }
+    let deleted = match tag.split_once(' ') {
+        Some(("deleted", m)) if m.bytes().all(|b| b.is_ascii_digit()) => true,
+        Some(("new", m)) if m.bytes().all(|b| b.is_ascii_digit()) => false,
+        _ => return None,
+    };
+    let hunk = *lines.get(at)?;
+    let count = if deleted { hunk.strip_prefix("@@ -1,")?.strip_suffix(" +0,0 @@")? } else { hunk.strip_prefix("@@ -0,0 +1,")?.strip_suffix(" @@")? };
+    let n: usize = count.parse().ok()?;
+    let min = if deleted { DELETED_MIN } else { NEW_MIN };
+    if n < min {
+        return None;
+    }
+    let sign = if deleted { '-' } else { '+' };
+    let body = lines.get(at + 1..at + 1 + n)?;
+    if !body.iter().all(|l| l.starts_with(sign)) {
+        return None;
+    }
+    let mut end = at + 1 + n;
+    while lines.get(end).is_some_and(|l| l.starts_with('\\')) {
+        end += 1; // `\ No newline at end of file`
+    }
+    let rep = if deleted {
+        vec![format!("deleted {path} ({n} lines)")]
+    } else {
+        let mut v = vec![title.clone(), hunk.to_string()];
+        v.extend(body[..NEW_SHOWN].iter().map(|l| l.to_string()));
+        v.push(format!("… {} more lines", n - NEW_SHOWN));
+        v
+    };
+    Some((rep, end))
+}
+
 /// A diff short enough to show whole: only its headers are folded, every hunk header, context, `+` and
-/// `-` line stays. `None` when there is nothing to fold or the diff has merge-conflict columns.
-fn trim_diff_headers(text: &str) -> Option<String> {
+/// `-` line stays, except a whole-file body that `fold_whole_file` shrinks. `None` when there is nothing
+/// to fold or the diff has merge-conflict columns. The flag says a whole-file body was folded, so the
+/// full text is worth keeping.
+fn trim_diff_headers(text: &str) -> Option<(String, bool)> {
     if diff_is_combined(text) {
         return None;
     }
     let lines: Vec<&str> = text.lines().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
+    let mut folded_whole = false;
     while i < lines.len() {
         if lines[i].starts_with("diff --git ") {
             let (folded, next) = fold_diff_header(&lines, i);
-            for l in folded {
+            let (shown, end) = match fold_whole_file(&folded, &lines, next) {
+                Some(f) => {
+                    folded_whole = true;
+                    f
+                }
+                None => (folded, next),
+            };
+            for l in shown {
                 out.push_str(&l);
                 out.push('\n');
             }
-            i = next;
+            i = end;
         } else {
             out.push_str(lines[i]);
             out.push('\n');
             i += 1;
         }
     }
-    (out.len() < text.len()).then_some(out)
+    (out.len() < text.len()).then_some((out, folded_whole))
 }
 
 /// A merge-conflict diff marks each side with a column of its own; this reader knows one.
@@ -1088,18 +1171,27 @@ fn git_diff(text: &str) -> Option<(String, usize, bool)> {
     let mut kept = 0usize;
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
+    let mut folded_whole = false;
 
     while i < lines.len() {
         let line = lines[i];
         i += 1;
         if line.starts_with("diff --git ") {
             let (folded, next) = fold_diff_header(&lines, i - 1);
-            omitted += (next - (i - 1)).saturating_sub(folded.len());
-            for l in folded {
+            let (shown, end) = match fold_whole_file(&folded, &lines, next) {
+                Some((rep, end)) => {
+                    changed += 1;
+                    folded_whole = true;
+                    (rep, end)
+                }
+                None => (folded, next),
+            };
+            omitted += (end - (i - 1)).saturating_sub(shown.len());
+            for l in shown {
                 out.push_str(&l);
                 out.push('\n');
             }
-            i = next;
+            i = end;
             in_hunk = false;
             continue;
         }
@@ -1178,7 +1270,7 @@ fn git_diff(text: &str) -> Option<(String, usize, bool)> {
     if clipped {
         out.push_str(&format!("[qx] {omitted} diff lines omitted\n"));
     }
-    Some((out, omitted, clipped))
+    Some((out, omitted, clipped || folded_whole))
 }
 
 fn fail_line(t: &str, build: bool) -> bool {
@@ -1327,7 +1419,7 @@ fn nonzero_tally(t: &str) -> bool {
 }
 
 /// Progress and bookkeeping a green test or build run prints: dropping it loses nothing.
-fn routine_line(t: &str) -> bool {
+pub(crate) fn routine_line(t: &str) -> bool {
     const STARTS: &[&str] = &[
         "Compiling ", "Checking ", "Finished ", "Running ", "Fresh ", "Downloaded ", "Downloading ", "Updating ",
         "Locking ", "Adding ", "Blocking ", "Installing ", "Installed ", "Replacing ", "Replaced ", "Doc-tests ",
@@ -1372,10 +1464,29 @@ fn lint_name(t: &str) -> Option<&str> {
     (n != "warnings").then_some(n)
 }
 
-/// `^^^ help: use `is_empty`: `v.is_empty()`` label: the text after `help: `.
-fn inline_help(t: &str) -> Option<&str> {
-    let r = t[t.find('^')?..].trim_start_matches('^').trim_start();
-    r.strip_prefix("help: ")
+/// Text after the markers of a `|` row: `|   ^^^ help: x`, `|   help: x` or `|   ---- label`. None when the row is not a `|` row.
+fn pipe_row(u: &str) -> Option<&str> {
+    let r = u.strip_prefix('|')?.trim_start();
+    Some(r.trim_start_matches(['^', '-', '~']).trim_start())
+}
+
+/// `^^^ help: use `is_empty`: `v.is_empty()`` label (or a bare `help:` pipe row): the text after `help: `.
+fn inline_help(u: &str) -> Option<&str> {
+    pipe_row(u)?.strip_prefix("help: ")
+}
+
+/// `---- matches all the values already` span label: markers followed by text, not a help.
+fn span_label(u: &str) -> bool {
+    let Some(r) = u.strip_prefix('|') else { return false };
+    let r = r.trim_start();
+    let text = r.trim_start_matches(['^', '-', '~']);
+    text.len() < r.len() && !text.trim().is_empty() && !text.trim_start().starts_with("help: ")
+}
+
+/// `4 |   source` row: the line number and ` |` start it.
+fn source_line(u: &str) -> bool {
+    let n = u.bytes().take_while(u8::is_ascii_digit).count();
+    n > 0 && u[n..].starts_with(" |")
 }
 
 /// `5 +     v[0]` line of a rustc suggestion diff.
@@ -1401,6 +1512,7 @@ fn fold_rustc(lines: &[&str], keep: &mut [bool], noise: &mut [bool], over: &mut 
         let mut lint = None;
         let mut inline = false;
         let mut fix: Vec<usize> = Vec::new();
+        let mut last_src: Option<usize> = None;
         let pin = |j: usize, keep: &mut [bool], noise: &mut [bool]| {
             noise[j] = false;
             keep[j] = true;
@@ -1416,12 +1528,19 @@ fn fold_rustc(lines: &[&str], keep: &mut [bool], noise: &mut [bool], over: &mut 
             } else if u.starts_with("= help: for further information visit") || u == "|" {
                 noise[j] = true;
             } else if warn {
-                if u.starts_with("--> ") || u.starts_with("= note:") || u.starts_with("= help:") {
+                if source_line(u) {
+                    last_src = Some(j);
+                } else if u.starts_with("--> ") || u.starts_with("= note:") || u.starts_with("= help:") {
                     pin(j, keep, noise);
                 } else if let Some(h) = inline_help(u) {
                     over[j] = Some(format!("help: {h}"));
                     inline = true;
                     pin(j, keep, noise);
+                } else if span_label(u) {
+                    pin(j, keep, noise);
+                    if let Some(s) = last_src {
+                        pin(s, keep, noise);
+                    }
                 } else if lines[j].starts_with("help: ") || (!fix.is_empty() && plus_line(u)) {
                     fix.push(j);
                 }
@@ -1854,37 +1973,56 @@ fn split_numbered(line: &str) -> Option<(&str, &str, &str)> {
     None
 }
 
+/// Lines a search digest gives its file names and matches: with its total and trailer lines it stays
+/// under the 400-line bound of `digest`, whose compaction would otherwise cut files out of the middle.
+const GREP_LINES: usize = 380;
+
+/// `rg --heading` shape: each file's path on its own line, then its matches as `12:text`. A file
+/// whose matches were capped says how many it had (`path (25 of 40)`). The same text on several
+/// lines of one file (a `#[cfg]` twin, a repeated call) shows once with every line number: `12,40:text`.
 fn grep(text: &str) -> Option<(String, usize, bool)> {
-    // (path, matches seen, matches kept): the caps are per file (25) and overall
-    // (300), and a capped file still shows its true count.
-    type Group = (String, usize, Vec<(String, String)>);
+    let mut matches = Vec::new();
+    for line in text.lines() {
+        match split_match(line) {
+            Some(m) => matches.push(m),
+            // `--` alone is a group separator. Context lines (`-A`), `Binary file x matches` and the like
+            // cannot be placed in a group, so a digest would drop them without a trace: leave the output
+            // to generic compaction.
+            None if line.trim().is_empty() || line == "--" => {}
+            None => return None,
+        }
+    }
+    let parsed = matches.len();
+    if parsed < 3 {
+        return None;
+    }
+    // Every file is named while that takes at most half the budget (the file list is the map of the
+    // answer); the matches get the rest.
+    let names = matches.iter().map(|m| m.0).collect::<std::collections::HashSet<_>>().len().min(GREP_LINES / 2);
+    // (path, matches seen, matches kept, kept lines as (numbers, text)): the caps are per file (25)
+    // and overall, and a capped file still shows its true count. Once one match is past the overall
+    // cap none after it is kept, so the files without a shown match are the tail of `groups`.
+    type Group = (String, usize, usize, Vec<(String, String)>);
     let mut groups: Vec<Group> = Vec::new();
     let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    let mut parsed = 0usize;
     let mut kept = 0usize;
     let mut clipped = false;
     let mut cut_lines = 0usize;
 
-    for line in text.lines() {
-        let Some((path, num, content)) = split_match(line) else {
-            // Context lines (`-A`), `Binary file x matches` and the like cannot be placed in a group,
-            // so a digest would drop them without a trace: leave the output to generic compaction.
-            if line.trim().is_empty() || line == "--" {
-                continue;
-            }
-            return None;
-        };
-        parsed += 1;
+    for (path, num, content) in matches {
         let g = *index.entry(path).or_insert_with(|| {
-            groups.push((path.to_string(), 0, Vec::new()));
+            groups.push((path.to_string(), 0, 0, Vec::new()));
             groups.len() - 1
         });
         groups[g].1 += 1;
-        if groups[g].2.len() >= 25 || kept >= 300 {
+        if groups[g].2 >= 25 || kept >= GREP_LINES - names {
             clipped = true;
             continue;
         }
-        let content = content.trim_end();
+        groups[g].2 += 1;
+        kept += 1;
+        // Indentation is nesting depth, not content: the match keeps its text and its line number.
+        let content = content.trim();
         // A minified line is cut in the middle, not at the end: its tail (where a stack, a path or the
         // match often sits) stays, and the flag spools the whole line.
         let content = if content.len() > 500 {
@@ -1895,33 +2033,37 @@ fn grep(text: &str) -> Option<(String, usize, bool)> {
         } else {
             content.to_string()
         };
-        groups[g].2.push((num.to_string(), content));
-        kept += 1;
-    }
-
-    if parsed < 3 {
-        return None;
+        // Without line numbers a repeat has nothing to be told apart by: it stays a line of its own.
+        let items = &mut groups[g].3;
+        match items.iter_mut().find(|(n, c)| !num.is_empty() && !n.is_empty() && *c == content) {
+            Some((n, _)) => {
+                n.push(',');
+                n.push_str(num);
+            }
+            None => items.push((num.to_string(), content)),
+        }
     }
 
     // The per-file counts alone make the agent add them up; one total survives the grouping.
     let mut out = format!("{parsed} matches in {} files\n", groups.len());
-    for (shown, (path, seen, items)) in groups.iter().enumerate() {
-        if shown >= 200 && items.is_empty() {
-            let rest = groups[shown..].iter().filter(|g| g.2.is_empty()).count();
+    for (shown, (path, seen, kept_here, items)) in groups.iter().enumerate() {
+        // Files past the overall cap are still named, with their counts, up to the name budget.
+        if shown >= names && items.is_empty() {
+            let rest = groups.len() - shown;
             out.push_str(&format!("[qx] +{rest} more files with matches (cap reached)\n"));
             break;
         }
         out.push_str(path);
-        if *seen > items.len() {
-            out.push_str(&format!(" ({} of {seen})\n", items.len()));
-        } else {
-            out.push_str(&format!(" ({seen})\n"));
+        if seen > kept_here {
+            out.push_str(&format!(" ({kept_here} of {seen})"));
         }
+        out.push('\n');
         for (num, content) in items {
-            out.push_str("  ");
-            if !num.is_empty() {
+            if num.is_empty() {
+                out.push_str("  ");
+            } else {
                 out.push_str(num);
-                out.push_str(": ");
+                out.push(':');
             }
             out.push_str(content);
             out.push('\n');
@@ -1937,23 +2079,25 @@ fn grep(text: &str) -> Option<(String, usize, bool)> {
     Some((out, hidden, clipped || cut_lines > 0))
 }
 
-/// Minify a JSON reply. Never a file the agent asked to read: `cat package.json` is read to be edited.
-fn json_min(label: &str, text: &str) -> Option<(String, usize)> {
-    let t = text.trim();
-    if !(t.starts_with('{') || t.starts_with('[')) {
-        return None;
-    }
-    let reader = label.split_whitespace().next().unwrap_or("");
-    if matches!(reader, "cat" | "type" | "jq" | "get-content" | "gc" | "bat" | "head" | "tail" | "less" | "more") {
-        return None;
-    }
-    // Validate, then strip whitespace only: numbers and key order stay byte-exact. A raw value is
-    // checked without building the tree, which for a 16 MiB reply would be ten times its size.
-    serde_json::from_str::<&serde_json::value::RawValue>(t).ok()?;
+/// A JSON array of objects shows at most this many bytes of records (minified JSON; a table of them is
+/// smaller), split 3:1 between its first and last records (the tail shows what the list ends with).
+const JSON_RECORD_BYTES: usize = 2000;
+
+/// A file the agent reads whole is shown by plain compaction up to this many lines; only a longer one
+/// (which would be cut to its first and last lines anyway) is shown as records.
+const JSON_READ_LINES: usize = 200;
+
+/// Whitespace-stripped JSON and, for the first array of objects in it, the byte range of each element.
+/// Only whitespace outside strings goes: numbers and key order stay byte-exact.
+fn minify_json(t: &str) -> (String, Vec<(usize, usize)>) {
     let mut out = String::with_capacity(t.len());
-    let mut in_str = false;
-    let mut esc = false;
-    for ch in t.chars() {
+    let mut recs: Vec<(usize, usize)> = Vec::new();
+    let (mut in_str, mut esc) = (false, false);
+    let mut depth = 0usize;
+    // Depth of the record array while it is open (its elements' commas are at this depth).
+    let mut rec_depth: Option<usize> = None;
+    let mut found = false;
+    for (at, ch) in t.char_indices() {
         if in_str {
             out.push(ch);
             if esc {
@@ -1963,17 +2107,202 @@ fn json_min(label: &str, text: &str) -> Option<(String, usize)> {
             } else if ch == '"' {
                 in_str = false;
             }
-        } else if ch == '"' {
-            in_str = true;
-            out.push(ch);
-        } else if !ch.is_whitespace() {
-            out.push(ch);
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_str = true;
+                out.push(ch);
+            }
+            '[' | '{' => {
+                out.push(ch);
+                depth += 1;
+                if ch == '[' && !found && t[at + 1..].trim_start().starts_with('{') {
+                    found = true;
+                    rec_depth = Some(depth);
+                    recs.push((out.len(), 0));
+                }
+            }
+            ']' | '}' => {
+                if ch == ']' && rec_depth == Some(depth) {
+                    if let Some(last) = recs.last_mut() {
+                        last.1 = out.len();
+                    }
+                    rec_depth = None;
+                }
+                depth = depth.saturating_sub(1);
+                out.push(ch);
+            }
+            ',' => {
+                if rec_depth == Some(depth) {
+                    if let Some(last) = recs.last_mut() {
+                        last.1 = out.len();
+                    }
+                    out.push(ch);
+                    recs.push((out.len(), 0));
+                } else {
+                    out.push(ch);
+                }
+            }
+            c if c.is_whitespace() => {}
+            c => out.push(c),
         }
     }
-    if out.len() + 1 >= t.len() {
+    (out, recs)
+}
+
+/// Minify a JSON reply. A file the agent asked to read (`cat package.json`) is read to be edited, so it
+/// stays whole unless it is long enough for plain compaction to cut it. An array of objects is shown one
+/// minified record per line (the text stays valid JSON), so the byte budget keeps more records than the
+/// pretty-printed lines would, from the head and the tail; the rest is counted, and spooled by the
+/// caller as an omission. Once records are left out (the text is no longer the whole JSON anyway),
+/// records of one shape are shown as a table (`json_table`): the keys once, not on every record.
+fn json_min(label: &str, text: &str) -> Option<(String, usize)> {
+    let t = text.trim();
+    if !(t.starts_with('{') || t.starts_with('[')) {
         return None;
     }
-    Some((format!("{out}\n"), 0))
+    let reader = label.split_whitespace().next().unwrap_or("");
+    let reads = matches!(reader, "cat" | "type" | "jq" | "get-content" | "gc" | "bat" | "head" | "tail" | "less" | "more");
+    if reads && t.lines().count() <= JSON_READ_LINES {
+        return None;
+    }
+    // Validate, then strip whitespace only. A raw value is checked without building the tree, which for
+    // a 16 MiB reply would be ten times its size.
+    serde_json::from_str::<&serde_json::value::RawValue>(t).ok()?;
+    let (out, recs) = minify_json(t);
+    if recs.len() < 2 {
+        if reads || out.len() + 1 >= t.len() {
+            return None;
+        }
+        return Some((format!("{out}\n"), 0));
+    }
+    let n = recs.len();
+    let len = |k: usize| recs[k].1 - recs[k].0 + 1;
+    // The first and the last record always show (a cut one is spooled); more while the budget lasts.
+    let (mut head, mut head_used) = (1, len(0));
+    while head + 1 < n && head_used + len(head) <= JSON_RECORD_BYTES * 3 / 4 {
+        head_used += len(head);
+        head += 1;
+    }
+    let (mut tail, mut tail_used) = (1, len(n - 1));
+    while head + tail < n && tail_used + len(n - 1 - tail) <= JSON_RECORD_BYTES / 4 {
+        tail_used += len(n - 1 - tail);
+        tail += 1;
+    }
+    let hidden = n - head - tail;
+    let shown: Vec<usize> = (0..head).chain(n - tail..n).collect();
+    let table = if hidden > 0 { json_table(shown.iter().map(|&k| &out[recs[k].0..recs[k].1])) } else { None };
+    let mut s = String::with_capacity(head_used + tail_used + 128);
+    s.push_str(&out[..recs[0].0]);
+    s.push('\n');
+    if let Some((header, _)) = &table {
+        s.push_str(header);
+    }
+    for (i, &k) in shown.iter().enumerate() {
+        if k == n - tail && hidden > 0 {
+            s.push_str(&format!("[qx] {hidden} of {n} records not shown\n"));
+        }
+        match &table {
+            Some((_, rows)) => s.push_str(&rows[i]),
+            None => {
+                s.push_str(&out[recs[k].0..recs[k].1]);
+                if k + 1 < n {
+                    s.push(',');
+                }
+            }
+        }
+        s.push('\n');
+    }
+    s.push_str(&out[recs[n - 1].1..]);
+    s.push('\n');
+    if s.len() >= t.len() {
+        return None;
+    }
+    Some((s, hidden))
+}
+
+/// Records of one shape as a table: a header line `[qx] records as rows: id,name,address.zip`, then one
+/// row per record of its minified JSON values (`1,"ann","Z1"`). Every record must be an object with
+/// the same keys in the same order; an object value is flattened one level (`address.zip`), and a
+/// column with one value in each of 3+ rows is said once in the header: `(every row shown: tags=[])`.
+/// `None` keeps the records as JSON lines.
+fn json_table<'a>(records: impl Iterator<Item = &'a str>) -> Option<(String, Vec<String>)> {
+    let mut rows: Vec<Vec<(String, &str)>> = Vec::new();
+    for r in records {
+        let mut cells = Vec::new();
+        for (k, v) in json_members(r)? {
+            match json_members(v).filter(|m| !m.is_empty()) {
+                Some(sub) => cells.extend(sub.into_iter().map(|(s, sv)| (format!("{k}.{s}"), sv))),
+                None => cells.push((k.to_string(), v)),
+            }
+        }
+        if rows.first().is_some_and(|f| f.len() != cells.len() || f.iter().zip(&cells).any(|(a, b)| a.0 != b.0)) {
+            return None;
+        }
+        rows.push(cells);
+    }
+    let first = rows.first()?;
+    let fixed: Vec<bool> = (0..first.len()).map(|c| rows.len() >= 3 && rows.iter().all(|r| r[c].1 == first[c].1)).collect();
+    if fixed.iter().all(|&f| f) {
+        return None;
+    }
+    let pick = |row: &[(String, &'a str)], want: bool| -> Vec<(String, &'a str)> {
+        row.iter().zip(&fixed).filter(|(_, f)| **f == want).map(|(c, _)| c.clone()).collect()
+    };
+    let cols: Vec<String> = pick(first, false).into_iter().map(|(k, _)| k).collect();
+    let mut header = format!("[qx] records as rows: {}", cols.join(","));
+    let same: Vec<String> = pick(first, true).into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+    if !same.is_empty() {
+        header.push_str(&format!(" (every row shown: {})", same.join(", ")));
+    }
+    header.push('\n');
+    let rows = rows.iter().map(|r| pick(r, false).into_iter().map(|(_, v)| v).collect::<Vec<_>>().join(",")).collect();
+    Some((header, rows))
+}
+
+/// The `"key":value` members of a minified JSON object; `None` when `t` is not an object or a key is
+/// not a plain name a table header can show (empty, escaped, or holding `,.=` or a space).
+fn json_members(t: &str) -> Option<Vec<(&str, &str)>> {
+    let body = t.strip_prefix('{')?.strip_suffix('}')?;
+    let mut members = Vec::new();
+    if body.is_empty() {
+        return Some(members);
+    }
+    let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+    let mut cuts = Vec::new();
+    for (i, c) in body.bytes().enumerate() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.checked_sub(1)?,
+            b',' if depth == 0 => cuts.push(i),
+            _ => {}
+        }
+    }
+    cuts.push(body.len());
+    let mut from = 0;
+    for to in cuts {
+        let m = body[from..to].strip_prefix('"')?;
+        let q = m.find('"')?;
+        let (key, value) = (&m[..q], m[q + 1..].strip_prefix(':')?);
+        if key.is_empty() || key.contains(['\\', ',', '.', '=', ' ']) || value.is_empty() {
+            return None;
+        }
+        members.push((key, value));
+        from = to + 1;
+    }
+    Some(members)
 }
 
 #[cfg(test)]
@@ -2079,7 +2408,8 @@ mod tests {
     #[test]
     fn diff_folds_rename_and_keeps_mode_change_and_odd_headers() {
         let raw = "diff --git a/a.rs b/b.rs\nsimilarity index 95%\nrename from a.rs\nrename to b.rs\nindex 111..222 100644\n--- a/a.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\ndiff --git a/img.png b/img.png\nindex 1..2 100644\nBinary files a/img.png and b/img.png differ\ndiff --git i/odd.txt w/odd.txt\nindex 1..2 100644\n--- i/odd.txt\n+++ w/odd.txt\n@@ -1 +1 @@\n-p\n+q\n";
-        let out = trim_diff_headers(raw).unwrap();
+        let (out, folded) = trim_diff_headers(raw).unwrap();
+        assert!(!folded, "headers only: nothing lost");
         assert!(out.starts_with("diff a.rs -> b.rs (renamed 95%)\n@@ -1 +1 @@\n-x\n+y\n"), "{out}");
         assert!(out.contains("diff run.sh\nold mode 100644\nnew mode 100755\n"), "{out}");
         assert!(out.contains("diff img.png\nBinary files a/img.png and b/img.png differ\n"), "{out}");
@@ -2266,6 +2596,28 @@ mod tests {
     }
 
     #[test]
+    fn rustc_warnings_keep_span_labels_and_their_source_line() {
+        let raw = "warning: unreachable pattern\n --> src/main.rs:5:9\n  |\n4 |         Some(_) => 1,\n  |         ------- matches all the values already\n5 |         Some(1) => 2,\n  |         ^^^^^^^ no value can reach this\n  |\n  = note: `#[warn(unreachable_patterns)]` on by default\n";
+        let (out, _, _) = diagnostic(raw, 0, true).unwrap();
+        assert_has(&out, &[
+            "[unreachable_patterns]",
+            "--> src/main.rs:5:9",
+            "4 |         Some(_) => 1,",
+            "matches all the values already",
+            "5 |         Some(1) => 2,",
+            "no value can reach this",
+        ]);
+        assert!(!out.lines().any(|l| l.trim() == "|"), "{out}");
+    }
+
+    #[test]
+    fn rustc_pipe_row_help_survives() {
+        let raw = "warning: variable does not need to be mutable\n --> src/main.rs:2:9\n  |\n2 |     let mut x = 1;\n  |         ----^\n  |         |\n  |         help: remove this `mut`\n  |\n  = note: `#[warn(unused_mut)]` on by default\n";
+        let (out, _, _) = diagnostic(raw, 0, true).unwrap();
+        assert_has(&out, &["[unused_mut]", "help: remove this `mut`"]);
+    }
+
+    #[test]
     fn clippy_implied_lint_note_names_the_lint() {
         let raw = "error: unneeded `return` statement\n --> a.rs:1:1\n  |\n1 | x\n  |\n  = note: `-D clippy::needless_return` implied by `-D warnings`\n  = help: to override `-D warnings` add `#[allow(clippy::needless_return)]`\n";
         let (out, _, _) = diagnostic(raw, 1, true).unwrap();
@@ -2423,8 +2775,8 @@ mod tests {
         let raw = "src/a.rs:12:let x = 1;\nsrc/a.rs:40:let y = 2;\nsrc/b.rs:7:fn z() {}\n";
         let (out, _, _) = grep(raw).unwrap();
         assert_eq!(out.matches("src/a.rs").count(), 1);
-        assert!(out.contains("12: let x = 1;"));
-        assert!(out.contains("7: fn z() {}"));
+        assert!(out.contains("\n12:let x = 1;\n"), "{out}");
+        assert!(out.contains("src/b.rs\n7:fn z() {}\n"), "{out}");
     }
 
     #[test]
@@ -2471,6 +2823,16 @@ mod tests {
     }
 
     #[test]
+    fn paths_factor_a_shared_ending_that_starts_at_a_separator() {
+        let mut raw: String = ["a-x1.md", "b-x1.md", "c-x1.md"].iter().map(|n| format!("notes/{n}\n")).collect();
+        raw.push_str("t/a_test.rs\nt/b_test.rs\nt/c_test.rs\nv/a.rs\nv/ba.rs\nv/ca.rs\nw/x.y\nw/z.y\nw/.y\n");
+        let (out, _) = paths(&raw, true).unwrap();
+        assert!(out.contains("notes/{a,b,c}-x1.md\n") && out.contains("t/{a,b,c}_test.rs\n"), "{out}");
+        // The ending starts at a separator and leaves every stem a name.
+        assert!(out.contains("v/{a,ba,ca}.rs\n") && out.contains("w/{x.y,z.y,.y}\n"), "{out}");
+    }
+
+    #[test]
     fn grep_caps_per_file_without_dropping_later_files() {
         let mut raw = String::new();
         for i in 1..=40 {
@@ -2479,12 +2841,13 @@ mod tests {
         raw.push_str("late.rs:3:needle\nlate2.rs:9:needle\n");
         let (out, hidden, clipped) = grep(&raw).unwrap();
         assert!(clipped && hidden == 15, "{out}");
-        assert!(out.contains("big.rs (25 of 40)") && out.contains("late.rs (1)") && out.contains("9: needle"));
-        // past the overall cap, files are still named with their counts
+        assert!(out.contains("big.rs (25 of 40)") && out.contains("\nlate.rs\n3:needle\n") && out.contains("9:needle"), "{out}");
+        // The cap counts file names too, so the digest stays under the 400-line bound that would cut its middle.
         let many: String = (0..400).map(|i| format!("f{i}.rs:1:x\n")).collect();
         let (out, hidden, _) = grep(&many).unwrap();
-        assert_eq!(hidden, 100);
-        assert!(out.contains("f399.rs (1)") || out.contains("more files with matches"), "{out}");
+        assert_eq!(hidden, 400 - GREP_LINES / 2);
+        assert!(out.contains(&format!("\nf{}.rs\n1:x\n[qx] +{hidden} more files with matches (cap reached)\n", GREP_LINES / 2 - 1)), "{out}");
+        assert!(out.lines().count() < 400, "{out}");
     }
 
     #[test]
@@ -2502,8 +2865,8 @@ mod tests {
     fn grep_groups_rg_output_without_line_numbers() {
         let raw = "src\\a.rs:let x = 1; // a: b\nsrc\\a.rs:let y = 2;\nC:\\w\\b.rs:fn z() {}\nsrc\\a.rs:  \n";
         let (out, _, _) = grep(raw).unwrap();
-        assert_eq!(out.matches("src\\a.rs (").count(), 1, "{out}");
-        assert!(out.contains("  let x = 1; // a: b") && out.contains("C:\\w\\b.rs (1)"));
+        assert_eq!(out.matches("src\\a.rs\n").count(), 1, "{out}");
+        assert!(out.contains("  let x = 1; // a: b") && out.contains("C:\\w\\b.rs\n  fn z() {}\n"), "{out}");
         // `grep -c` / `-l` / prose are not matches
         assert!(split_match("src/a.rs:12").is_none() && split_match("src/a.rs").is_none());
         assert!(split_match("note: build failed").is_none() && split_match("é:é").is_none());
@@ -2821,6 +3184,159 @@ mod tests {
         assert!(json_min("curl http://x", raw).is_some());
     }
 
+    #[test]
+    fn git_log_says_a_shared_author_and_date_once() {
+        let c = |h: &str, who: &str, day: &str, s: &str| format!("commit {h}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nAuthor: {who} <x@y.z>\nDate:   {day} 12:00:00 2026 +0000\n\n    {s}\n\n");
+        let same = c("1111111", "T", "Tue Oct 14", "one") + &c("2222222", "T", "Tue Oct 14", "two");
+        let (out, _) = git_log(&same).unwrap();
+        assert!(out.starts_with("all by T, Oct 14 2026\n1111111 one\n2222222 two\n"), "{out}");
+        assert!(!out.contains("(T,"), "{out}");
+        // A different author or a different day keeps `(who, date)` on every line.
+        let other_who = c("1111111", "T", "Tue Oct 14", "one") + &c("2222222", "U", "Tue Oct 14", "two");
+        let other_day = c("1111111", "T", "Tue Oct 14", "one") + &c("2222222", "T", "Mon Oct 13", "two");
+        for raw in [other_who, other_day] {
+            let (out, _) = git_log(&raw).unwrap();
+            assert!(!out.contains("all by") && out.contains("1111111 one (T, Oct 14 2026)"), "{out}");
+            assert!(out.contains("2222222 two ("), "{out}");
+        }
+        // One entry has nothing to share.
+        let (out, _) = git_log(&c("1111111", "T", "Tue Oct 14", "one")).unwrap();
+        assert!(out.starts_with("1111111 one (T, Oct 14 2026)\n"), "{out}");
+    }
+
+    #[test]
+    fn git_ls_files_groups_folders_even_with_root_files_between() {
+        let mut raw = String::from(".gitignore\nCargo.toml\nREADME.md\n");
+        raw.extend((0..4).map(|i| format!("docs/review/r{i}.md\n")));
+        raw.extend((0..6).map(|i| format!("src/m{i}.rs\n")));
+        let expect = ".gitignore\nCargo.toml\nREADME.md\ndocs/review/{r0,r1,r2,r3}.md\nsrc/{m0,m1,m2,m3,m4,m5}.rs\n";
+        let d = digest("git ls-files", &raw, "", 0).expect("the path digest fires");
+        assert_eq!((d.profile, d.stdout.as_str()), ("paths", expect));
+        // Root names have no folder to share: they stay plain lines, never `{a,b}`.
+        assert!(!d.stdout.starts_with('{') && !d.stdout.contains("\n{"), "{}", d.stdout);
+        // Mostly plain names are still not a path list.
+        assert!(paths(&format!("{}a/b\n", "plain\n".repeat(20)), true).is_none());
+    }
+
+    #[test]
+    fn a_deleted_file_body_is_one_line() {
+        let deleted: String = "diff --git a/old.txt b/old.txt\ndeleted file mode 100644\nindex fe33913..0000000\n--- a/old.txt\n+++ /dev/null\n@@ -1,40 +0,0 @@\n".to_string()
+            + &(1..=40).map(|i| format!("-# old line {i}\n")).collect::<String>();
+        let tail = "diff --git a/b.txt b/b.txt\nindex 1..2 100644\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-x\n+y\n";
+        let raw = format!("{deleted}{tail}");
+        let want = "deleted old.txt (40 lines)\ndiff b.txt\n@@ -1 +1 @@\n-x\n+y\n";
+        assert_eq!(trim_diff_headers(&raw).unwrap(), (want.to_string(), true));
+        let d = digest("git diff", &raw, "", 0).unwrap();
+        assert_eq!(d.stdout, want);
+        assert!(d.clipped && d.lossy(), "a folded body is lossy, so the caller spools the full text");
+        // The condensing path of a long diff folds it the same way, and counts it as a change.
+        let (out, omitted, clipped) = git_diff(&raw).unwrap();
+        assert!(out.starts_with("deleted old.txt (40 lines)\ndiff b.txt\n") && !out.contains("old line 7"), "{out}");
+        assert!(omitted >= 40 && clipped, "{omitted}");
+        assert!(git_diff(&deleted).is_some(), "a diff of only a deleted file still has a change");
+        // A small deleted file stays whole, and loses nothing.
+        let small = "diff --git a/s.txt b/s.txt\ndeleted file mode 100644\nindex fe33913..0000000\n--- a/s.txt\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-a\n-b\n-c\n";
+        let (out, folded) = trim_diff_headers(small).unwrap();
+        assert!(out.contains("diff s.txt (deleted 100644)\n@@ -1,3 +0,0 @@\n-a\n-b\n-c\n") && !folded);
+        // A body that does not match its hunk header is not touched.
+        let torn = deleted.replace("-# old line 40\n", "");
+        assert!(trim_diff_headers(&torn).unwrap().0.contains("-# old line 39\n"));
+    }
+
+    #[test]
+    fn a_new_file_over_20_lines_keeps_its_first_5() {
+        let new = |n: usize| {
+            format!("diff --git a/n.txt b/n.txt\nnew file mode 100644\nindex 0000000..e69de29\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1,{n} @@\n")
+                + &(0..n).map(|i| format!("+line {i}\n")).collect::<String>()
+        };
+        let want = "diff n.txt (new 100644)\n@@ -0,0 +1,30 @@\n+line 0\n+line 1\n+line 2\n+line 3\n+line 4\n… 25 more lines\n";
+        assert_eq!(trim_diff_headers(&new(30)).unwrap(), (want.to_string(), true));
+        let (out, _, clipped) = git_diff(&new(30)).unwrap();
+        assert!(out == want && clipped);
+        let (twenty, folded) = trim_diff_headers(&new(20)).unwrap();
+        assert!(twenty.contains("+line 19\n") && !twenty.contains("more lines") && !folded, "{twenty}");
+    }
+
+    #[test]
+    fn a_diff_with_folded_whole_files_is_lossy_and_names_no_route() {
+        let deleted = "diff --git a/old.txt b/old.txt\ndeleted file mode 100644\nindex fe33913..0000000\n--- a/old.txt\n+++ /dev/null\n@@ -1,40 +0,0 @@\n".to_string()
+            + &(1..=40).map(|i| format!("-# old line {i}\n")).collect::<String>();
+        let new = "diff --git a/n.txt b/n.txt\nnew file mode 100644\nindex 0000000..e69de29\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1,51 @@\n".to_string()
+            + &(0..51).map(|i| format!("+line {i}\n")).collect::<String>();
+        let d = digest("git diff", &format!("{deleted}{new}"), "", 0).unwrap();
+        assert!(d.clipped && d.lossy(), "{}", d.stdout);
+        assert!(d.stdout.contains("deleted old.txt (40 lines)\n") && d.stdout.contains("… 46 more lines\n"), "{}", d.stdout);
+        assert!(!d.stdout.contains("full:"), "{}", d.stdout);
+    }
+
+    #[test]
+    fn a_json_array_of_objects_shows_one_record_per_line() {
+        let pretty = |n: usize, wrap: bool| {
+            let v: Vec<serde_json::Value> = (0..n).map(|i| serde_json::json!({"id": i, "name": format!("user-{i:04}"), "tags": ["a", "b"]})).collect();
+            if wrap { serde_json::to_string_pretty(&serde_json::json!({ "items": v })).unwrap() } else { serde_json::to_string_pretty(&v).unwrap() }
+        };
+        let (out, hidden) = json_min("curl http://x", &pretty(300, false)).unwrap();
+        assert!(out.starts_with("[\n[qx] records as rows: id,name (every row shown: tags=[\"a\",\"b\"])\n0,\"user-0000\"\n"), "{out}");
+        assert!(out.contains("\n7,\"user-0007\"\n"), "{out}");
+        assert!(out.ends_with("\n299,\"user-0299\"\n]\n"), "{out}");
+        assert!(hidden > 0 && out.contains(&format!("[qx] {hidden} of 300 records not shown\n")), "{out}");
+        assert!(!out.contains("\n150,") && out.len() <= JSON_RECORD_BYTES + 200, "{} bytes", out.len());
+        assert_eq!(out.lines().filter(|l| l.starts_with(|c: char| c.is_ascii_digit())).count() + hidden, 300);
+        // Few records all show, and the text is still the same valid JSON.
+        let (out, hidden) = json_min("curl http://x", &pretty(3, true)).unwrap();
+        assert!(out.starts_with("{\"items\":[\n{\"id\":0,") && out.ends_with("]}\n") && hidden == 0, "{out}");
+        let (a, b): (serde_json::Value, serde_json::Value) = (serde_json::from_str(&out).unwrap(), serde_json::from_str(&pretty(3, true)).unwrap());
+        assert_eq!(a, b);
+        // The digest spools what the budget cut.
+        let d = digest("curl http://x", &pretty(300, true), "", 0).unwrap();
+        assert!(d.profile == "json" && d.lossy() && d.stdout.contains("\n299,\"user-0299\"\n"), "{}", d.stdout);
+    }
+
+    #[test]
+    fn records_left_out_show_as_a_table_of_one_shape() {
+        let rec = |i: usize| serde_json::json!({"id": i, "addr": {"city": "X", "zip": format!("Z{i}")}, "on": i % 2 == 0});
+        let raw = serde_json::to_string_pretty(&(0..300).map(rec).collect::<Vec<_>>()).unwrap();
+        let (out, hidden) = json_min("curl http://x", &raw).unwrap();
+        assert!(out.starts_with("[\n[qx] records as rows: addr.zip,id,on (every row shown: addr.city=\"X\")\n\"Z0\",0,true\n"), "{out}");
+        assert!(out.ends_with("\n\"Z299\",299,false\n]\n") && hidden > 0, "{out}");
+        // Records of another shape, or a key a header cannot name, stay JSON lines.
+        for other in [raw.replacen("\"on\": true", "\"off\": true", 1), raw.replace("\"on\"", "\"o.n\"")] {
+            let (out, _) = json_min("curl http://x", &other).unwrap();
+            assert!(out.starts_with("[\n{\"addr\":{\"city\":\"X\",\"zip\":\"Z0\"},\"id\":0,"), "{out}");
+        }
+        let m = json_members("{\"a\":[1,{\"b\":2}],\"c\":\"x,y\"}").unwrap();
+        assert_eq!(m, vec![("a", "[1,{\"b\":2}]"), ("c", "\"x,y\"")]);
+    }
+
+    #[test]
+    fn a_long_file_read_shows_its_records_and_a_short_one_stays_whole() {
+        let recs = |n: usize| serde_json::to_string_pretty(&(0..n).map(|i| serde_json::json!({"id": i, "tags": ["a", "b"]})).collect::<Vec<_>>()).unwrap();
+        let (out, hidden) = json_min("cat data.json", &recs(300)).unwrap();
+        assert!(hidden > 0 && out.contains("\n299\n"), "{out}");
+        assert!(json_min("cat data.json", &recs(3)).is_none());
+        // Long but not records (one array of numbers): `cat` keeps its plain compaction.
+        let numbers = serde_json::to_string_pretty(&serde_json::json!({ "a": (0..300).collect::<Vec<_>>() })).unwrap();
+        assert!(numbers.lines().count() > JSON_READ_LINES && json_min("cat a.json", &numbers).is_none());
+    }
+
+    #[test]
+    fn grep_drops_the_indentation_of_a_match_but_keeps_its_line_number() {
+        let raw = "src/a.rs:12:        let x = 1;\nsrc/a.rs:40:\tlet y = 2;\nsrc/b.rs:7:    fn z() {}\n";
+        let (out, _, _) = grep(raw).unwrap();
+        assert!(out.contains("\n12:let x = 1;\n") && out.contains("\n40:let y = 2;\n") && out.contains("\n7:fn z() {}\n"), "{out}");
+    }
+
+    #[test]
+    fn grep_shows_the_same_text_of_one_file_once_with_every_line_number() {
+        let raw = "src/a.rs:3:fn twin() {\nsrc/a.rs:9:let x = 1;\nsrc/a.rs:20:    fn twin() {\nsrc/b.rs:4:fn twin() {\nsrc/a.rs:31:fn twin() {\n";
+        let (out, hidden, clipped) = grep(raw).unwrap();
+        assert_eq!(out, "5 matches in 2 files\nsrc/a.rs\n3,20,31:fn twin() {\n9:let x = 1;\nsrc/b.rs\n4:fn twin() {\n");
+        assert!(hidden == 0 && !clipped);
+        // Without line numbers there is nothing to merge into: each repeat stays a line.
+        let (out, _, _) = grep("a.txt:dup\na.txt:dup\na.txt:other\n").unwrap();
+        assert_eq!(out, "3 matches in 1 files\na.txt\n  dup\n  dup\n  other\n");
+    }
+
     /// What the caller sees: the digest's two streams, or `None` (generic compaction keeps the text).
     fn reply(d: Option<Digest>) -> Option<String> {
         d.map(|d| format!("{}{}", d.stdout, d.stderr))
@@ -2946,5 +3462,118 @@ mod tests {
         // A note this digest does not know declines rather than becoming a file.
         let slow = raw.replace("Your stash currently has 1 entry", "It took 5.12 seconds to enumerate untracked files.");
         assert!(git_status(&slow).is_none());
+    }
+
+    /// Every path a `paths` digest line stands for: `dir/{a,b}.rs` -> `dir/a.rs`, `dir/b.rs`.
+    fn expand_paths(out: &str) -> Vec<String> {
+        let mut all = Vec::new();
+        for l in out.lines() {
+            match (l.find('{'), l.rfind('}')) {
+                (Some(a), Some(b)) => all.extend(l[a + 1..b].split(',').map(|n| format!("{}{n}{}", &l[..a], &l[b + 1..]))),
+                _ => all.push(l.to_string()),
+            }
+        }
+        all.sort();
+        all
+    }
+
+    /// A `find` listing of a TypeScript tree: root files beside 60 folders of 1-30 files, every third
+    /// folder with nested subfolders. About 1300 lines, like a real `find . -name '*.ts'`.
+    fn ts_tree(prefix: &str) -> String {
+        let mut raw = String::new();
+        for d in 0..60 {
+            if d % 4 == 0 {
+                raw.push_str(&format!("{prefix}root-file-{d}.ts\n"));
+            }
+            for n in 0..1 + (d * 7) % 30 {
+                raw.push_str(&format!("{prefix}feature-area-{d}/module-{n}-handler.ts\n"));
+            }
+            if d % 3 == 0 {
+                for s in 0..3 {
+                    for n in 0..8 {
+                        raw.push_str(&format!("{prefix}feature-area-{d}/nested-{s}/part-{n}.ts\n"));
+                    }
+                }
+            }
+        }
+        raw
+    }
+
+    #[test]
+    fn a_long_find_listing_with_or_without_dot_slash_groups_by_directory_losslessly() {
+        for prefix in ["./", ""] {
+            let raw = ts_tree(prefix);
+            assert!(raw.lines().count() > 1000, "{}", raw.lines().count());
+            let d = digest("find . -name '*.ts'", &raw, "", 0).expect(prefix);
+            assert_eq!(d.profile, "paths");
+            assert!(!d.lossy() && !d.clipped, "{prefix}: a regrouped list loses nothing");
+            assert!(d.stdout.len() * 2 < raw.len(), "{prefix}: {} of {} bytes\n{}", d.stdout.len(), raw.len(), d.stdout);
+            let mut want: Vec<String> = raw.lines().map(str::to_string).collect();
+            want.sort();
+            assert_eq!(expand_paths(&d.stdout), want, "{prefix}: every path comes back from the groups");
+            // One line per folder (plus the root files): the folder name is said once, not per file.
+            assert!(d.stdout.lines().count() < 150, "{}", d.stdout);
+            assert!(d.stdout.contains(&format!("{prefix}feature-area-21/{{module-0,module-1,")), "{}", d.stdout);
+        }
+    }
+
+    /// `rg -n` over a Windows tree: `tools\modK\file-F.ts:LINE:  export function ...`, `per_file(f)`
+    /// matches in each of `files` files.
+    fn ts_matches(files: usize, per_file: impl Fn(usize) -> usize) -> String {
+        let mut raw = String::new();
+        for f in 0..files {
+            for i in 0..per_file(f) {
+                raw.push_str(&format!("tools\\mod{}\\file-{f}.ts:{}:  export function handler{f}x{i}(arg: string): string {{\n", f % 7, 10 * i + 3));
+            }
+        }
+        raw
+    }
+
+    #[test]
+    fn a_long_grep_groups_by_file_and_counts_every_match_it_cuts() {
+        let raw = ts_matches(130, |f| 1 + (f * 7) % 9 + if f % 29 == 0 { 30 } else { 0 });
+        let total = raw.lines().count();
+        assert!(total > 600, "{total}");
+        let d = digest("rg -n handler", &raw, "", 0).unwrap();
+        assert_eq!(d.profile, "search");
+        let out = &d.stdout;
+        assert!(out.starts_with(&format!("{total} matches in 130 files\n")), "{out}");
+        // Every file is named once, a capped one with how many of its matches show: 130 names fit the budget.
+        let mut shown_by_header = 0;
+        for f in 0..130 {
+            let path = format!("tools\\mod{}\\file-{f}.ts", f % 7);
+            let heads: Vec<&str> = out.lines().filter(|l| *l == path || l.starts_with(&format!("{path} ("))).collect();
+            assert_eq!(heads.len(), 1, "{path}\n{out}");
+            let n = raw.lines().filter(|l| l.starts_with(&format!("{path}:"))).count();
+            shown_by_header += match heads[0].strip_prefix(&format!("{path} (")) {
+                Some(rest) => {
+                    let (kept, of) = rest.trim_end_matches(')').split_once(" of ").unwrap();
+                    assert_eq!(of.parse::<usize>().unwrap(), n, "{}", heads[0]);
+                    kept.parse::<usize>().unwrap()
+                }
+                None => n,
+            };
+        }
+        // Under the 400-line bound: no file is cut out of the middle by compaction.
+        assert!(out.lines().count() < 400 && !out.contains("omitted"), "{out}");
+        let match_lines = out.lines().filter(|l| l.as_bytes()[0].is_ascii_digit()).count() - 1;
+        assert_eq!(match_lines, shown_by_header, "{out}");
+        assert!(out.contains(&format!("[qx] match cap reached: {} matches not shown\n", total - match_lines)), "{out}");
+        assert!(d.clipped && d.lossy(), "a cut digest must be spooled");
+        assert!(out.len() * 2 < raw.len(), "{} of {}", out.len(), raw.len());
+    }
+
+    #[test]
+    fn a_grep_under_the_caps_keeps_every_match_under_its_file() {
+        let raw = ts_matches(60, |f| 1 + f % 8);
+        assert!(raw.lines().count() > 250);
+        let d = digest("rg -n handler", &raw, "", 0).unwrap();
+        assert!(!d.lossy() && d.omitted == 0, "{}", d.stdout);
+        for l in raw.lines() {
+            let (path, num, text) = split_numbered(l).unwrap();
+            let file = d.stdout.split(&format!("{path}\n")).nth(1).expect(path);
+            assert!(file.lines().take_while(|x| !x.starts_with("tools\\")).any(|x| x == format!("{num}:{}", text.trim())), "{l}\n{}", d.stdout);
+        }
+        assert!(d.stdout.len() * 10 < raw.len() * 8, "{} of {}", d.stdout.len(), raw.len());
     }
 }

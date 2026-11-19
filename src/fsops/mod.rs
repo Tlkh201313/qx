@@ -189,7 +189,7 @@ pub fn call(args: &Value) -> Reply {
 const KNOWN_KEYS: &[&str] = &[
     "op", "cwd", "path", "file_path", "content", "old_string", "new_string", "replace_all", "ops", "paths", "edits",
     "pattern", "include", "offset", "limit", "max_results", "max_matches", "max_line_chars", "ignore_case", "literal",
-    "all", "context", "-C", "-A", "-B", "fresh",
+    "all", "context", "-C", "-A", "-B", "fresh", "n", "grep", "searches", "show",
 ];
 
 /// The keys of the call (and of each `ops` item) that no operation reads, in first-seen order.
@@ -319,14 +319,45 @@ fn dispatch(op: &str, args: &Value) -> Result<Reply, FsError> {
         "read" => read(&root, args),
         "write" => write(&root, args),
         "edit" => edit(&root, args),
-        "glob" => glob(&root, args),
-        "grep" => grep(&root, args),
+        "glob" => searched(&root, args, "glob", glob),
+        "grep" => searched(&root, args, "grep", grep),
         "list" => list(&root, args),
         "stat" => stat(&root, args),
+        "history" => history_op(&root, args),
         _ => Err(FsError::arg(
-            "op must be one of read, write, edit, glob, grep, list, stat",
+            "op must be one of read, write, edit, glob, grep, list, stat, history",
         )),
     }
+}
+
+/// Runs a `glob`/`grep` and notes it in the repo history (never replayed: the tree may differ next time).
+fn searched(root: &Root, args: &Value, op: &str, run: fn(&Root, &Value) -> Result<Reply, FsError>) -> Result<Reply, FsError> {
+    let started = Instant::now();
+    let reply = run(root, args)?;
+    if !reply.is_error {
+        let pattern = opt_str(args, "pattern").unwrap_or("");
+        let cmd = match path_arg(args).filter(|_| op == "grep") {
+            Some(p) => format!("grep {pattern} {p}"),
+            None => format!("{op} {pattern}"),
+        };
+        let hits = reply.structured["count"].as_u64();
+        crate::history::record(&root.cwd, &cmd, crate::history::Kind::Search, 0, started.elapsed().as_millis() as u64, "", hits, None);
+    }
+    Ok(reply)
+}
+
+/// `op=history`: what ran in this repo (`n`, `grep`, `searches`) or one entry in full (`show`).
+fn history_op(root: &Root, args: &Value) -> Result<Reply, FsError> {
+    let text = match opt_str(args, "show").filter(|k| !k.trim().is_empty()) {
+        Some(key) => crate::history::show(&root.cwd, key.trim())
+            .ok_or_else(|| FsError::arg(format!("no history entry {}", key.trim())))?,
+        None => {
+            let n = usize_arg(args, "n", 20, 1, 500)?;
+            let grep = opt_str(args, "grep").filter(|g| !g.is_empty());
+            crate::history::list(&root.cwd, n, grep, bool_arg(args, "searches", false), false)
+        }
+    };
+    Ok(Reply { text, structured: json!({ "op": "history" }), is_error: false })
 }
 
 // ---------------------------------------------------------------- arguments

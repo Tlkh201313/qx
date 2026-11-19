@@ -745,4 +745,98 @@ mod tests {
         assert!(!s.contains("rerun-if") && s.contains("12 cargo build-script lines omitted"), "{s}");
         let mut few = "cargo:rerun-if-changed=a\nV = None\n".to_string();
         assert_eq!(drop_build_noise(&mut few), 0);
-    }}
+    }
+
+    /// A reply built the way the MCP `run` reply and the CLI build it: noise dropped, digest or plain
+    /// compaction, a spool file for a cut, and the `full output:` line that names it.
+    fn reply_like_run(label: &str, stdout: &str, stderr: &str, code: i32) -> String {
+        use crate::digest;
+        let (mut so, mut se) = (stdout.to_string(), stderr.to_string());
+        drop_build_noise(&mut se);
+        drop_build_noise(&mut so);
+        digest::drop_git_eol_warnings(label, &mut se);
+        let (mut truncated, mut lossy) = (false, false);
+        let original = if let Some(d) = digest::digest(label, &so, &se, code) {
+            lossy = d.lossy();
+            truncated |= d.clipped;
+            (std::mem::replace(&mut so, d.stdout), std::mem::replace(&mut se, d.stderr))
+        } else {
+            let (max, head, tail) = digest::plain_budget(label, (200, 80, 60));
+            let (a, cut) = compact(&so, max, head, tail);
+            let (b, cut_err) = compact(&se, 120, 50, 40);
+            truncated |= cut | cut_err;
+            (std::mem::replace(&mut so, a), std::mem::replace(&mut se, b))
+        };
+        digest::shorten_paths("", label, &mut so, &mut se, None);
+        let mut text = so;
+        if !se.is_empty() {
+            text.push_str("[stderr]\n");
+            text.push_str(&se);
+        }
+        if truncated || lossy {
+            if let Some(p) = spool(&original.0, &original.1) {
+                text.push_str(&format!("\n[qx] full output: {}\n", p.display()));
+                std::fs::remove_file(p).ok();
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn every_cut_names_a_route_to_the_full_text() {
+        let generic: String = (0..1000).map(|i| format!("line w{i} w{}\n", i * 7 + 3)).collect();
+        let git_log: String = (0..120)
+            .map(|i| format!("commit {i:040x}\nAuthor: A <a@b.c>\nDate:   Mon Jan 1 00:00:00 2024 +0000\n\n    change number {i}\n\n"))
+            .collect();
+        let deleted: String = (0..40).map(|i| format!("-old line {i}\n")).collect();
+        let git_diff = format!(
+            "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\nindex 1234567..0000000\n--- a/gone.txt\n+++ /dev/null\n@@ -1,40 +0,0 @@\n{deleted}"
+        );
+        let big_diff: String = (0..30)
+            .map(|f| {
+                let body: String = (0..30).map(|i| format!("+added {f} {i}\n")).collect();
+                format!("diff --git a/f{f}.txt b/f{f}.txt\nindex 1234567..89abcde 100644\n--- a/f{f}.txt\n+++ b/f{f}.txt\n@@ -1,1 +1,31 @@\n ctx\n{body}")
+            })
+            .collect();
+        let json = format!(
+            "[{}]\n",
+            (0..300).map(|i| format!("{{\"id\":{i},\"name\":\"item {i}\",\"tags\":[\"a\",\"b\"]}}")).collect::<Vec<_>>().join(",")
+        );
+        let pretty_json = serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(&json).unwrap()).unwrap();
+        let grep: String = (0..300).map(|i| format!("src/m{}.rs:{}:let foo = {i};\n", i % 40, i + 1)).collect();
+        let build: String = (0..5000)
+            .map(|i| {
+                if i % 500 == 250 {
+                    format!("error[E0308]: mismatched types {i}\n --> src/m{i}.rs:{i}:5\n")
+                } else {
+                    format!("   Compiling crate{i} v0.1.{i}\n")
+                }
+            })
+            .collect();
+        let cases: [(&str, &str, i32); 8] = [
+            ("somecmd --all", &generic, 0),
+            ("git log", &git_log, 0),
+            ("git diff", &git_diff, 0),
+            ("git diff", &big_diff, 0),
+            ("cat x.json", &json, 0),
+            ("cat x.json", &pretty_json, 0),
+            ("rg foo", &grep, 0),
+            ("cargo build", &build, 101),
+        ];
+        for (label, input, code) in cases {
+            let (stdout, stderr) = if label == "cargo build" { ("", input) } else { (input, "") };
+            let text = reply_like_run(label, stdout, stderr, code);
+            let is_marker = |l: &str| l.starts_with("[qx]") || l.starts_with("[stderr]");
+            let kept = text.lines().filter(|l| !l.trim().is_empty() && !is_marker(l)).count();
+            // Noise the pipeline drops by design (build-script directives, a failed build's
+            // `Compiling` progress) is not content, so losing it needs no route.
+            let mut clean = input.to_string();
+            drop_build_noise(&mut clean);
+            let had = clean.lines().filter(|l| !l.trim().is_empty() && !crate::digest::routine_line(l.trim())).count();
+            let dropped = kept < had || text.contains("omitted") || text.contains(" more");
+            if dropped {
+                assert!(text.contains("[qx] full output: "), "`{label}` dropped lines but names no route:\n{text}");
+            }
+        }
+    }
+}

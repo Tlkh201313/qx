@@ -11,6 +11,7 @@ mod fsops;
 #[cfg(test)]
 mod fuzz;
 mod guard;
+mod history;
 mod hook;
 mod index;
 mod mcp;
@@ -24,12 +25,16 @@ mod stats;
 #[cfg_attr(test, allow(dead_code))] // `mcp::serve` starts it outside tests only
 mod warmup;
 
-use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::io::{IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Directory and command text of the captured CLI run in flight, set once after the guard passed so
+/// `emit` can write it to the repo history, with the tree fingerprint taken before the run.
+static HISTORY: std::sync::OnceLock<(PathBuf, String, Option<String>)> = std::sync::OnceLock::new();
 
 struct RunOpts {
     stream: bool,
@@ -69,8 +74,8 @@ fn main() {
 
 /// The first words `dispatch` takes as qx's own commands: `qx which git` is not `which git`.
 pub const SUBCOMMANDS: &[&str] = &[
-    "help", "version", "doctor", "bench", "deploy", "setup", "hook", "gain", "mcp", "serve", "which", "check",
-    "policy", "audit", "proxy",
+    "help", "version", "doctor", "bench", "deploy", "setup", "hook", "gain", "history", "mcp", "serve", "which", "check",
+    "policy", "audit", "proxy", "squeeze",
 ];
 
 fn dispatch(args: &[String]) -> i32 {
@@ -93,10 +98,12 @@ fn dispatch(args: &[String]) -> i32 {
         "setup" => setup::run(&args[1..]),
         "hook" => hook::run(&args[1..]),
         "gain" => gain(&args[1..]),
+        "history" => history_cmd(&args[1..]),
         "mcp" | "serve" => mcp::serve(),
         "which" => which(&args[1..]),
         "check" | "policy" => check_cmd(&args[1..]),
         "audit" => audit_cmd(&args[1..]),
+        "squeeze" => squeeze_cmd(&args[1..]),
         "proxy" => run_cli(&args[1..], true),
         _ => run_cli(args, false),
     }
@@ -281,6 +288,35 @@ fn run_cli(args: &[String], force_raw: bool) -> i32 {
         eprintln!("[qx guard] warning: {}", decision.summary());
     }
     guard::record("cli", &guard_command, &decision);
+
+    // A repeat of a passing test/lint run in an unchanged git tree is answered from memory (QX_FRESH=1 runs
+    // it for real). Only captured, uncut output is remembered: a terminal run, --raw, --head or --tail would
+    // store text that another call would not get.
+    if !o.stream && o.compact && !o.limited {
+        if let Some(dir) = o.cwd.clone().or_else(|| std::env::current_dir().ok()) {
+            let fresh = std::env::var("QX_FRESH").ok().as_deref() == Some("1");
+            let fp = match history::before(&dir, &guard_command, fresh) {
+                history::Before::Replay(code, text) => {
+                    write_out(&text, "");
+                    if !text.ends_with('\n') {
+                        write_out("\n", "");
+                    }
+                    stats::record_now(stats::Entry {
+                        tool: "cli",
+                        key: stats::first_word(&guard_command),
+                        ms: 0,
+                        code,
+                        raw: text.len(),
+                        reply: text.len(),
+                        flags: "replay",
+                    });
+                    return code;
+                }
+                history::Before::Run(fp) => fp,
+            };
+            let _ = HISTORY.set((dir, guard_command.clone(), fp));
+        }
+    }
 
     let (mut cmd, label) = if let Some(sh) = shell_cmd {
         // `CI=1 npm test`: the prefix goes to the child only, never into qx's own environment
@@ -516,6 +552,11 @@ fn emit(out: exec::Outcome, o: &RunOpts, label: &str) -> i32 {
 
     record_stat(label, out.elapsed.as_millis() as u64, out.code, bytes_in, bytes_out);
 
+    if let Some((dir, cmd, fp)) = HISTORY.get().filter(|_| !out.timed_out) {
+        let reply = format!("{so}{se}");
+        history::record_output(dir, cmd, out.code, out.elapsed.as_millis() as u64, &so, &reply, fp.clone());
+    }
+
     if std::env::var("QX_TIME").ok().as_deref() == Some("1") {
         eprintln!("[qx] {} ms, exit {}", out.elapsed.as_millis(), out.code);
     }
@@ -542,19 +583,78 @@ fn record_stat(label: &str, ms: u64, code: i32, bytes_in: usize, bytes_out: usiz
     });
 }
 
-/// `qx gain [--since 7d]`: what the ledger holds, per tool and command.
+/// `qx gain [--since 7d] [--line|--json]`: what the ledger holds, per tool and command; `--line` is the
+/// one-line summary for agent-CLI widgets, `--json` the same figures as an object.
 fn gain(rest: &[String]) -> i32 {
-    let since = match rest.iter().position(|a| a == "--since") {
-        Some(i) => match rest.get(i + 1).and_then(|s| stats::parse_since(s)) {
-            Some(s) => s,
-            None => {
-                eprintln!("usage: qx gain [--since 7d|12h|30m]");
-                return 2;
-            }
-        },
-        None => 0,
+    let (mut since, mut fmt, mut bad) = (None, stats::Format::Text, false);
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--line" => fmt = stats::Format::Line,
+            "--json" => fmt = stats::Format::Json,
+            "--since" => match it.next().and_then(|s| stats::parse_since(s)) {
+                Some(s) => since = Some(s),
+                None => bad = true,
+            },
+            _ => bad = true,
+        }
+    }
+    if bad {
+        eprintln!("usage: qx gain [--since 7d|12h|30m] [--line|--json]");
+        return 2;
+    }
+    stats::report(since.unwrap_or(0), fmt)
+}
+
+/// `qx history [-n 20] [--grep TEXT] [--searches] [--show KEY] [--brief]`: what ran in this repo and what
+/// came of it, from the per-repo history that answers repeats (see `history`).
+fn history_cmd(rest: &[String]) -> i32 {
+    let (mut n, mut grep, mut show, mut searches, mut brief, mut bad) = (20usize, None, None, false, false, false);
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-n" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(v) => n = v,
+                None => bad = true,
+            },
+            "--grep" => match it.next() {
+                Some(v) => grep = Some(v.as_str()),
+                None => bad = true,
+            },
+            "--show" => match it.next() {
+                Some(v) => show = Some(v.as_str()),
+                None => bad = true,
+            },
+            "--searches" => searches = true,
+            "--brief" => brief = true,
+            _ => bad = true,
+        }
+    }
+    let Some(cwd) = std::env::current_dir().ok().filter(|_| !bad) else {
+        eprintln!("usage: qx history [-n 20] [--grep TEXT] [--searches] [--show KEY] [--brief]");
+        return 2;
     };
-    stats::report(since)
+    if let Some(key) = show {
+        return match history::show(&cwd, key) {
+            Some(text) => {
+                write_out(&text, "");
+                if !text.ends_with('\n') {
+                    write_out("\n", "");
+                }
+                0
+            }
+            None => {
+                eprintln!("qx: no history entry {key}");
+                1
+            }
+        };
+    }
+    let text = history::list(&cwd, n, grep, searches, brief);
+    write_out(&text, "");
+    if !text.ends_with('\n') {
+        write_out("\n", "");
+    }
+    0
 }
 
 fn check_cmd(rest: &[String]) -> i32 {
@@ -679,6 +779,78 @@ fn which(names: &[String]) -> i32 {
     0
 }
 
+/// `qx squeeze --label L [--code N] [--cwd DIR] [--max-ratio PCT]`: stdin is the output of command line `L`
+/// (an agent's native grep, glob or test run that exited `N`, default 0); the digest of it goes to stdout, with
+/// a line naming the file that holds the full text. Input the digest does not shrink is printed as it is, with
+/// secrets redacted and colour stripped, and so is a digest that cut lines when no full copy can be saved; one
+/// that only regrouped is printed without the route then. Every call is counted in `qx gain`, shrunk or not.
+/// With `--cwd DIR` the command also goes into DIR's repo history (`qx history`, never replayed), so commands the
+/// agent ran itself are listed with those qx ran.
+fn squeeze_cmd(rest: &[String]) -> i32 {
+    let (mut label, mut ratio, mut code, mut cwd) = (None, 100u64, 0i32, None);
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        let bad = match a.as_str() {
+            "--label" => flag_value(a, it.next(), "a command line").map(|v| label = Some(v.clone())),
+            "--cwd" => flag_value(a, it.next(), "a directory").map(|v| cwd = Some(v.clone())),
+            "--code" => flag_num(a, it.next(), false).map(|n| code = n as u32 as i32),
+            "--max-ratio" => flag_num(a, it.next(), false).map(|n| ratio = n.clamp(1, 100)),
+            _ => Err(format!("unknown argument {a}")),
+        };
+        if let Err(e) = bad {
+            eprintln!("qx squeeze: {e}");
+            return 2;
+        }
+    }
+    let Some(label) = label else {
+        eprintln!("qx squeeze: needs --label \"<command line>\"");
+        return 2;
+    };
+    let mut raw = Vec::new();
+    if let Err(e) = std::io::stdin().lock().read_to_end(&mut raw) {
+        eprintln!("qx squeeze: cannot read stdin: {e}");
+        return 1;
+    }
+    let started = Instant::now();
+    let text = clean_text(String::from_utf8_lossy(&raw).into_owned());
+    let digest = squeeze(&label, &text, ratio, code);
+    let printed = digest.as_deref().unwrap_or(&text);
+    write_out(printed, "");
+    record_stat(&label, started.elapsed().as_millis() as u64, code, raw.len(), printed.len());
+    if let Some(dir) = cwd {
+        history::record_output(Path::new(&dir), &label, code, 0, &text, printed, None);
+    }
+    0
+}
+
+/// Secrets redacted and colour stripped, as for a run.
+fn clean_text(text: String) -> String {
+    let (mut text, _) = if std::env::var("QX_REDACT").ok().as_deref() == Some("off") { (text, 0) } else { redact_text(text) };
+    if text.contains('\x1b') {
+        text = compact::strip_ansi(&text);
+    }
+    text
+}
+
+/// The digest of `text` (already `clean_text`) as the output of `label` that exited `code`, or `None` to
+/// print `text` as it is. A digest counts only when the whole reply (route line included) is at most
+/// `ratio` percent of the input.
+fn squeeze(label: &str, text: &str, ratio: u64, code: i32) -> Option<String> {
+    let fits = |len: usize| (len as u64).saturating_mul(100) <= (text.len() as u64).saturating_mul(ratio);
+    let d = digest::digest(label, text, "", code)?;
+    let body = format!("{}{}", d.stdout, d.stderr);
+    if body.is_empty() || !fits(body.len()) {
+        return None;
+    }
+    // Saved even when the digest dropped nothing (a regrouped path list): the reply names its full text.
+    // A digest that lost nothing still stands when the copy cannot be written (no writable temp dir);
+    // one that cut lines needs the route.
+    let Some(path) = compact::spool(text, "") else { return (!d.lossy()).then_some(body) };
+    let sep = if body.ends_with('\n') { "" } else { "\n" };
+    let reply = format!("{body}{sep}[qx] full output: {}\n", path.display());
+    fits(reply.len()).then_some(reply)
+}
+
 fn print_help() {
     println!(
         r#"qx {VERSION} — fast local command executor
@@ -693,7 +865,11 @@ USAGE
                                      register qx in each agent CLI's config
   qx hook claude                     Claude Code PreToolUse hook (`qx setup` registers it)
   qx which <command>...              show the real binary that will run
-  qx gain [--since 7d]               calls, timings and output savings per tool (QX_STATS=off stops recording)
+  qx squeeze --label "<cmd line>" [--code N] [--cwd DIR] [--max-ratio PCT]
+                                     digest stdin as the output of that command, which exited N (a search, path list, test or build run shrinks, cuts name the full text); else stdin with secrets redacted and colour stripped. Counted in `qx gain`; --cwd DIR also lists the command in `qx history`
+  qx gain [--since 7d] [--line|--json]  calls, timings and output savings per tool; --line: one-line summary (QX_STATS=off stops recording)
+  qx history [-n 20] [--grep TEXT] [--searches] [--show KEY] [--brief]
+                                     commands already run in this repo, with exit code and age (a repeat of a passing test/lint run on an unchanged tree is answered from memory, reply included; QX_FRESH=1 reruns)
   qx check <program|command>         dry-run the safety gate
   qx audit [N]                       review recent warnings/blocks
 
@@ -854,5 +1030,44 @@ mod tests {
         assert!(streams(true, None, Some("off")));
         assert!(streams(true, Some(true), Some("1")), "an explicit --stream wins");
         assert!(!streams(false, None, None));
+    }
+
+    #[test]
+    fn squeeze_shrinks_a_search_and_names_the_full_text() {
+        let text: String = (1..=60).map(|n| format!("src/mod{}/file.rs:{n}:    let value = compute_something({n}, other_argument);\n", n % 4)).collect();
+        let out = squeeze("rg -n compute_something", &text, 100, 0).expect("a search of 60 hits shrinks");
+        assert!(out.len() < text.len(), "{out}");
+        let route = out.lines().find(|l| l.starts_with("[qx] full output: ")).expect(&out);
+        let spooled = fs::read_to_string(route.trim_start_matches("[qx] full output: ")).unwrap();
+        assert_eq!(spooled, text);
+    }
+
+    #[test]
+    fn squeeze_shrinks_a_path_list_and_keeps_a_route() {
+        let text: String = (1..=80).map(|n| format!("./src/deep/dir{}/module_{n}.rs\n", n % 2)).collect();
+        let out = squeeze("find . -name *.rs", &text, 100, 0).expect("a path list shrinks");
+        assert!(out.len() < text.len(), "{out}");
+        assert!(out.lines().any(|l| l.starts_with("[qx] full output: ")), "{out}");
+    }
+
+    #[test]
+    fn squeeze_leaves_small_unparsable_and_over_ratio_input_alone() {
+        let small = "src/a.rs:1:fn a() {}\nsrc/b.rs:2:fn b() {}\n";
+        assert_eq!(squeeze("rg -n fn", small, 100, 0), None);
+        let prose = "no matches here\n".repeat(100);
+        assert_eq!(squeeze("rg -n x", &prose, 100, 0), None);
+        let text: String = (1..=60).map(|n| format!("src/mod{}/file.rs:{n}:    let value = compute_something({n}, other_argument);\n", n % 4)).collect();
+        assert_eq!(squeeze("rg -n compute_something", &text, 1, 0), None);
+    }
+
+    #[test]
+    fn squeeze_passes_the_exit_code_to_the_digest() {
+        // A column-0 line that is neither a failure nor progress: a red run keeps it, a green run drops it.
+        let mut text: String = (0..60).map(|i| format!("test case_{i} ... ok\n")).collect();
+        text.push_str("\nfailures:\n\n---- case_bad stdout ----\nthread 'case_bad' panicked at src/lib.rs:9:5:\nboom\n\nfailures:\n    case_bad\n\nharness note: seed_marker_7\ntest result: FAILED. 60 passed; 1 failed; 0 filtered out\n");
+        let red = squeeze("cargo test", &text, 100, 101).expect("a failed test run shrinks");
+        let green = squeeze("cargo test", &text, 100, 0).expect("the same text still shrinks");
+        assert!(red.contains("panicked at") && green.contains("panicked at"), "{red}\n{green}");
+        assert!(red.contains("seed_marker_7") && !green.contains("seed_marker_7"), "{red}\n{green}");
     }
 }

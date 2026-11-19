@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 
 const PROTOCOL = "2024-11-05";
 
@@ -193,4 +193,45 @@ function untilAborted(promise, signal) {
     signal.addEventListener("abort", onAbort, { once: true });
     promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
   });
+}
+
+/**
+ * Show qx's one-line savings summary in pi's footer: once now, then every `intervalMs`.
+ * Async exec with a 2 s cap; on failure or empty output the status is cleared. Returns a stop function.
+ */
+export function watchGain(exe, ui, theme, intervalMs = 10000) {
+  if (!ui?.setStatus) return () => {};
+  let stopped = false;
+  const color = (text) => {
+    try {
+      return theme?.fg ? theme.fg("accent", text) : text;
+    } catch {
+      return text;
+    }
+  };
+  // Set on every tick, not just on change, so a status the host dropped is redrawn; a failed run
+  // clears it instead of leaving stale numbers.
+  const show = (text) => {
+    try {
+      if (!stopped) ui.setStatus("qx", text ? color(text) : undefined);
+    } catch {
+      // A status line must never break pi.
+    }
+  };
+  const refresh = () => {
+    try {
+      execFile(exe, ["gain", "--line"], { timeout: 2000, windowsHide: true, encoding: "utf8" }, (err, stdout) => {
+        show(err ? "" : String(stdout).trim());
+      });
+    } catch {
+      show("");
+    }
+  };
+  refresh();
+  const timer = setInterval(refresh, intervalMs);
+  timer.unref?.();
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
 }

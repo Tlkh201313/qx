@@ -24,8 +24,9 @@ BASE = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Temp" / "vsrtk"
 FX = BASE / "fx"
 QX = os.environ.get("QX_EXE") or str(Path.home() / ".cargo" / "bin" / "qx.exe")
 RTK = shutil.which("rtk") or str(Path.home() / ".cargo" / "bin" / "rtk.exe")
+# QX_HISTORY=off: a re-run in an unchanged tree would replay a "[qx] unchanged since ..." stub.
 ENV = dict(os.environ, CARGO_TARGET_DIR=str(BASE / "cargo-target"), GIT_TERMINAL_PROMPT="0",
-           QX_STATS="off", QX_RUN_MEMORY="off", QX_WARM="off")
+           QX_STATS="off", QX_RUN_MEMORY="off", QX_WARM="off", QX_HISTORY="off")
 # Git Bash agents see Git usr\bin before System32 (find/sort); give raw and rtk the same PATH.
 GITBIN = r"C:\Program Files\Git\usr\bin"
 ENV_SH = dict(ENV, PATH=GITBIN + os.pathsep + ENV.get("PATH", ""))

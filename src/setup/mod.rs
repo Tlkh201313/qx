@@ -76,37 +76,76 @@ pub struct Change {
 
 /// One entry per client; editing a file twice for one client is a bug.
 pub fn plan(c: Client, p: &Paths, exe: &Path, a: Action) -> Result<Vec<Change>, String> {
+    plan_with(c, p, exe, a, crate::resolve::find_on_path("node").is_some())
+}
+
+/// `plan`, with whether `node` resolves on PATH given: the Claude statusLine is a node script.
+fn plan_with(c: Client, p: &Paths, exe: &Path, a: Action, node: bool) -> Result<Vec<Change>, String> {
     match c {
-        Client::ClaudeCode => Ok(vec![
-            Change {
+        Client::ClaudeCode => {
+            let settings = claude_settings(p);
+            let script = claude_dir(p).join("qx-statusline.js");
+            let sidecar = claude_dir(p).join("qx-statusline.json");
+            let sidecar_text = read_optional(&sidecar)?;
+            // An unreadable settings file is refused by its own edit, not by the whole plan; the
+            // sidecar sees it as "unknown" and is left alone.
+            let settings_text = read_optional(&settings);
+            // Without node the statusLine could not run: install leaves settings.json's slot, the
+            // script and the sidecar alone. Remove always runs, so it can give back what was there.
+            let line = a == Action::Remove || node;
+            let wanted = if line {
+                claude_sidecar(settings_text.as_ref().map(Option::as_deref).map_err(|_| ()), sidecar_text.as_deref(), a)
+            } else {
+                None
+            };
+            let settings_edit = edit_claude_settings(&settings, exe, &script, sidecar_text.as_deref(), line, a);
+            // A removal that refuses leaves qx's statusLine in place, so the script and the record of
+            // what to restore must stay with it.
+            let keep = !line || (a == Action::Remove && matches!(settings_edit, Edit::Refuse(_)));
+            let (script_edit, sidecar_edit) = if keep {
+                (Edit::Unchanged, Edit::Unchanged)
+            } else {
+                (
+                    edit_generated(&script, fill_exe(STATUSLINE_SCRIPT, exe), a),
+                    wanted.map_or(Edit::Unchanged, |wanted| edit_generated(&sidecar, wanted, a)),
+                )
+            };
+            let mcp = Change {
                 client: c,
                 file: claude_file(p),
                 edit: edit_json_file(claude_file(p).as_path(), &["mcpServers", "qx"], |existing| {
                     claude_entry(exe, existing)
                 }, a),
-            },
-            Change {
-                client: c,
-                file: claude_settings(p),
-                edit: edit_claude_hook(&claude_settings(p), exe, a),
-            },
-        ]),
+            };
+            let script = Change { client: c, edit: script_edit, file: script };
+            let sidecar = Change { client: c, edit: sidecar_edit, file: sidecar };
+            let settings = Change { client: c, edit: settings_edit, file: settings };
+            // The settings file points at the script and names the sidecar's record: on install they
+            // are written first, so a failed write never leaves the statusLine without them. On
+            // remove the statusLine goes first, so a failure never leaves it without its script.
+            Ok(match a {
+                Action::Install => vec![mcp, script, sidecar, settings],
+                Action::Remove => vec![mcp, settings, script, sidecar],
+            })
+        }
         Client::OpenCode => {
             let file = opencode_file(p);
             // V1 lists servers directly under `mcp`; V2 under `mcp.servers`. A file shows which one
             // it is; a new file gets V2's shape.
             let v1 = read_optional(&file)?.as_deref().is_some_and(opencode_v1);
             let path: &[&str] = if v1 { &["mcp", "qx"] } else { &["mcp", "servers", "qx"] };
-            Ok(vec![Change {
-                client: c,
-                file: file.clone(),
-                edit: edit_json_file(
-                    &file,
-                    path,
-                    |existing| if v1 { opencode_entry_v1(exe, existing) } else { opencode_entry(exe, existing) },
-                    a,
-                ),
-            }])
+            Ok(vec![
+                Change {
+                    client: c,
+                    file: file.clone(),
+                    edit: edit_json_file(
+                        &file,
+                        path,
+                        |existing| if v1 { opencode_entry_v1(exe, existing) } else { opencode_entry(exe, existing) },
+                        a,
+                    ),
+                },
+            ])
         }
         Client::Codex => {
             let file = p.codex_home.join("config.toml");
@@ -141,11 +180,15 @@ pub fn plan(c: Client, p: &Paths, exe: &Path, a: Action) -> Result<Vec<Change>, 
             .collect()),
         Client::Cursor => {
             let file = cursor_file(p);
-            Ok(vec![Change {
-                client: c,
-                file: file.clone(),
-                edit: edit_json_file(&file, &["mcpServers", "qx"], |existing| cursor_entry(exe, existing), a),
-            }])
+            let config = cursor_config(p);
+            Ok(vec![
+                Change {
+                    client: c,
+                    file: file.clone(),
+                    edit: edit_json_file(&file, &["mcpServers", "qx"], |existing| cursor_entry(exe, existing), a),
+                },
+                Change { client: c, edit: edit_cursor_statusline(&config, exe, a), file: config },
+            ])
         }
         Client::Omp => {
             let file = p.omp_agent_dir.join("mcp.json");
@@ -165,6 +208,9 @@ pub fn plan(c: Client, p: &Paths, exe: &Path, a: Action) -> Result<Vec<Change>, 
 
 /// omp's `bash` hook: omp mounts MCP tools under `xd://`, so its own shell is where qx pays off.
 const OMP_EXTENSION: &str = include_str!("../../integrations/omp/qx.js");
+
+/// The Claude Code status line: chains the user's own one and appends `qx gain --line`.
+const STATUSLINE_SCRIPT: &str = include_str!("../../integrations/statusline/qx-statusline.js");
 
 fn omp_extension(p: &Paths) -> PathBuf {
     p.omp_agent_dir.join("extensions").join("qx.js")
@@ -223,10 +269,213 @@ fn claude_file(p: &Paths) -> PathBuf {
 
 /// The hooks live in the user settings, not next to the MCP servers in `.claude.json`.
 fn claude_settings(p: &Paths) -> PathBuf {
-    match &p.claude_config_dir {
-        Some(dir) => dir.join("settings.json"),
-        None => p.home.join(".claude").join("settings.json"),
+    claude_dir(p).join("settings.json")
+}
+
+/// Where Claude Code keeps its settings, and where qx puts the status line script beside them.
+fn claude_dir(p: &Paths) -> PathBuf {
+    p.claude_config_dir.clone().unwrap_or_else(|| p.home.join(".claude"))
+}
+
+const STATUS_LINE: &[&str] = &["statusLine"];
+
+/// Claude runs this through Git Bash on Windows, so the script path takes forward slashes. It starts
+/// from the user's previous `statusLine` object, so `padding` and the like survive; only `type` and
+/// `command` are qx's. No `refreshInterval`: qx forcing one would rerun the user's script on a timer.
+fn claude_statusline_value(script: &Path, previous: Option<&Value>) -> Value {
+    let script = script.to_string_lossy().replace('\\', "/");
+    let mut value = previous.filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({}));
+    value["type"] = json!("command");
+    value["command"] = json!(format!("node \"{script}\""));
+    value
+}
+
+/// PowerShell rejects a quoted program name followed by arguments, so only a path with a space is quoted.
+fn cursor_statusline_value(exe: &Path) -> Value {
+    let exe = exe.to_string_lossy();
+    let exe = if exe.contains(char::is_whitespace) { format!("\"{exe}\"") } else { exe.into_owned() };
+    json!({
+        "type": "command",
+        "command": format!("{exe} gain --line"),
+        "updateIntervalMs": 10000,
+        "timeoutMs": 2000,
+    })
+}
+
+/// A statusLine value qx wrote: Claude's `node ".../qx-statusline.js"` or Cursor's `qx gain --line`
+/// (the exe quoted when its path has a space).
+fn is_qx_statusline(v: &Value) -> bool {
+    let Some(cmd) = v["command"].as_str() else { return false };
+    if cmd.contains("qx-statusline.js") {
+        return true;
     }
+    let Some(exe) = cmd.strip_suffix(" gain --line") else { return false };
+    let exe = exe.strip_prefix('"').and_then(|e| e.strip_suffix('"')).unwrap_or(exe);
+    Path::new(exe).file_stem().is_some_and(|s| s.eq_ignore_ascii_case("qx"))
+}
+
+/// What the `statusLine` member of a settings text holds.
+enum Slot {
+    Free,
+    Value(std::ops::Range<usize>, Value),
+    /// The member exists but its text does not parse (or the document itself does not).
+    Unreadable,
+}
+
+fn statusline_slot(text: &str) -> Slot {
+    match jsonc::member(text, STATUS_LINE) {
+        Ok(None) => Slot::Free,
+        Ok(Some(range)) => match serde_json::from_str(&jsonc::to_strict_json(&text[range.clone()])) {
+            Ok(value) => Slot::Value(range, value),
+            Err(_) => Slot::Unreadable,
+        },
+        Err(_) => Slot::Unreadable,
+    }
+}
+
+/// A blank file is an empty document (see `jsonc`), though it is not valid JSON.
+fn is_blank(text: &str) -> bool {
+    text.trim_start_matches('\u{feff}').trim().is_empty()
+}
+
+/// The sidecar: what `statusLine` held before qx took the slot. `raw` is that value's own source
+/// text, so removing qx gives back its bytes (comments, indentation) and not a re-print.
+fn render_sidecar(previous: &Value, raw: Option<&str>) -> String {
+    let mut doc = json!({"previous": previous});
+    if let Some(raw) = raw {
+        doc["raw"] = json!(raw);
+    }
+    format!("{}\n", serde_json::to_string_pretty(&doc).unwrap_or_default())
+}
+
+/// The previous value and its source text, or `None` when there is no usable sidecar.
+fn parse_sidecar(text: Option<&str>) -> Option<(Value, Option<String>)> {
+    let doc = serde_json::from_str::<Value>(text.filter(|t| is_sidecar(t))?).ok()?;
+    Some((doc["previous"].clone(), doc["raw"].as_str().map(str::to_string)))
+}
+
+/// Whether `text` is a sidecar as `render_sidecar` writes it.
+fn is_sidecar(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|doc| doc.as_object().map(|m| m.contains_key("previous") && m.keys().all(|k| k == "previous" || k == "raw")))
+        .unwrap_or(false)
+}
+
+/// What the sidecar must hold after this run; `None` leaves the file as it is. A slot that already
+/// holds qx's own value keeps whatever sidecar there is (even a missing or corrupt one): qx's value
+/// is never stored as the one to restore, and "nothing before" is never guessed when settings.json
+/// could not be read.
+fn claude_sidecar(settings: Result<Option<&str>, ()>, sidecar: Option<&str>, a: Action) -> Option<String> {
+    let none = || Some(render_sidecar(&Value::Null, None));
+    // The file is gone: the sidecar goes with it, or records that nothing was there before.
+    let Some(text) = settings.ok()? else { return if a == Action::Install { none() } else { Some(String::new()) } };
+    if !is_blank(text) && parse_strict(text).is_none() {
+        return None;
+    }
+    match (statusline_slot(text), a) {
+        (Slot::Unreadable, _) => None,
+        (Slot::Free, Action::Install) => none(),
+        (Slot::Free, Action::Remove) => Some(String::new()),
+        (Slot::Value(_, v), Action::Install) if is_qx_statusline(&v) => None,
+        (Slot::Value(range, v), Action::Install) => Some(render_sidecar(&v, Some(&text[range]))),
+        // qx's statusLine can only be restored from a usable sidecar, which then goes with it.
+        (Slot::Value(_, v), Action::Remove) if is_qx_statusline(&v) => parse_sidecar(sidecar).map(|_| String::new()),
+        (Slot::Value(..), Action::Remove) => Some(String::new()),
+    }
+}
+
+/// `current` with `statusLine` pointed at qx's script (Install) or given back what it held (Remove).
+fn claude_statusline_text(current: &str, script: &Path, sidecar: Option<&str>, a: Action) -> Result<String, String> {
+    let slot = statusline_slot(current);
+    match a {
+        Action::Install => {
+            // The base for qx's value is what the user had: the sidecar's record when qx holds the slot
+            // (a slot of qx's own keeps nothing of an older qx but its record), else the slot itself.
+            let base = match &slot {
+                Slot::Unreadable => {
+                    return Err("the statusLine entry cannot be parsed, so qx will not overwrite it: edit it by hand".into());
+                }
+                Slot::Free => None,
+                Slot::Value(_, v) if is_qx_statusline(v) => Some(parse_sidecar(sidecar).map_or_else(|| v.clone(), |(previous, _)| previous)),
+                Slot::Value(_, v) => Some(v.clone()),
+            };
+            let ours = claude_statusline_value(script, base.as_ref());
+            match slot {
+                Slot::Value(_, v) if v == ours => Ok(current.to_string()),
+                _ => jsonc::set_member(current, STATUS_LINE, &ours),
+            }
+        }
+        Action::Remove => {
+            // A slot the user has since taken over for something else is theirs.
+            let Slot::Value(range, v) = slot else {
+                return Ok(current.to_string());
+            };
+            if !is_qx_statusline(&v) {
+                return Ok(current.to_string());
+            }
+            // Without the record there is no telling what to give back, and deleting the key could
+            // destroy the user's old status line.
+            let Some((previous, raw)) = parse_sidecar(sidecar) else {
+                return Err("the previous statusLine is unknown (sidecar missing): edit settings.json by hand".into());
+            };
+            if previous.is_null() {
+                return jsonc::remove_member(current, STATUS_LINE).and_then(|text| jsonc::prune_empty(&text, &[]));
+            }
+            match raw.filter(|r| parse_strict(r).as_ref() == Some(&previous)) {
+                Some(raw) => Ok(format!("{}{}{}", &current[..range.start], raw, &current[range.end..])),
+                None => jsonc::set_member(current, STATUS_LINE, &previous),
+            }
+        }
+    }
+}
+
+/// Claude's settings with both qx edits in one write: the PreToolUse hook and the status line.
+fn edit_claude_settings(file: &Path, exe: &Path, script: &Path, sidecar: Option<&str>, line: bool, a: Action) -> Edit {
+    let original = match read_optional(file) {
+        Ok(text) => text,
+        Err(e) => return Edit::Refuse(e),
+    };
+    let current = match (&original, a) {
+        (Some(text), _) => text.clone(),
+        (None, Action::Remove) => return Edit::Unchanged,
+        (None, Action::Install) => "{}\n".to_string(),
+    };
+    // The status line goes first: the hook edit then tidies an emptied document down to `{}`.
+    let staged = if line {
+        match claude_statusline_text(&current, script, sidecar, a) {
+            Ok(text) => text,
+            Err(e) => return Edit::Refuse(format!("{}: {e}", file.display())),
+        }
+    } else {
+        current
+    };
+    match claude_hook_edit(file, &staged, exe, a) {
+        Edit::Unchanged if original.as_deref() == Some(staged.as_str()) => Edit::Unchanged,
+        Edit::Unchanged if parse_strict(&staged).is_some() => Edit::Changed(staged),
+        Edit::Unchanged => Edit::Refuse(format!("the edit would leave {} unparseable; edit it by hand", file.display())),
+        other => other,
+    }
+}
+
+fn cursor_config(p: &Paths) -> PathBuf {
+    p.home.join(".cursor").join("cli-config.json")
+}
+
+/// cursor-agent has one `statusLine` slot: qx takes it when free and leaves another tool's alone.
+/// The file is cursor-agent's own, written on its first run: qx never creates it (a stub may be
+/// rejected), so without one there is nothing to edit.
+fn edit_cursor_statusline(file: &Path, exe: &Path, a: Action) -> Edit {
+    let text = match read_optional(file) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Edit::Unchanged,
+        Err(e) => return Edit::Refuse(e),
+    };
+    let foreign = matches!(statusline_slot(&text), Slot::Value(_, v) if !is_qx_statusline(&v));
+    if foreign {
+        return Edit::Unchanged;
+    }
+    edit_json_file(file, STATUS_LINE, |_| cursor_statusline_value(exe), a)
 }
 
 const PRE_TOOL_USE: &[&str] = &["hooks", "PreToolUse"];
@@ -294,6 +543,8 @@ fn claude_hook_text(current: &str, groups: &[Value], exe: &Path, a: Action) -> R
     }
 }
 
+/// The hook part of the settings edit alone, read from disk; the hook tests drive it directly.
+#[cfg(test)]
 fn edit_claude_hook(file: &Path, exe: &Path, a: Action) -> Edit {
     let current = match read_optional(file) {
         Ok(Some(text)) => text,
@@ -302,7 +553,12 @@ fn edit_claude_hook(file: &Path, exe: &Path, a: Action) -> Edit {
 ".to_string(),
         Err(e) => return Edit::Refuse(e),
     };
-    let groups = match jsonc::elements(&current, PRE_TOOL_USE) {
+    claude_hook_edit(file, &current, exe, a)
+}
+
+/// The hook edit on `current`, the text of `file` (named for messages) as it now stands.
+fn claude_hook_edit(file: &Path, current: &str, exe: &Path, a: Action) -> Edit {
+    let groups = match jsonc::elements(current, PRE_TOOL_USE) {
         Ok(groups) => groups,
         Err(e) => return Edit::Refuse(format!("{}: {e}", file.display())),
     };
@@ -313,7 +569,7 @@ fn edit_claude_hook(file: &Path, exe: &Path, a: Action) -> Edit {
     if a == Action::Install && settled {
         return Edit::Unchanged;
     }
-    match claude_hook_text(&current, &groups, exe, a) {
+    match claude_hook_text(current, &groups, exe, a) {
         Ok(text) if text == current => Edit::Unchanged,
         Ok(text) if parse_strict(&text).is_some() => Edit::Changed(text),
         Ok(_) => Edit::Refuse(format!("the edit would leave {} unparseable; edit it by hand", file.display())),
@@ -578,8 +834,13 @@ fn leaves_nothing_of_the_users(client: Client, text: &str, existing: &[u8]) -> b
     if client == Client::Pi && text.is_empty() {
         return pi::is_generated(existing);
     }
-    if client == Client::Omp && text.is_empty() && generated_from(OMP_EXTENSION, existing) {
-        return true;
+    if text.is_empty() {
+        // The widget files are qx's whole: a script or sidecar qx wrote holds nothing of the user's.
+        match client {
+            Client::Omp if generated_from(OMP_EXTENSION, existing) => return true,
+            Client::ClaudeCode if generated_from(STATUSLINE_SCRIPT, existing) || is_sidecar(existing) => return true,
+            _ => {}
+        }
     }
     let bare = text.trim_start_matches('\u{feff}').trim();
     (bare.is_empty() || bare == "{}")
@@ -612,10 +873,12 @@ fn only_qx_lines(client: Client, existing: &str) -> bool {
 /// A document that is one chain of single-key objects down to a qx server entry or qx hook group.
 fn only_qx_wrote(doc: &Value) -> bool {
     match doc {
-        Value::Object(m) if m.len() == 1 => {
-            let (key, value) = m.iter().next().expect("one member");
-            if key == "qx" { is_pristine_entry(value) } else { only_qx_wrote(value) }
-        }
+        // Every member must be qx's: its server entry, its status line, or a chain down to its hook.
+        Value::Object(m) if !m.is_empty() => m.iter().all(|(key, value)| match key.as_str() {
+            "qx" => m.len() == 1 && is_pristine_entry(value),
+            "statusLine" => is_qx_statusline(value),
+            _ => only_qx_wrote(value),
+        }),
         Value::Array(groups) if groups.len() == 1 => {
             let exe = groups[0]["hooks"][0]["command"].as_str().unwrap_or_default();
             groups[0] == claude_hook(Path::new(exe))
@@ -657,6 +920,11 @@ pub struct Status {
 }
 
 pub fn status(c: Client, p: &Paths) -> Status {
+    status_with(c, p, crate::resolve::find_on_path("node").is_some())
+}
+
+/// `status`, with whether `node` resolves on PATH given (see `plan_with`).
+fn status_with(c: Client, p: &Paths, node: bool) -> Status {
     let mut notes = Vec::new();
     let (file, command) = match c {
         Client::ClaudeCode => {
@@ -681,6 +949,21 @@ pub fn status(c: Client, p: &Paths) -> Status {
                     if let Some(want) = crate::deploy::canonical().filter(|w| !same_path(cmd, w)) {
                         notes.push(format!("the PreToolUse hook runs {cmd}, not {}: run `qx setup claude`", want.display()));
                     }
+                }
+            }
+            if command.is_some() {
+                let script = claude_dir(p).join("qx-statusline.js");
+                let line = std::fs::read_to_string(claude_settings(p)).ok().and_then(|t| match statusline_slot(&t) {
+                    Slot::Value(_, v) => Some(v),
+                    _ => None,
+                });
+                match line {
+                    Some(v) if is_qx_statusline(&v) && !script.is_file() => {
+                        notes.push(format!("the statusLine runs {} which is missing: run `qx setup claude`", script.display()));
+                    }
+                    Some(v) if is_qx_statusline(&v) => {}
+                    _ if !node => notes.push("node not found on PATH: statusLine not installed".into()),
+                    _ => notes.push("no qx statusLine in settings.json: the savings line is not shown; run `qx setup claude`".into()),
                 }
             }
             (Some(file), command)
@@ -764,6 +1047,18 @@ pub fn status(c: Client, p: &Paths) -> Status {
         Client::Cursor => {
             let file = cursor_file(p);
             let command = read_json_command(&file, &["mcpServers", "qx", "command"]);
+            if command.is_some() {
+                let text = std::fs::read_to_string(cursor_config(p)).ok();
+                match text.as_deref().map(statusline_slot) {
+                    None => notes.push("no cli-config.json yet (cursor-agent writes it on first run): run `qx setup cursor` again after it exists to show the savings line".into()),
+                    Some(Slot::Value(_, v)) => {
+                        if !is_qx_statusline(&v) {
+                            notes.push("cli-config.json statusLine belongs to another tool: qx leaves it, so the savings line is not shown".into());
+                        }
+                    }
+                    Some(_) => notes.push("no qx statusLine in cli-config.json: the savings line is not shown; run `qx setup cursor`".into()),
+                }
+            }
             (Some(file), command)
         }
         Client::Omp => {
@@ -944,6 +1239,15 @@ fn configure(clients: Vec<Client>, paths: &Paths, exe: &Path, action: Action, dr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The tests do not depend on whether this machine has node on PATH.
+    fn plan(c: Client, p: &Paths, exe: &Path, a: Action) -> Result<Vec<Change>, String> {
+        plan_with(c, p, exe, a, true)
+    }
+
+    fn status(c: Client, p: &Paths) -> Status {
+        status_with(c, p, true)
+    }
 
     fn paths(tag: &str) -> Paths {
         let root = std::env::temp_dir().join(format!("qx-setup-{tag}-{}", std::process::id()));
@@ -1352,21 +1656,26 @@ ew\qx.exe");
             put(&claude_file(&p), blank);
             put(&claude_settings(&p), blank);
             let changes = plan(Client::ClaudeCode, &p, q(), Action::Install).unwrap();
-            assert_eq!(changes.len(), 2);
+            assert_eq!(changes.len(), 4);
             for ch in &changes {
                 let text = changed(&ch.edit).unwrap_or_else(|| panic!("{} {blank:?} must install: {:?}", ch.file.display(), ch.edit));
-                assert!(parse_strict(text).is_some(), "{text}");
+                if ch.file.extension().is_some_and(|e| e == "json") {
+                    assert!(parse_strict(text).is_some(), "{text}");
+                }
                 apply(ch).unwrap();
             }
             let settings = std::fs::read_to_string(claude_settings(&p)).unwrap();
             assert_eq!(qx_hook_commands(&settings), vec![q().to_string_lossy().to_string()]);
             let servers = std::fs::read_to_string(claude_file(&p)).unwrap();
             assert_eq!(parse_strict(&servers).unwrap()["mcpServers"]["qx"]["args"][0], "mcp");
-            // Removing from a blank file is a no-op, not an error.
+            // Removing from a blank file is a no-op, not an error. The widget script and its sidecar
+            // written above are still there, so their removal is a real change.
             put(&claude_file(&p), blank);
             put(&claude_settings(&p), blank);
             for ch in plan(Client::ClaudeCode, &p, q(), Action::Remove).unwrap() {
-                assert!(matches!(ch.edit, Edit::Unchanged), "{blank:?}: {:?}", ch.edit);
+                if ch.file == claude_file(&p) || ch.file == claude_settings(&p) {
+                    assert!(matches!(ch.edit, Edit::Unchanged), "{blank:?}: {:?}", ch.edit);
+                }
             }
             let _ = std::fs::remove_dir_all(&p.home);
         }
@@ -1642,6 +1951,223 @@ ew\qx.exe");
         );
     }
 
+    fn claude_script(p: &Paths) -> PathBuf {
+        claude_dir(p).join("qx-statusline.js")
+    }
+
+    fn claude_sidecar_file(p: &Paths) -> PathBuf {
+        claude_dir(p).join("qx-statusline.json")
+    }
+
+    #[test]
+    fn claude_chains_a_foreign_status_line_and_remove_restores_it_byte_for_byte() {
+        let p = paths("sl-foreign");
+        // Odd spacing on purpose: the restored value is the user's own text, not a re-print.
+        let foreign = "{\n  \"model\": \"opus\",\n  \"statusLine\": {\n    \"type\": \"command\",   \"command\": \"echo mine\"\n  }\n}\n";
+        put(&claude_settings(&p), foreign);
+        apply_all(real_plan(Client::ClaudeCode)(&p, Action::Install));
+
+        let installed = parse_strict(&std::fs::read_to_string(claude_settings(&p)).unwrap()).unwrap();
+        let script = claude_script(&p).to_string_lossy().replace('\\', "/");
+        assert_eq!(installed["statusLine"]["command"], format!("node \"{script}\""));
+        assert_eq!(installed["statusLine"]["type"], "command");
+        assert!(installed["statusLine"].get("refreshInterval").is_none(), "qx must not force a refresh timer");
+        let sidecar: Value = serde_json::from_str(&std::fs::read_to_string(claude_sidecar_file(&p)).unwrap()).unwrap();
+        assert_eq!(sidecar["previous"], json!({"type": "command", "command": "echo mine"}));
+        assert_eq!(
+            std::fs::read_to_string(claude_script(&p)).unwrap(),
+            fill_exe(STATUSLINE_SCRIPT, Path::new(E2E_EXE))
+        );
+        assert!(status(Client::ClaudeCode, &p).notes.iter().all(|n| !n.contains("statusLine")), "{:?}", status(Client::ClaudeCode, &p).notes);
+
+        assert_eq!(apply_all(real_plan(Client::ClaudeCode)(&p, Action::Install)), 0, "a second install changes nothing");
+        apply_all(real_plan(Client::ClaudeCode)(&p, Action::Remove));
+        assert_eq!(std::fs::read_to_string(claude_settings(&p)).unwrap(), foreign);
+        assert!(!claude_script(&p).exists() && !claude_sidecar_file(&p).exists());
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn claude_reinstall_with_another_exe_keeps_the_first_previous() {
+        let p = paths("sl-twice");
+        put(&claude_settings(&p), "{\"statusLine\": {\"type\": \"command\", \"command\": \"echo mine\"}}\n");
+        apply_all(real_plan(Client::ClaudeCode)(&p, Action::Install));
+        let sidecar = std::fs::read_to_string(claude_sidecar_file(&p)).unwrap();
+        let settings = std::fs::read_to_string(claude_settings(&p)).unwrap();
+
+        let newer = Path::new(r"D:\new\qx.exe");
+        let changes = plan(Client::ClaudeCode, &p, newer, Action::Install).unwrap();
+        // Only the hook and the script name the exe; qx's own statusLine is never stored as the one to restore.
+        let sidecar_edit = &changes.iter().find(|c| c.file == claude_sidecar_file(&p)).unwrap().edit;
+        assert!(matches!(sidecar_edit, Edit::Unchanged), "{sidecar_edit:?}");
+        for ch in changes {
+            apply(&ch).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(claude_sidecar_file(&p)).unwrap(), sidecar);
+        let after = parse_strict(&std::fs::read_to_string(claude_settings(&p)).unwrap()).unwrap();
+        assert_eq!(after["statusLine"], parse_strict(&settings).unwrap()["statusLine"]);
+        assert_eq!(apply_all(plan(Client::ClaudeCode, &p, newer, Action::Install).unwrap()), 0);
+        apply_all(plan(Client::ClaudeCode, &p, newer, Action::Remove).unwrap());
+        assert_eq!(
+            parse_strict(&std::fs::read_to_string(claude_settings(&p)).unwrap()).unwrap(),
+            json!({"statusLine": {"type": "command", "command": "echo mine"}})
+        );
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn claude_without_a_status_line_ends_without_one() {
+        let p = paths("sl-none");
+        let original = "{\n  \"model\": \"opus\"\n}\n";
+        put(&claude_settings(&p), original);
+        apply_all(real_plan(Client::ClaudeCode)(&p, Action::Install));
+        let sidecar: Value = serde_json::from_str(&std::fs::read_to_string(claude_sidecar_file(&p)).unwrap()).unwrap();
+        assert_eq!(sidecar["previous"], Value::Null);
+        assert!(parse_strict(&std::fs::read_to_string(claude_settings(&p)).unwrap()).unwrap().get("statusLine").is_some());
+        apply_all(real_plan(Client::ClaudeCode)(&p, Action::Remove));
+        let restored = std::fs::read_to_string(claude_settings(&p)).unwrap();
+        assert_eq!(restored, original);
+        assert!(parse_strict(&restored).unwrap().get("statusLine").is_none());
+        assert!(!claude_script(&p).exists() && !claude_sidecar_file(&p).exists());
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn cursor_takes_a_free_status_line_slot_and_leaves_a_foreign_one() {
+        let p = paths("sl-cursor");
+        let config = cursor_config(&p);
+        // cursor-agent writes its own config on first run: without one qx has nothing to edit.
+        apply_all(real_plan(Client::Cursor)(&p, Action::Install));
+        assert!(!config.exists(), "qx never creates cli-config.json");
+        assert!(matches!(edit_cursor_statusline(&config, Path::new(E2E_EXE), Action::Remove), Edit::Unchanged));
+        put(&config, "{}\n");
+        apply_all(real_plan(Client::Cursor)(&p, Action::Install));
+        let v = parse_strict(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(v["statusLine"], cursor_statusline_value(Path::new(E2E_EXE)));
+        assert_eq!(v["statusLine"]["command"], format!("{E2E_EXE} gain --line"));
+        assert_eq!(apply_all(real_plan(Client::Cursor)(&p, Action::Install)), 0);
+        apply_all(real_plan(Client::Cursor)(&p, Action::Remove));
+        assert!(!config.exists(), "a config qx emptied goes");
+        let _ = std::fs::remove_dir_all(&p.home);
+
+        let p = paths("sl-cursor-foreign");
+        let config = cursor_config(&p);
+        let foreign = "{\n  \"statusLine\": {\"type\": \"command\", \"command\": \"mine\"}\n}\n";
+        put(&config, foreign);
+        apply_all(real_plan(Client::Cursor)(&p, Action::Install));
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), foreign, "another tool's slot is left alone");
+        let notes = status(Client::Cursor, &p).notes;
+        assert!(notes.iter().any(|n| n.contains("another tool")), "{notes:?}");
+        apply_all(real_plan(Client::Cursor)(&p, Action::Remove));
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), foreign, "remove does not delete what is not qx's");
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    fn edit_for<'a>(changes: &'a [Change], file: &Path) -> &'a Edit {
+        &changes.iter().find(|c| c.file == file).expect("a change for the file").edit
+    }
+
+    #[test]
+    fn claude_keeps_a_corrupt_or_missing_sidecar_while_qx_holds_the_slot() {
+        let p = paths("sl-corrupt");
+        put(&claude_settings(&p), "{\"statusLine\": {\"type\": \"command\", \"command\": \"echo mine\"}}\n");
+        apply_all(real_plan(Client::ClaudeCode)(&p, Action::Install));
+        let sidecar = claude_sidecar_file(&p);
+
+        std::fs::write(&sidecar, "{ not json").unwrap();
+        let changes = real_plan(Client::ClaudeCode)(&p, Action::Install);
+        assert!(matches!(edit_for(&changes, &sidecar), Edit::Unchanged));
+        apply_all(changes);
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), "{ not json", "no fresh null record over a corrupt one");
+
+        std::fs::remove_file(&sidecar).unwrap();
+        apply_all(real_plan(Client::ClaudeCode)(&p, Action::Install));
+        assert!(!sidecar.exists(), "no invented `previous: null` when the record is gone");
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn claude_remove_without_the_sidecar_keeps_the_status_line_and_its_script() {
+        let p = paths("sl-nosidecar");
+        put(&claude_settings(&p), "{\"statusLine\": {\"type\": \"command\", \"command\": \"echo mine\"}}\n");
+        apply_all(real_plan(Client::ClaudeCode)(&p, Action::Install));
+        let installed = std::fs::read_to_string(claude_settings(&p)).unwrap();
+        for sidecar_text in [None, Some("{ not json")] {
+            match sidecar_text {
+                None => std::fs::remove_file(claude_sidecar_file(&p)).unwrap(),
+                Some(text) => std::fs::write(claude_sidecar_file(&p), text).unwrap(),
+            }
+            let changes = real_plan(Client::ClaudeCode)(&p, Action::Remove);
+            match edit_for(&changes, &claude_settings(&p)) {
+                Edit::Refuse(why) => assert!(why.contains("previous statusLine is unknown"), "{why}"),
+                other => panic!("the settings edit must refuse: {other:?}"),
+            }
+            for ch in &changes {
+                apply(ch).unwrap();
+            }
+            assert_eq!(std::fs::read_to_string(claude_settings(&p)).unwrap(), installed, "{sidecar_text:?}: the slot is left alone");
+            assert!(claude_script(&p).exists(), "{sidecar_text:?}: the script the slot runs stays");
+            assert_eq!(std::fs::read_to_string(claude_sidecar_file(&p)).ok().as_deref(), sidecar_text);
+        }
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn claude_unparseable_settings_leave_the_sidecar_alone() {
+        let p = paths("sl-unparseable");
+        let sidecar = claude_sidecar_file(&p);
+        for settings in ["{ \"model\": ", "{\"statusLine\": nope}"] {
+            put(&claude_settings(&p), settings);
+            put(&sidecar, "{\"previous\": {\"type\": \"command\", \"command\": \"echo mine\"}}\n");
+            let changes = plan(Client::ClaudeCode, &p, q(), Action::Install).unwrap();
+            assert!(matches!(edit_for(&changes, &sidecar), Edit::Unchanged), "{settings}");
+            assert!(matches!(edit_for(&changes, &claude_settings(&p)), Edit::Refuse(_)), "{settings}");
+        }
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn claude_status_line_keeps_the_previous_keys_and_forces_no_refresh() {
+        let p = paths("sl-padding");
+        let foreign = "{\"statusLine\": {\"type\": \"command\", \"command\": \"echo mine\", \"padding\": 0}}\n";
+        put(&claude_settings(&p), foreign);
+        apply_all(real_plan(Client::ClaudeCode)(&p, Action::Install));
+        let installed = parse_strict(&std::fs::read_to_string(claude_settings(&p)).unwrap()).unwrap();
+        assert_eq!(installed["statusLine"]["padding"], 0);
+        assert_eq!(installed["statusLine"]["type"], "command");
+        assert!(installed["statusLine"]["command"].as_str().unwrap().contains("qx-statusline.js"));
+        assert!(installed["statusLine"].get("refreshInterval").is_none());
+        assert_eq!(apply_all(real_plan(Client::ClaudeCode)(&p, Action::Install)), 0, "a second install changes nothing");
+        apply_all(real_plan(Client::ClaudeCode)(&p, Action::Remove));
+        assert_eq!(std::fs::read_to_string(claude_settings(&p)).unwrap(), foreign);
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn claude_without_node_installs_no_status_line() {
+        let p = paths("sl-nonode");
+        let foreign = "{\"statusLine\": {\"type\": \"command\", \"command\": \"echo mine\"}}\n";
+        put(&claude_settings(&p), foreign);
+        for ch in plan_with(Client::ClaudeCode, &p, Path::new(E2E_EXE), Action::Install, false).unwrap() {
+            apply(&ch).unwrap();
+        }
+        let after = parse_strict(&std::fs::read_to_string(claude_settings(&p)).unwrap()).unwrap();
+        assert_eq!(after["statusLine"], json!({"type": "command", "command": "echo mine"}));
+        assert!(!claude_script(&p).exists() && !claude_sidecar_file(&p).exists());
+        let notes = status_with(Client::ClaudeCode, &p, false).notes;
+        assert!(notes.iter().any(|n| n.contains("node not found on PATH")), "{notes:?}");
+        let _ = std::fs::remove_dir_all(&p.home);
+    }
+
+    #[test]
+    fn cursor_quotes_the_exe_only_when_its_path_has_whitespace() {
+        let plain = cursor_statusline_value(Path::new(E2E_EXE));
+        assert_eq!(plain["command"], format!("{E2E_EXE} gain --line"));
+        assert!(is_qx_statusline(&plain));
+        let spaced = cursor_statusline_value(Path::new(r"C:\Program Files\qx\qx.exe"));
+        assert_eq!(spaced["command"], r#""C:\Program Files\qx\qx.exe" gain --line"#);
+        assert!(is_qx_statusline(&spaced));
+    }
     #[test]
     fn e2e_omp_roundtrip() {
         let f = |p: &Paths| p.omp_agent_dir.join("mcp.json");

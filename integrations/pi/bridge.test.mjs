@@ -4,7 +4,7 @@ import { getEventListeners } from "node:events";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { QxBridge } from "./qx/bridge.js";
+import { QxBridge, watchGain } from "./qx/bridge.js";
 
 const within = (ms, promise, what) =>
   Promise.race([
@@ -180,6 +180,32 @@ try {
   const block = source("./qx.js").match(/const FS_PARAMETERS = Type\.Object\(\{\n([\s\S]*?)\n\}\);/)[1];
   const pi = [...block.matchAll(/^ {2}"?([\w-]+)"?:/gm)].map((m) => m[1]).sort();
   assert.deepEqual(pi, server);
+}
+
+// 9. The footer status comes from `<exe> gain --line`; node stands in for qx, so `gain` is a script
+// path in the current folder. A stub that fails shows nothing and never throws.
+{
+  const dir = mkdtempSync(join(tmpdir(), "qx-pi-gain-"));
+  writeFileSync(join(dir, "gain"), "console.log('qx ▸ −62% · stub');\n");
+  const seen = [];
+  const ui = { setStatus: (key, text) => seen.push([key, text]) };
+  const theme = { fg: (name, text) => `<${name}>${text}` };
+  const cwd = process.cwd();
+  process.chdir(dir);
+  const stop = watchGain(process.execPath, ui, theme, 60000);
+  const start = Date.now();
+  while (!seen.length && Date.now() - start < 5000) await new Promise((r) => setTimeout(r, 25));
+  stop();
+  process.chdir(cwd);
+  rmSync(dir, { recursive: true, force: true });
+  assert.deepEqual(seen, [["qx", "<accent>qx ▸ −62% · stub"]]);
+  const none = [];
+  const stopNone = watchGain("qx-does-not-exist", { setStatus: (k, t) => none.push(t) }, null, 60000);
+  const begin = Date.now();
+  while (!none.length && Date.now() - begin < 5000) await new Promise((r) => setTimeout(r, 25));
+  stopNone();
+  assert.deepEqual(none, [undefined]);
+  assert.equal(typeof watchGain("x", undefined, null), "function");
 }
 
 console.log("bridge ok");

@@ -131,6 +131,12 @@ fn sender() -> &'static Mutex<Option<SyncSender<String>>> {
 /// `ROTATE_AT`. The file is held without write sharing for the whole step, so one qx process never
 /// rotates a stale copy over lines another one has just appended.
 fn append(path: &std::path::Path, text: &[u8]) {
+    append_limited(path, text, ROTATE_AT);
+}
+
+/// `append` with the rotation size as a parameter. Also keeps the totals sidecar current while the
+/// ledger handle is held, which is what makes the read-modify-write of the sidecar safe across processes.
+fn append_limited(path: &std::path::Path, text: &[u8], rotate_at: u64) {
     use std::io::{Read, Seek, SeekFrom};
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true).write(true).create(true);
@@ -150,19 +156,36 @@ fn append(path: &std::path::Path, text: &[u8]) {
         }
     }
     let Some(mut f) = held else { return };
-    if f.metadata().is_ok_and(|m| m.len() >= ROTATE_AT) {
+    let mut totals = read_totals(path);
+    let rotate = f.metadata().is_ok_and(|m| m.len() >= rotate_at);
+    // The ledger is read whole only when it must be: to cut it, or to seed missing totals from it.
+    if rotate || totals.is_none() {
         let mut data = Vec::new();
         if f.read_to_end(&mut data).is_ok() {
-            let from = data.len() / 2;
-            let start = data[from..].iter().position(|&b| b == b'\n').map_or(data.len(), |i| from + i + 1);
-            let kept = &data[start..];
-            let _ = f
-                .seek(SeekFrom::Start(0))
-                .and_then(|_| f.write_all(kept))
-                .and_then(|_| f.set_len(kept.len() as u64));
+            if totals.is_none() {
+                totals = Some(scan(&String::from_utf8_lossy(&data), 0).t);
+            }
+            if rotate {
+                let from = data.len() / 2;
+                let start = data[from..].iter().position(|&b| b == b'\n').map_or(data.len(), |i| from + i + 1);
+                let kept = &data[start..];
+                let _ = f
+                    .seek(SeekFrom::Start(0))
+                    .and_then(|_| f.write_all(kept))
+                    .and_then(|_| f.set_len(kept.len() as u64));
+            }
         }
     }
-    let _ = f.seek(SeekFrom::End(0)).and_then(|_| f.write_all(text));
+    if f.seek(SeekFrom::End(0)).and_then(|_| f.write_all(text)).is_ok() {
+        if let Some(mut t) = totals {
+            for l in String::from_utf8_lossy(text).lines() {
+                if let Some(r) = Row::parse(l) {
+                    t.add(&r);
+                }
+            }
+            write_totals(path, &t);
+        }
+    }
 }
 
 fn line(e: &Entry) -> String {
@@ -209,36 +232,219 @@ struct Group {
     pub reply: u64,
 }
 
-/// Read the ledger from `since_secs` ago (0: everything) and print the report. Returns the exit code.
-pub fn report(since_secs: u64) -> i32 {
-    let Some(path) = path() else {
+/// The only fields read from a ledger line.
+struct Row {
+    ts: u64,
+    tool: String,
+    cmd: String,
+    ms: u64,
+    code: i64,
+    raw: u64,
+    reply: u64,
+    unchanged: bool,
+}
+
+impl Row {
+    fn parse(l: &str) -> Option<Row> {
+        let v: serde_json::Value = serde_json::from_str(l).ok()?;
+        let n = |k: &str| v[k].as_u64().unwrap_or(0);
+        let s = |k: &str, d: &str| v[k].as_str().unwrap_or(d).to_string();
+        Some(Row {
+            ts: n("ts"),
+            tool: s("tool", "cli"),
+            cmd: s("cmd", "?"),
+            ms: n("ms"),
+            code: v["code"].as_i64().unwrap_or(0),
+            raw: n("in"),
+            reply: n("out"),
+            unchanged: v["flags"] == "unchanged",
+        })
+    }
+}
+
+/// Running totals of the whole ledger. Also the sidecar file `stats.totals.json`, which keeps all-time
+/// figures across rotation (the ledger itself only keeps its newest half).
+#[derive(Default, Clone, PartialEq, Debug)]
+struct Totals {
+    calls: u64,
+    failed: u64,
+    raw_bytes: u64,
+    reply_bytes: u64,
+    cmd_raw_bytes: u64,
+    cmd_reply_bytes: u64,
+    stub_reads: u64,
+}
+
+impl Totals {
+    fn add(&mut self, r: &Row) {
+        self.calls += 1;
+        self.failed += u64::from(r.code != 0);
+        self.raw_bytes += r.raw;
+        self.reply_bytes += r.reply;
+        if r.tool == "run" || r.tool == "cli" {
+            self.cmd_raw_bytes += r.raw;
+            self.cmd_reply_bytes += r.reply;
+        }
+        self.stub_reads += u64::from(r.unchanged);
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "calls": self.calls, "failed": self.failed, "raw_bytes": self.raw_bytes, "reply_bytes": self.reply_bytes,
+            "cmd_raw_bytes": self.cmd_raw_bytes, "cmd_reply_bytes": self.cmd_reply_bytes, "stub_reads": self.stub_reads,
+        })
+    }
+
+    fn from_json(v: &serde_json::Value) -> Option<Totals> {
+        let n = |k: &str| v[k].as_u64();
+        Some(Totals {
+            calls: n("calls")?,
+            failed: n("failed")?,
+            raw_bytes: n("raw_bytes")?,
+            reply_bytes: n("reply_bytes")?,
+            cmd_raw_bytes: n("cmd_raw_bytes")?,
+            cmd_reply_bytes: n("cmd_reply_bytes")?,
+            stub_reads: n("stub_reads")?,
+        })
+    }
+}
+
+/// Everything one pass over the ledger yields; the text report, `--line` and `--json` all read it.
+#[derive(Default)]
+struct Scan {
+    groups: std::collections::HashMap<(String, String), Group>,
+    t: Totals,
+}
+
+/// Aggregate every line at or after `floor` (unix seconds). Bad lines are skipped.
+fn scan(data: &str, floor: u64) -> Scan {
+    let mut s = Scan::default();
+    for l in data.lines() {
+        let Some(r) = Row::parse(l) else { continue };
+        if r.ts < floor {
+            continue;
+        }
+        s.t.add(&r);
+        let g = s.groups.entry((r.tool, r.cmd)).or_default();
+        g.ms.push(r.ms);
+        g.raw += r.raw;
+        g.reply += r.reply;
+    }
+    s
+}
+
+fn sidecar(ledger: &std::path::Path) -> PathBuf {
+    ledger.with_extension("totals.json")
+}
+
+fn read_totals(ledger: &std::path::Path) -> Option<Totals> {
+    Totals::from_json(&serde_json::from_slice(&std::fs::read(sidecar(ledger)).ok()?).ok()?)
+}
+
+/// Write the sidecar through a temp file and a rename, so a reader never sees half of it. Errors are
+/// ignored: totals are a convenience, never a reason to fail a call.
+fn write_totals(ledger: &std::path::Path, t: &Totals) {
+    let side = sidecar(ledger);
+    let tmp = side.with_extension("tmp");
+    if let Ok(body) = serde_json::to_vec(&t.to_json()) {
+        let written = std::fs::File::create(&tmp).and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(&body)?;
+            // On disk before the rename, so a crash leaves the old sidecar or the whole new one.
+            f.sync_all()
+        });
+        if written.and_then(|()| std::fs::rename(&tmp, &side)).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+/// What `qx gain` prints.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Format {
+    Text,
+    Line,
+    Json,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Short count: `999`, `1.5k`, `12.3k`, `690k`, `1.8M`. One decimal below 100 of a unit, none above.
+fn humanize(n: u64) -> String {
+    fn unit(v: f64, suffix: &str) -> String {
+        if v < 99.95 {
+            let s = format!("{v:.1}");
+            format!("{}{suffix}", s.strip_suffix(".0").unwrap_or(&s))
+        } else {
+            format!("{v:.0}{suffix}")
+        }
+    }
+    if n < 1000 {
+        n.to_string()
+    } else if n < 999_500 {
+        unit(n as f64 / 1e3, "k")
+    } else {
+        unit(n as f64 / 1e6, "M")
+    }
+}
+
+/// Signed change from `raw` to `reply` in whole percent: `−62%` saved, `+5%` grown, `0%` even.
+fn delta(raw: u64, reply: u64) -> String {
+    let pct = ((reply as f64 - raw as f64) * 100.0 / raw.max(1) as f64).round() as i64;
+    match pct {
+        0 => "0%".into(),
+        p if p < 0 => format!("\u{2212}{}%", -p),
+        p => format!("+{p}%"),
+    }
+}
+
+/// The one-line summary every agent-CLI widget shows. Tokens are bytes / 4.
+fn format_line(t: &Totals) -> String {
+    if t.calls == 0 {
+        return "qx \u{25b8} no calls yet".into();
+    }
+    let mut out = format!("qx \u{25b8} {} \u{b7} {}\u{2192}{} tok", delta(t.raw_bytes, t.reply_bytes), humanize(t.raw_bytes / 4), humanize(t.reply_bytes / 4));
+    if t.cmd_raw_bytes > 0 {
+        out += &format!(" \u{b7} cmds {}", delta(t.cmd_raw_bytes, t.cmd_reply_bytes));
+    }
+    if t.stub_reads > 0 {
+        out += &format!(" \u{b7} {} stub reads", t.stub_reads);
+    }
+    out + &format!(" \u{b7} {} calls", humanize(t.calls))
+}
+
+fn format_json(t: &Totals, since_secs: u64) -> String {
+    let mut v = t.to_json();
+    v["since_secs"] = since_secs.into();
+    v.to_string()
+}
+
+/// Read the ledger from `since_secs` ago (0: everything) and print it as `fmt`. Returns the exit code.
+/// `Line` and `Json` never fail: a missing ledger reads as no calls. With no window they read only the
+/// sidecar of running totals (cheap, and not cut by rotation); a missing sidecar falls back to a scan.
+pub fn report(since_secs: u64, fmt: Format) -> i32 {
+    let ledger = path();
+    let floor = if since_secs == 0 { 0 } else { now_secs().saturating_sub(since_secs) };
+    if fmt != Format::Text {
+        let side = if since_secs == 0 { ledger.as_deref().and_then(read_totals) } else { None };
+        let t = side.unwrap_or_else(|| {
+            let data = ledger.as_deref().and_then(|p| std::fs::read_to_string(p).ok());
+            scan(data.as_deref().unwrap_or(""), floor).t
+        });
+        println!("{}", if fmt == Format::Line { format_line(&t) } else { format_json(&t, since_secs) });
+        return 0;
+    }
+    let Some(ledger) = ledger else {
         println!("stats path unavailable");
         return 0;
     };
-    let Ok(data) = std::fs::read_to_string(&path) else {
+    let Ok(data) = std::fs::read_to_string(&ledger) else {
         println!("no stats yet: the qx server records every call from now on (QX_STATS=off stops it)");
         return 0;
     };
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let floor = if since_secs == 0 { 0 } else { now.saturating_sub(since_secs) };
-    let mut groups: std::collections::HashMap<(String, String), Group> = std::collections::HashMap::new();
-    let (mut unchanged, mut failed) = (0u64, 0u64);
-    for l in data.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(l) else { continue };
-        if v.get("ts").and_then(|x| x.as_u64()).unwrap_or(0) < floor {
-            continue;
-        }
-        let tool = v.get("tool").and_then(|x| x.as_str()).unwrap_or("cli").to_string();
-        let key = v.get("cmd").and_then(|x| x.as_str()).unwrap_or("?").to_string();
-        let g = groups.entry((tool, key)).or_default();
-        g.ms.push(v.get("ms").and_then(|x| x.as_u64()).unwrap_or(0));
-        g.raw += v.get("in").and_then(|x| x.as_u64()).unwrap_or(0);
-        g.reply += v.get("out").and_then(|x| x.as_u64()).unwrap_or(0);
-        unchanged += u64::from(v.get("flags").and_then(|x| x.as_str()) == Some("unchanged"));
-        failed += u64::from(v.get("code").and_then(|x| x.as_i64()).unwrap_or(0) != 0);
-    }
-    let calls: usize = groups.values().map(|g| g.ms.len()).sum();
-    let (raw, reply): (u64, u64) = groups.values().fold((0, 0), |a, g| (a.0 + g.raw, a.1 + g.reply));
+    let Scan { groups, t: Totals { calls, failed, raw_bytes: raw, reply_bytes: reply, stub_reads: unchanged, .. } } = scan(&data, floor);
     let total_ms: u64 = groups.values().map(|g| g.ms.iter().sum::<u64>()).sum();
     println!("qx gain{}", if since_secs == 0 { String::new() } else { format!(" (last {})", human(since_secs)) });
     println!("  calls      : {calls} ({failed} non-zero)");
@@ -341,6 +547,78 @@ mod tests {
         assert_eq!(take_raw(), 0);
     }
 
+    fn ledger_row(tool: &str, raw: u64, reply: u64, flags: &str, ts: u64) -> String {
+        format!("{{\"ts\":{ts},\"tool\":\"{tool}\",\"cmd\":\"x\",\"ms\":1,\"code\":0,\"in\":{raw},\"out\":{reply},\"flags\":\"{flags}\"}}\n")
+    }
+
+    fn temp_ledger(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("qx-stats-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("stats.jsonl")
+    }
+
+    #[test]
+    fn counts_are_humanized() {
+        assert_eq!(humanize(999), "999");
+        assert_eq!(humanize(1500), "1.5k");
+        assert_eq!(humanize(12_345), "12.3k");
+        assert_eq!(humanize(690_000), "690k");
+        assert_eq!(humanize(1_800_000), "1.8M");
+    }
+
+    #[test]
+    fn the_line_shows_savings_and_hides_zero_stub_reads() {
+        let data = ledger_row("run", 4000, 1000, "", 1) + &ledger_row("fs", 4000, 4000, "unchanged", 1);
+        let line = format_line(&scan(&data, 0).t);
+        assert_eq!(line, "qx \u{25b8} \u{2212}38% \u{b7} 2k\u{2192}1.2k tok \u{b7} cmds \u{2212}75% \u{b7} 1 stub reads \u{b7} 2 calls");
+        let none = format_line(&scan(&ledger_row("run", 4000, 1000, "", 1), 0).t);
+        assert_eq!(none, "qx \u{25b8} \u{2212}75% \u{b7} 1k\u{2192}250 tok \u{b7} cmds \u{2212}75% \u{b7} 1 calls");
+    }
+
+    #[test]
+    fn an_empty_ledger_has_no_calls_yet() {
+        assert_eq!(format_line(&scan("", 0).t), "qx \u{25b8} no calls yet");
+        assert_eq!(format_line(&scan("not json\n", 0).t), "qx \u{25b8} no calls yet");
+    }
+
+    #[test]
+    fn since_drops_older_lines() {
+        let data = ledger_row("run", 100, 10, "", 50) + &ledger_row("run", 200, 20, "", 150);
+        let t = scan(&data, 100).t;
+        assert_eq!((t.calls, t.raw_bytes, t.reply_bytes), (1, 200, 20));
+    }
+
+    #[test]
+    fn two_appends_add_up_and_the_first_seeds_existing_history_once() {
+        let p = temp_ledger("seed");
+        std::fs::write(&p, ledger_row("run", 100, 10, "", 1)).unwrap();
+        append(&p, ledger_row("run", 200, 20, "", 2).as_bytes());
+        append(&p, ledger_row("fs", 300, 30, "unchanged", 3).as_bytes());
+        let t = read_totals(&p).unwrap();
+        assert_eq!((t.calls, t.raw_bytes, t.reply_bytes, t.cmd_raw_bytes, t.stub_reads), (3, 600, 60, 300, 1));
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn rotation_does_not_lower_the_totals() {
+        let p = temp_ledger("rotate");
+        let row = ledger_row("run", 100, 10, "", 1);
+        for _ in 0..10 {
+            append_limited(&p, row.as_bytes(), 500);
+        }
+        let t = read_totals(&p).unwrap();
+        assert_eq!((t.calls, t.raw_bytes), (10, 1000));
+        assert!(std::fs::metadata(&p).unwrap().len() < 10 * row.len() as u64, "the ledger was not cut");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn a_json_object_carries_the_window() {
+        let v: serde_json::Value = serde_json::from_str(&format_json(&scan(&ledger_row("run", 8, 4, "", 1), 0).t, 604_800)).unwrap();
+        assert_eq!((v["calls"].as_u64(), v["raw_bytes"].as_u64(), v["since_secs"].as_u64()), (Some(1), Some(8), Some(604_800)));
+    }
+
     #[test]
     fn the_median_of_an_odd_and_even_list() {
         assert_eq!(median(&mut [5, 1, 9]), 5);
@@ -366,6 +644,7 @@ mod tests {
         ours.join().unwrap();
         let data = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(sidecar(&path));
         assert!(data.ends_with("theirs\nours\n"), "another process's line was lost");
         assert!((data.len() as u64) < ROTATE_AT, "the file was not rotated");
     }

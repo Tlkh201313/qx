@@ -505,6 +505,8 @@ fn call_logged(req: &Value, id: Option<Value>) -> Value {
     let raw = stats::take_raw();
     let flags = if reply_text.starts_with("[qx] unchanged since your last read") {
         "unchanged"
+    } else if reply_text.starts_with("[qx] unchanged since") && reply_text.contains("same tree") {
+        "replay"
     } else if reply_text.contains("moved to background job") || reply_text.contains(" started") && args.get("background").is_some() {
         "job"
     } else {
@@ -567,6 +569,7 @@ fn run_schema() -> Value {
                 "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Extra environment variables for the command." },
                 "timeout_ms": { "type": "integer", "default": 120000, "description": "1000 to 3600000; how long this call waits before the command becomes a job." },
                 "kill_on_timeout": { "type": "boolean", "description": "Stop the command at timeout_ms instead of moving it to a job." },
+                "fresh": { "type": "boolean", "description": "Run it again even when a repeat of a read-only command in an unchanged git tree would be answered from memory." },
                 "mode": { "type": "string", "enum": ["compact", "full"], "default": "compact" },
                 "background": { "type": "boolean", "description": "Return a job id at once." },
                 "job": { "type": "string", "description": "Follow a background job by id, or `list`." },
@@ -606,11 +609,11 @@ fn fs_schema() -> Value {
     let mut schema = json!({
         "name": "fs",
         "title": "qx fs",
-        "description": "In-process files in the workspace. op=read (path, offset?, limit?, fresh?; also dirs, any path, any size; a repeat read of an unchanged file returns a one-line stub, fresh=true re-sends); write (path, content; replacing a file needs a prior read); edit (path, old_string, new_string, replace_all?; unique exact match, no prior read); glob (pattern, path?; newest first); grep (pattern REGEX, path?, include?, ignore_case?, literal?); list; stat. Batch: `ops:[{op,...}]` (max 32, in order, shared cwd), `paths:[..]` reads/stats many, `edits:[{old_string,new_string,replace_all?}]` atomic on one path. Pass `cwd`. Writes stay inside cwd or %TEMP%\\claude; reads can go anywhere. Generated dirs (node_modules, target, build, dist, vendor) are skipped unless named or all=true.",
+        "description": "In-process files in the workspace. op=read (path, offset?, limit?, fresh?; also dirs, any path, any size; a repeat read of an unchanged file returns a one-line stub, fresh=true re-sends); write (path, content; replacing a file needs a prior read); edit (path, old_string, new_string, replace_all?; unique exact match, no prior read); glob (pattern, path?; newest first); grep (pattern REGEX, path?, include?, ignore_case?, literal?); list; stat; history: what ran or was searched here (n, grep, searches, show). Batch: `ops:[{op,...}]` (max 32, in order, shared cwd), `paths:[..]` reads/stats many, `edits:[{old_string,new_string,replace_all?}]` atomic on one path. Pass `cwd`. Writes stay inside cwd or %TEMP%\\claude; reads can go anywhere. Generated dirs (node_modules, target, build, dist, vendor) are skipped unless named or all=true.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "op": { "type": "string", "enum": ["read", "write", "edit", "glob", "grep", "list", "stat"] },
+                "op": { "type": "string", "enum": ["read", "write", "edit", "glob", "grep", "list", "stat", "history"] },
                 "cwd": { "type": "string", "description": "Session working directory. Omitted: the last one given." },
                 "path": { "type": "string", "description": "File or directory (default '.')." },
                 "content": { "type": "string" },
@@ -630,7 +633,11 @@ fn fs_schema() -> Value {
                 "ignore_case": { "type": "boolean" },
                 "fresh": { "type": "boolean", "description": "read: send the text even if unchanged since your last read." },
                 "literal": { "type": "boolean", "description": "grep: plain text, not regex." },
-                "all": { "type": "boolean", "description": "glob/grep: include node_modules, target, build, dist, vendor." }
+                "all": { "type": "boolean", "description": "glob/grep: include node_modules, target, build, dist, vendor." },
+                "n": { "type": "integer", "description": "history: entries (default 20)." },
+                "grep": { "type": "string", "description": "history: keep entries whose command or output contains this." },
+                "searches": { "type": "boolean", "description": "history: search commands only." },
+                "show": { "type": "string", "description": "history: key of one entry, to print it whole." }
             },
             "required": []
         },
@@ -719,6 +726,9 @@ struct RunCtx {
     guard_warning: Option<String>,
     /// Said when the call named no `cwd`: the command ran in qx's own directory, which is rarely meant.
     cwd_note: Option<String>,
+    /// Directory and command text to record in the repo history once the command ends; `None` for
+    /// calls that must not be remembered (`mode: full`, a custom `env`).
+    history: Option<(std::path::PathBuf, String, Option<String>)>,
 }
 
 /// One command running on its own thread. The call that started it waits a while; when the command
@@ -1026,7 +1036,7 @@ fn flag_arg(args: &Value, keys: &[&str]) -> bool {
 /// Every key `run` reads, with the alternate spellings clients use (see `text_arg`, `number_arg`).
 const RUN_KEYS: &[&str] = &[
     "program", "args", "command", "shell", "cwd", "workdir", "env", "timeout_ms", "timeoutMs", "kill_on_timeout", "mode",
-    "background", "run_in_background", "job", "wait_ms", "kill",
+    "background", "run_in_background", "job", "wait_ms", "kill", "fresh",
     // Other agents' shell tools carry it; a note about the command, harmless to ignore.
     "description",
 ];
@@ -1256,6 +1266,25 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
     if program.is_none() && cmdline.is_none() {
         return tool_text(id, "provide `program` + `args`, or `command`", true);
     }
+    // A repeat of a passing test/lint run in an unchanged tree is answered from memory. `mode: full` and a
+    // custom `env` change what comes back, and a background call wants a job: none of them replay or record.
+    // Args with whitespace are not told apart once joined (`cat "a b"` vs `cat a b`): no history either.
+    let spaced = program.is_some() && list.iter().any(|a| a.contains(char::is_whitespace));
+    let history = if full || background || spaced || !user_env.is_empty() {
+        None
+    } else {
+        cwd.clone().or_else(|| std::env::current_dir().ok()).map(|d| (d, guard_cmd.to_string()))
+    };
+    let history = match history {
+        Some((dir, cmd)) => match crate::history::before(&dir, &cmd, flag_arg(args, &["fresh"])) {
+            crate::history::Before::Replay(code, text) => {
+                let fault = code != 0 && client::current().exit_is_error();
+                return tool_result(id, &text, fault, json!({"source": "replay", "exit_code": code}));
+            }
+            crate::history::Before::Run(fp) => Some((dir, cmd, fp)),
+        },
+        None => None,
+    };
 
     // The foreground wait never passes dsh's own limit; what is still running then is a job.
     let promote = std::env::var("QX_PROMOTE").ok().as_deref() != Some("off") && !kill_on_timeout;
@@ -1278,6 +1307,7 @@ fn call_tool(req: &Value, id: Option<Value>) -> Value {
         } else {
             None
         },
+        history,
     };
     let (program, cmdline) = (program.map(str::to_string), cmdline.map(str::to_string));
     let shell = shell.to_string();
@@ -1360,6 +1390,7 @@ fn render(id: Option<Value>, outcome: exec::Outcome, source: &str, ctx: &RunCtx,
     }
     let mut truncated = outcome.cut;
     let mut profile = "";
+    let mut repeat_note = false;
     let mut omitted = 0usize;
     // Content a digest dropped, as opposed to noise (see `Digest::lossy`): worth a spool file.
     let mut lossy = false;
@@ -1393,6 +1424,7 @@ fn render(id: Option<Value>, outcome: exec::Outcome, source: &str, ctx: &RunCtx,
             let key = format!("{}\0{label}", cwd.map(|c| c.display().to_string()).unwrap_or_default());
             if let Some(note) = runmem::seen(&key, &so, &se, outcome.code, matches!(profile, "test" | "build")) {
                 (so, se, truncated, lossy, redactions) = (note, String::new(), false, false, 0);
+                repeat_note = true;
             }
         }
         // A cut or a digest that dropped content must never lose facts for good: the agent can grep the full text.
@@ -1443,6 +1475,11 @@ fn render(id: Option<Value>, outcome: exec::Outcome, source: &str, ctx: &RunCtx,
     }
     if so.is_empty() && se.is_empty() {
         text.push_str("(no output)\n");
+    }
+    // A repeat note says nothing a later replay could show, so only a real reply is remembered.
+    if let Some((dir, cmd, fp)) = ctx.history.as_ref().filter(|_| !outcome.timed_out && !repeat_note) {
+        let ms = outcome.elapsed.as_millis() as u64;
+        crate::history::record_output(dir, cmd, outcome.code, ms, &so, &text, fp.clone());
     }
     if let Some(p) = &spool {
         text.push_str(&format!("[qx] full output: {}\n", p.display()));
@@ -1787,7 +1824,7 @@ mod tests {
     }
 
     fn render_text(label: &str, cwd: &std::path::Path, code: i32, so: &str, se: &str) -> String {
-        let ctx = RunCtx { label: label.into(), cwd: Some(cwd.to_path_buf()), full: false, guard_warning: None, cwd_note: None };
+        let ctx = RunCtx { label: label.into(), cwd: Some(cwd.to_path_buf()), full: false, guard_warning: None, cwd_note: None, history: None };
         let out = exec::Outcome { code, stdout: so.into(), stderr: se.into(), elapsed: Duration::ZERO, timed_out: false, cut: false };
         let r = render(Some(json!(1)), out, "", &ctx, "");
         r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap().to_string()
@@ -2189,7 +2226,7 @@ mod tests {
     #[test]
     fn cancelled_status_poll_stops_waiting_but_leaves_the_job_running() {
         let _server = server_lock();
-        let ctx = RunCtx { label: "t".into(), cwd: None, full: false, guard_warning: None, cwd_note: None };
+        let ctx = RunCtx { label: "t".into(), cwd: None, full: false, guard_warning: None, cwd_note: None, history: None };
         let rec = spawn_runner(ctx, || {
             std::thread::sleep(Duration::from_millis(600));
             Err("finished".to_string())
@@ -2210,7 +2247,7 @@ mod tests {
     #[test]
     fn two_polls_of_one_job_both_get_the_result() {
         let _server = server_lock();
-        let ctx = RunCtx { label: "t".into(), cwd: None, full: false, guard_warning: None, cwd_note: None };
+        let ctx = RunCtx { label: "t".into(), cwd: None, full: false, guard_warning: None, cwd_note: None, history: None };
         let rec = spawn_runner(ctx, || {
             std::thread::sleep(Duration::from_millis(300));
             Err("done".to_string())

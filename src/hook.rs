@@ -18,54 +18,21 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub fn run(args: &[String]) -> i32 {
-    let omp = match args.first().map(String::as_str) {
-        Some("claude") => false,
-        Some("omp") => true,
-        _ => {
-            eprintln!(
-                "usage: qx hook claude   (Claude Code PreToolUse hook; reads the event on stdin)\n       \
-                 qx hook omp      (omp bash input on stdin; prints the input to run instead)"
-            );
-            // Not 2: Claude Code reads exit 2 as "block this tool call", so a typo would stop every command.
-            return 0;
-        }
-    };
+    if args.first().map(String::as_str) != Some("claude") {
+        eprintln!("usage: qx hook claude   (Claude Code PreToolUse hook; reads the event on stdin)");
+        // Not 2: Claude Code reads exit 2 as "block this tool call", so a typo would stop every command.
+        return 0;
+    }
     // A broken hook must never block the tool call: on any doubt, print nothing and exit 0.
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
         return 0;
     }
-    let event = serde_json::from_str::<Value>(&input).ok();
-    let out = if omp { event.and_then(|e| respond_omp(&e)).filter(|_| qx_on_path()) } else { event.and_then(|e| respond(&e)) };
+    let out = serde_json::from_str::<Value>(&input).ok().and_then(|e| respond(&e));
     if let Some(out) = out {
         println!("{out}");
     }
     0
-}
-
-/// omp's `bash` input, from the `tool_call` handler in `integrations/omp/qx.js`, with `qx` put
-/// before the stages it should run. omp checks its own approval rules against the new line, so
-/// Claude's permission rules play no part here.
-fn respond_omp(input: &Value) -> Option<Value> {
-    let input = input.as_object()?;
-    // `async` and `pty` output reaches the user while the command runs; a named command is a service.
-    let set = |k: &str| match input.get(k) {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::String(s)) => !s.trim().is_empty(),
-        Some(v) => !v.is_null(),
-        None => false,
-    };
-    if ["async", "pty", "name", "ready"].into_iter().any(set) {
-        return None;
-    }
-    let command = input.get("command")?.as_str()?;
-    // Seconds, default 300, clamped to 3600; 0 turns omp's deadline off. qx stops 2 s before omp
-    // kills the tree, so the output it holds still reaches the model.
-    let secs = input.get("timeout").and_then(Value::as_f64).map_or(300, |t| t as u64).min(3600);
-    let budget = (secs > 0).then(|| Budget::from_secs(secs.saturating_sub(2).max(1)));
-    let mut updated = input.clone();
-    updated.insert("command".into(), Value::String(rewrite_bash_within(command, budget)?));
-    Some(Value::Object(updated))
 }
 
 fn respond(event: &Value) -> Option<Value> {
@@ -1325,31 +1292,6 @@ mod tests {
         // A streamed stage has shown its output already: no limit added.
         let piped = rewrite_bash_within("cargo test | grep ok", b).unwrap();
         assert!(!piped.contains("--timeout") && !piped.contains("--deadline"), "{piped}");
-    }
-
-    #[test]
-    fn omp_bash_input_gets_qx_and_keeps_omp_deadline() {
-        let r = |v: Value| respond_omp(&v).map(|o| o["command"].as_str().unwrap().to_string());
-        // Default 300 s, minus 2; the other fields pass through untouched.
-        let out = respond_omp(&json!({"command": "cargo test", "cwd": "src"})).unwrap();
-        assert_eq!(out, json!({"command": "qx --timeout 298 cargo test", "cwd": "src"}));
-        assert_eq!(r(json!({"command": "cargo test", "timeout": 30})).as_deref(), Some("qx --timeout 28 cargo test"));
-        assert_eq!(r(json!({"command": "cargo test", "timeout": 9999})).as_deref(), Some("qx --timeout 3598 cargo test"));
-        assert_eq!(r(json!({"command": "cargo test", "timeout": 0})).as_deref(), Some("qx cargo test"));
-        // Streamed to the user, a service, nothing qx runs, or not omp's shape: left alone.
-        for v in [
-            json!({"command": "cargo test", "async": true}),
-            json!({"command": "cargo test", "pty": true}),
-            json!({"command": "npm run dev", "name": "web"}),
-            json!({"command": "npm run dev", "ready": {"port": 3000}}),
-            json!({"command": "cd src"}),
-            json!({"cmd": "cargo test"}),
-            json!("cargo test"),
-        ] {
-            assert_eq!(respond_omp(&v), None, "{v}");
-        }
-        // Blank optional fields are how some callers spell "not set".
-        assert!(r(json!({"command": "cargo test", "name": " ", "async": false, "ready": null})).is_some());
     }
 
     #[test]
